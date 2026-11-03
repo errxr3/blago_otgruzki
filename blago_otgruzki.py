@@ -69,7 +69,7 @@ from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.pdfgen import canvas
 
 APP_NAME = "BLAGO OTGRUZKI"
-APP_VERSION = "1.2"  # при каждом обновлении +0.1, запись в CHANGELOG.md
+APP_VERSION = "1.3"  # при каждом обновлении +0.1, запись в CHANGELOG.md
 API = "https://api-seller.ozon.ru"
 BATCH = 20                   # максимум отправлений в одном запросе этикеток
 READY = "awaiting_deliver"   # статус, в котором Ozon отдаёт этикетку
@@ -2758,7 +2758,7 @@ class App(tk.Tk):
         g = ttk.Frame(c2, style="Card.TFrame")
         g.pack(fill="x")
         ttk.Label(g, text="Надпись на ШК", style="Field.TLabel").pack(side="left")
-        fcb = ttk.Combobox(g, textvariable=self.footer, width=16, values=("Озон утро",) + WAVES)
+        fcb = ttk.Combobox(g, textvariable=self.footer, width=16, values=("Озон утро", "Озон 1") + WAVES)
         fcb.pack(side="left", padx=(10, 24))
         fcb.bind("<<ComboboxSelected>>", lambda e: self.refresh_links())
         fcb.bind("<KeyRelease>", lambda e: self.refresh_links())
