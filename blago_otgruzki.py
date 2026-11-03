@@ -69,7 +69,7 @@ from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.pdfgen import canvas
 
 APP_NAME = "BLAGO OTGRUZKI"
-APP_VERSION = "1.1"  # при каждом обновлении +0.1, запись в CHANGELOG.md
+APP_VERSION = "1.2"  # при каждом обновлении +0.1, запись в CHANGELOG.md
 API = "https://api-seller.ozon.ru"
 BATCH = 20                   # максимум отправлений в одном запросе этикеток
 READY = "awaiting_deliver"   # статус, в котором Ozon отдаёт этикетку
@@ -2034,6 +2034,10 @@ def add_cdek(template, cdek, out, log, today=None):
     data = {"cdek": read_totals(cdek)}
     fill_sborka(template, path, day, data, log, base=path if path.exists() else None)
     log(f"✔ СДЭК {sum(data['cdek'].values())} шт. добавлен в {path.name}")
+    if sklad_on():  # на склад — в ту же очередь «Отправить на склад», что и утро
+        lines = [{"market": "cdek", "channel": "СДЭК", "posting": f"СДЭК {day:%d.%m} {art}"[:64],
+                  "article": art, "qty": q, "production": production_of(art)} for art, q in data["cdek"].items()]
+        morning_hold(day, lines, ["cdek"], [("СДЭК", len(lines), "")], log, title="СДЭК")
     return path
 
 
