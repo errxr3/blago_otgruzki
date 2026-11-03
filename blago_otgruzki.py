@@ -1,0 +1,3483 @@
+#!/usr/bin/env python3
+"""
+BLAGO OTGRUZKI — этикетки Ozon FBS и поставки Wildberries FBS по отчётам.
+
+Отчёт: .xlsx, колонки «Номер отправления», «Артикул», «Количество».
+Заказы всех кабинетов вперемешку, в статусах «Ожидают сборки» и
+«Ожидают отгрузки». Правее списка — сводная (артикул, сумма):
+  красный артикул — не едет, все его отправления пропускаются;
+  жёлтый артикул  — едет часть: в колонке сразу после суммы пишется,
+                    сколько штук едет; берутся самые старые заказы.
+
+Что делает кнопка «Скачать и собрать»:
+  1. читает отчёт и выбрасывает «красные» отправления;
+  2. находит, в каком кабинете Ozon лежит каждый заказ;
+  3. заказы из «Ожидают сборки» собирает через API — каждая штука товара
+     отдельным грузоместом, чтобы на каждое зеркало была своя этикетка;
+  4. скачивает этикетки, один PDF на артикул (имя файла = артикул;
+     если артикул есть в двух кабинетах — пачка второго с _X в имени);
+  5. раскладывает PDF по производствам:
+        Коминтерна   — Zerkalo… и Alum…
+        Учительская  — всё остальное (Ambient…)
+  6. в каждой папке подписывает артикул на этикетках и склеивает их
+     в одну ленту (сортировка Я->А):
+        «Коминтерна объединенные.pdf», «Учительская объединенные.pdf».
+
+Установка (один раз):  pip install requests openpyxl pypdf reportlab
+Запуск:                python blago_otgruzki.py
+
+Сборка в .exe:
+    pip install pyinstaller
+    pyinstaller --onefile --windowed --name "BLAGO OTGRUZKI" blago_otgruzki.py
+
+Вкладка Wildberries (кнопка «Создать поставки и скачать»):
+  1. читает отчёт(ы) WB — «№ задания», «Артикул продавца»; склад и дату
+     берёт из фильтров сводной; красные/жёлтые — как у Ozon (для жёлтых
+     старшинство заказа берётся из WB);
+  2. раскладывает задания на 4 поставки дня:
+        «Поставка от ДД.ММ.ГГГГ МГТ коминтерна», «… МГТ учительская»,
+        «… СГТ коминтерна», «… СГТ учительская»;
+     если есть вчерашняя неотгруженная поставка того же вида — показывает,
+     что в ней лежит, и спрашивает, добавлять ли в неё;
+  3. скачивает стикеры 58×40 (без подписей) и лист подбора в формате WB,
+     в одинаковом порядке, в папку результата WB/<производство>.
+  В доставку поставки не передаются.
+
+Ключи кабинетов сохраняются в cabinets.json, токен WB — в wb.json
+рядом с программой. Эти файлы никому не пересылать.
+"""
+import io
+import json
+import os
+import queue
+import subprocess
+import sys
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import tkinter as tk
+from collections import defaultdict
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from tkinter import filedialog, messagebox, ttk
+
+import openpyxl
+import requests
+from pypdf import PdfReader, PdfWriter, Transformation
+from reportlab.pdfbase import pdfmetrics
+from reportlab.pdfbase.ttfonts import TTFont
+from reportlab.pdfgen import canvas
+
+APP_NAME = "BLAGO OTGRUZKI"
+APP_VERSION = "1.1"  # при каждом обновлении +0.1, запись в CHANGELOG.md
+API = "https://api-seller.ozon.ru"
+BATCH = 20                   # максимум отправлений в одном запросе этикеток
+READY = "awaiting_deliver"   # статус, в котором Ozon отдаёт этикетку
+BASE_DIR = Path(sys.executable).parent if getattr(sys, "frozen", False) else Path(__file__).parent
+CONFIG = BASE_DIR / "cabinets.json"
+
+# --- производства
+KOMINTERNA, UCHITELSKAYA = "Коминтерна", "Учительская"
+PRODUCTIONS = (KOMINTERNA, UCHITELSKAYA)
+
+# --- подпись артикула на этикетке
+DEFAULT_TOP_MARGIN_PT = 8      # высота полосы сверху под текст
+DEFAULT_FONT_SIZE = 8          # размер шрифта
+FONT_NAME = "Helvetica-Bold"
+STRIP_WIDTH_MM = 14            # запасной вариант, если страница слишком низкая
+MM = 72 / 25.4
+
+STATUS_RU = {
+    "awaiting_packaging": "ожидает сборки",
+    "awaiting_deliver": "ожидает отгрузки",
+    "delivering": "доставляется",
+    "delivered": "доставлено",
+    "cancelled": "отменено",
+    "awaiting_registration": "ожидает регистрации",
+    "acceptance_in_progress": "идёт приёмка",
+    "arbitration": "арбитраж",
+}
+
+
+# ================================================================ логика
+
+def production_of(article):
+    """Zerkalo… (в т.ч. bp_Zerkalo…) и Alum… -> Коминтерна, остальное -> Учительская."""
+    a = article.strip().lower()
+    if "zerkalo" in a or a.startswith(("alum", "алюм")):
+        return KOMINTERNA
+    return UCHITELSKAYA
+
+
+def combined_name(production):
+    return f"{production} объединенные.pdf"
+
+
+def sheet_names(path):
+    return openpyxl.load_workbook(path, read_only=True).sheetnames
+
+
+def cell_colors(cell):
+    """RGB заливки и шрифта ячейки (то, что задано явным цветом)."""
+    fill, font = getattr(cell, "fill", None), getattr(cell, "font", None)
+    found = []
+    for kind, color in (("fill", fill.fgColor if fill is not None and fill.fill_type else None),
+                        ("font", font.color if font is not None else None)):
+        rgb = getattr(color, "rgb", None)
+        if isinstance(rgb, str) and len(rgb) == 8:
+            found.append((kind, int(rgb[2:4], 16), int(rgb[4:6], 16), int(rgb[6:8], 16)))
+    return found
+
+
+def is_red(cell):
+    """Красная заливка или красный шрифт."""
+    return any(r >= 180 and g <= 110 and b <= 110 for _, r, g, b in cell_colors(cell))
+
+
+def is_yellow(cell):
+    """Жёлтая или оранжево-жёлтая заливка (стандартные жёлтый и «золотой» из палитры Excel)."""
+    return any(kind == "fill" and r >= 200 and g >= 150 and b <= 120 for kind, r, g, b in cell_colors(cell))
+
+
+def parse_time(value):
+    if isinstance(value, datetime):
+        return value
+    if isinstance(value, str):
+        for fmt in ("%d.%m.%Y %H:%M", "%d.%m.%Y %H:%M:%S", "%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S"):
+            try:
+                return datetime.strptime(value.strip(), fmt)
+            except ValueError:
+                pass
+    return None
+
+
+class Report:
+    """Разобранный отчёт."""
+
+    def __init__(self):
+        self.postings = {}  # едут: {номер: {артикул: количество}}
+        self.red = []       # не едут, красные: (артикул, номер)
+        self.yellow = []    # не едут, не вошли в жёлтое количество: (артикул, номер, причина)
+        self.mixed = []     # (номер, причина, [не едущие артикулы], [остальные артикулы])
+        self.limits = []    # по жёлтым артикулам: dict(art, total, limit, taken, skipped)
+        self.notes = []     # замечания к самому отчёту
+        self.times = {}     # {номер: время «Принят в обработку»}
+
+    @property
+    def total(self):
+        return len(self.postings) + len(self.red) + len(self.yellow)
+
+
+COL_NUM = ("Номер отправления", "№ задания")
+COL_ART = ("Артикул", "Артикул продавца")
+COL_QTY = ("Количество", "к")
+COL_TIME = ("Принят в обработку",)
+
+
+def _find_col(header, names, required=True):
+    for n in names:
+        if n in header:
+            return header.index(n)
+    if required:
+        raise ValueError(f"В первой строке листа нет колонки «{names[0]}»")
+    return None
+
+
+def read_report(path, sheet=None, keep=None, times=None):
+    """Читает отчёт. Сам файл программа не меняет.
+
+    Список отправлений — слева: «Номер отправления», «Принят в обработку»,
+    «Артикул», «Количество». Правее — сводная: артикул, сумма, а в следующей
+    колонке при необходимости число «сколько штук едет».
+
+    КРАСНЫЙ артикул в сводной  -> не едет ни одно отправление с ним.
+    ЖЁЛТЫЙ артикул в сводной   -> едет только указанное рядом количество штук;
+                                  берутся самые старые заказы, новые остаются.
+    Красная строка в самом списке -> не едет это отправление.
+    """
+    rpt = Report()
+    wb = openpyxl.load_workbook(path, data_only=True)
+    ws = wb[sheet] if sheet else wb.worksheets[0]
+    rows = list(ws.iter_rows())
+    header = [str(c.value).strip() if c.value is not None else "" for c in rows[0]] if rows else []
+    i_num, i_art = _find_col(header, COL_NUM), _find_col(header, COL_ART)
+    i_qty = _find_col(header, COL_QTY, required=False)
+    i_time = _find_col(header, COL_TIME, required=False)
+    last_raw = max(i_num, i_art)  # правая граница списка отправлений
+    while last_raw + 1 < len(header) and header[last_raw + 1]:
+        last_raw += 1
+
+    # --- цвета в сводной
+    red_articles, limits = set(), {}  # limits: жёлтый артикул -> сколько штук едет (None — число не указано)
+    for row in rows:
+        for i in range(last_raw + 1, len(row)):
+            c = row[i]
+            if not isinstance(c.value, str) or not c.value.strip():
+                continue
+            art = c.value.strip()
+            if is_red(c):
+                red_articles.add(art)
+            elif is_yellow(c):
+                val = row[i + 2].value if i + 2 < len(row) else None  # артикул, сумма, «едет»
+                try:
+                    limits[art] = max(int(val), 0) if val is not None and not isinstance(val, bool) else None
+                except (TypeError, ValueError):
+                    limits[art] = None
+    for art in red_articles:
+        limits.pop(art, None)
+
+    # --- список отправлений
+    allp = {}
+    for order, row in enumerate(rows[1:]):
+        if len(row) <= max(i_num, i_art) or not row[i_num].value or not row[i_art].value:
+            continue
+        num, art = str(row[i_num].value).strip(), str(row[i_art].value).strip()
+        if keep and not keep({header[i]: row[i].value for i in range(last_raw + 1) if header[i]}):
+            continue  # строка не проходит фильтр (например, другой склад WB)
+        try:
+            qty = max(int(row[i_qty].value), 1) if i_qty is not None else 1
+        except (TypeError, ValueError):
+            qty = 1
+        p = allp.setdefault(num, {"arts": {}, "time": None, "order": order, "red_row": False})
+        p["arts"][art] = p["arts"].get(art, 0) + qty
+        if i_time is not None and p["time"] is None:
+            p["time"] = parse_time(row[i_time].value)
+        if p["time"] is None and times:
+            p["time"] = times.get(num)
+        if any(is_red(c) for c in row[:last_raw + 1]):
+            p["red_row"] = True
+
+    used = {a for p in allp.values() for a in p["arts"]}
+    limits = {a: v for a, v in limits.items() if a in used}
+    for art, v in limits.items():
+        if v is None:
+            rpt.notes.append(f"Жёлтый артикул {art}: рядом со сводной не указано, сколько штук едет. "
+                             f"Пока числа нет — НЕ едет ни одна штука этого артикула.")
+    if limits and i_time is None and not times:
+        rpt.notes.append("В отчёте нет колонки «Принят в обработку»: старые и новые заказы "
+                         "для жёлтых артикулов определяются по порядку строк (сверху — старые).")
+
+    # --- красные
+    rest = {}
+    for num, p in allp.items():
+        arts = p["arts"]
+        red = [a for a in arts if a in red_articles]
+        if red or p["red_row"]:
+            rpt.red.append((red[0] if red else next(iter(arts)), num))
+            other = [a for a in arts if a not in red_articles]
+            if red and other and not p["red_row"]:
+                rpt.mixed.append((num, "красный, не едет", red, other))
+        else:
+            rest[num] = p
+
+    # --- жёлтые: от старых к новым, пока не наберётся разрешённое количество
+    left = {a: (v or 0) for a, v in limits.items()}
+    stat = {a: {"art": a, "limit": v, "total": 0, "taken": 0, "skipped": []} for a, v in limits.items()}
+    for num, p in sorted(rest.items(), key=lambda kv: (kv[1]["time"] or datetime.max, kv[1]["order"])):
+        arts = p["arts"]
+        mine = [a for a in arts if a in limits]
+        for a in mine:
+            stat[a]["total"] += arts[a]
+        blocked = [a for a in mine if arts[a] > left[a]]
+        if blocked:
+            when = p["time"].strftime("%d.%m %H:%M") if p["time"] else ""
+            for a in blocked:
+                stat[a]["skipped"].append((num, when, arts[a], left[a]))
+            a = blocked[0]
+            if limits[a] is None:
+                why = "жёлтый — не указано, сколько штук едет"
+            elif left[a] == 0:
+                why = f"жёлтый — новый заказ, разрешённые {limits[a]} шт. уже набраны более старыми"
+            else:
+                why = (f"жёлтый — в одном отправлении {arts[a]} шт., а жёлтым выбрано {limits[a]} "
+                       f"(свободно {left[a]}); это один заказ, частично собрать нельзя")
+            rpt.yellow.append((a, num, why))
+            other = [a for a in arts if a not in blocked]
+            if other:
+                rpt.mixed.append((num, "жёлтый, не вошёл в количество", blocked, other))
+        else:
+            for a in mine:
+                left[a] -= arts[a]
+                stat[a]["taken"] += arts[a]
+            rpt.postings[num] = arts
+    # отправления возвращаем в порядке отчёта
+    rpt.postings = {n: rpt.postings[n] for n in allp if n in rpt.postings}
+    rpt.limits = [stat[a] for a in sorted(stat)]
+    rpt.times = {n: p["time"] for n, p in allp.items() if p["time"]}
+    return rpt
+
+
+WORKERS = 6   # сколько запросов к Ozon идёт одновременно (лимит Ozon — 50 в секунду на кабинет)
+RETRY_WAITS = (1, 2, 4, 8, 15, 30)   # паузы при ответе 429 «слишком много запросов», сек.
+
+
+def ozon_post(url, **kw):
+    """POST в Ozon с повтором, если Ozon ответил 429 (превышен лимит запросов в секунду)."""
+    for wait in RETRY_WAITS:
+        r = requests.post(url, **kw)
+        if r.status_code != 429:
+            return r
+        time.sleep(wait)
+    return requests.post(url, **kw)
+
+
+def headers_for(cfg):
+    return {"Client-Id": str(cfg["client_id"]).strip(), "Api-Key": cfg["api_key"].strip(),
+            "Content-Type": "application/json"}
+
+
+def api_error(r):
+    try:
+        msg = r.json().get("message") or r.text
+    except ValueError:
+        msg = r.text
+    hint = {401: "неверный Client-Id или Api-Key",
+            403: "ключ неверный или у него нет прав (нужна роль Posting FBS)",
+            404: "неверный Client-Id или Api-Key"}.get(r.status_code, "")
+    return f"ошибка {r.status_code}" + (f" — {hint}" if hint else "") + f" ({str(msg)[:200]})"
+
+
+def list_postings(headers, days):
+    """FBS-отправления кабинета за последние дни:
+    {номер: {"status": ..., "products": [{"offer_id", "sku", "quantity"}], "barcodes": [...]}}.
+
+    С октября 2026 Ozon перекрыл /v3/posting/fbs/list (лимит 0 — всегда 429),
+    поэтому используется /v4/posting/fbs/list: до 100 отправлений за запрос,
+    следующая страница — по cursor вместо offset.
+    """
+    now = datetime.now(timezone.utc)
+    fmt = "%Y-%m-%dT%H:%M:%SZ"
+    flt = {"since": (now - timedelta(days=days)).strftime(fmt),
+           "to": (now + timedelta(days=1)).strftime(fmt)}
+    result, cursor, extras = {}, "", {"with": {"barcodes": True}}
+    for _ in range(1000):  # защита от бесконечного цикла
+        body = {"cursor": cursor, "filter": flt, "limit": 100, "sort_dir": "asc", **extras}
+        r = ozon_post(f"{API}/v4/posting/fbs/list", headers=headers, json=body, timeout=60)
+        if r.status_code == 400 and extras:
+            extras = {}  # если Ozon не принял запрос штрихкодов — работаем без них
+            continue
+        if r.status_code != 200:
+            raise RuntimeError(api_error(r))
+        data = r.json()
+        data = data.get("result", data) if isinstance(data.get("result"), dict) else data
+        batch = data.get("postings") or []
+        for p in batch:
+            bc = p.get("barcodes") or {}
+            result[p["posting_number"]] = {
+                "status": p.get("status", ""),
+                "products": [{"offer_id": str(x.get("offer_id", "")), "sku": x.get("sku"),
+                              "quantity": int(x.get("quantity") or 1)} for x in p.get("products") or []],
+                "barcodes": [str(v) for v in (bc.values() if isinstance(bc, dict) else bc) if v],
+                "warehouse": str((p.get("delivery_method") or {}).get("warehouse")
+                                 or (p.get("warehouse") or {}).get("name") or ""),
+                "time": p.get("in_process_at") or ""}
+        cursor = data.get("cursor") or ""
+        if not data.get("has_next") or not cursor or not batch:
+            return result
+    return result
+
+
+def check_key(headers):
+    """Быстрая проверка ключа: один запрос списка заказов на 1 отправление."""
+    now = datetime.now(timezone.utc)
+    fmt = "%Y-%m-%dT%H:%M:%SZ"
+    body = {"cursor": "", "limit": 1, "sort_dir": "asc",
+            "filter": {"since": (now - timedelta(days=3)).strftime(fmt), "to": now.strftime(fmt)}}
+    r = ozon_post(f"{API}/v4/posting/fbs/list", headers=headers, json=body, timeout=30)
+    if r.status_code != 200:
+        raise RuntimeError(api_error(r))
+
+
+def plural(n, one, few, many):
+    """1 отправление, 2 отправления, 5 отправлений."""
+    n10, n100 = n % 10, n % 100
+    word = one if n10 == 1 and n100 != 11 else few if 2 <= n10 <= 4 and not 12 <= n100 <= 14 else many
+    return f"{n} {word}"
+
+
+def units_of(info):
+    return sum(p["quantity"] for p in info["products"]) or 1
+
+
+def ship_posting(headers, num, products):
+    """Собирает заказ: каждая штука товара — отдельное грузоместо (своя этикетка).
+    Возвращает (номера получившихся отправлений | None, {номер: артикул}, ошибка)."""
+    packages = [{"products": [{"product_id": p["sku"], "quantity": 1}]}
+                for p in products for _ in range(p["quantity"])]
+    try:
+        r = ozon_post(f"{API}/v4/posting/fbs/ship", headers=headers, timeout=60,
+                          json={"posting_number": num, "packages": packages,
+                                "with": {"additional_data": True}})
+    except requests.RequestException as e:
+        return None, {}, f"нет связи: {e}"
+    if r.status_code != 200:
+        return None, {}, api_error(r)
+    data = r.json()
+    numbers = [str(n) for n in data.get("result") or []]
+    arts = {}
+    for item in data.get("additional_data") or []:
+        prods = item.get("products") or []
+        if item.get("posting_number") and prods and prods[0].get("offer_id"):
+            arts[str(item["posting_number"])] = str(prods[0]["offer_id"])
+    return numbers, arts, ""
+
+
+LABEL_TASK_WAIT = 90     # сколько секунд ждём, пока Ozon сформирует файл этикеток
+LABEL_TASK_POLL = 2      # как часто спрашиваем
+
+
+def fetch_labels(headers, numbers):
+    """PDF с этикетками. Возвращает (bytes | None, [(номер, ошибка)] — что Ozon не напечатал).
+
+    Со 2 ноября 2026 Ozon отключил /v2/posting/fbs/package-label. Теперь в два шага:
+    /v3/posting/fbs/package-label/create создаёт задание (бывает два — на обычные и маленькие
+    этикетки), /v2/posting/fbs/package-label/get отдаёт ссылку на готовый файл.
+    """
+    try:
+        r = ozon_post(f"{API}/v3/posting/fbs/package-label/create", headers=headers,
+                      json={"posting_numbers": numbers}, timeout=60)
+    except requests.RequestException as e:
+        return None, [(n, f"нет связи: {e}") for n in numbers]
+    if r.status_code != 200:
+        return None, [(n, api_error(r)) for n in numbers]
+    tasks = [t.get("task_id") for t in (r.json().get("tasks") or []) if t.get("task_id")]
+    if not tasks:
+        return None, [(n, "Ozon не создал задание на этикетки") for n in numbers]
+    files, unprinted = [], {}
+    for task in tasks:
+        pdf, bad, err = _label_task_file(headers, task)
+        unprinted.update(bad)
+        if pdf is None:
+            return None, [(n, unprinted.get(n) or err) for n in numbers]
+        files.append(pdf)
+    if len(files) == 1:
+        pdf = files[0]
+    else:
+        writer = PdfWriter()
+        for part in files:
+            for page in PdfReader(io.BytesIO(part)).pages:
+                writer.add_page(page)
+        buf = io.BytesIO()
+        writer.write(buf)
+        pdf = buf.getvalue()
+    return pdf, list(unprinted.items())
+
+
+def _label_task_file(headers, task_id):
+    """Дождаться файла задания. (pdf | None, {номер: почему не напечатан}, ошибка)."""
+    deadline = time.monotonic() + LABEL_TASK_WAIT
+    while True:
+        try:
+            r = ozon_post(f"{API}/v2/posting/fbs/package-label/get", headers=headers,
+                          json={"task_id": task_id}, timeout=60)
+        except requests.RequestException as e:
+            return None, {}, f"нет связи: {e}"
+        if r.status_code != 200:
+            return None, {}, api_error(r)
+        data = r.json()
+        status = data.get("status") or {}
+        bad = {str(x.get("posting_number")): str(x.get("message") or "этикетка не готова")
+               for x in status.get("unprinted_postings") or [] if x.get("posting_number")}
+        error = data.get("error") or {}
+        url = data.get("file_url") or ""
+        if url:
+            pdf, err = _download_label_file(url, headers)
+            return pdf, bad, err
+        code = str(status.get("code") or "").lower()
+        if error.get("code") or error.get("message") or code in ("error", "failed", "fail"):
+            msg = error.get("message") or error.get("code") or code
+            return None, bad, f"Ozon не сформировал этикетки ({msg})"
+        if time.monotonic() > deadline:
+            return None, bad, f"Ozon не отдал файл этикеток за {LABEL_TASK_WAIT} с"
+        time.sleep(LABEL_TASK_POLL)
+
+
+def _download_label_file(url, headers):
+    """Скачать PDF по ссылке из задания (сначала без ключей, если не пустили — с ключами)."""
+    for extra in ({}, headers):
+        try:
+            r = requests.get(url, headers={k: v for k, v in extra.items() if k != "Content-Type"}, timeout=60)
+        except requests.RequestException as e:
+            return None, f"нет связи: {e}"
+        if r.status_code == 200 and r.content[:4] == b"%PDF":
+            return r.content, ""
+        if r.status_code not in (401, 403):
+            break
+    return None, f"файл этикеток не скачался (ошибка {r.status_code})"
+
+
+def grab_labels(headers, numbers):
+    """Качает этикетки пачками по 20. Возвращает ([(номера, pdf)], [(номер, ошибка)])."""
+    good, bad = [], []
+    for i in range(0, len(numbers), BATCH):
+        chunk = numbers[i:i + BATCH]
+        pdf, failed = fetch_labels(headers, chunk)
+        if pdf is None and len(chunk) > 1:
+            # одно «плохое» отправление может валить всю пачку — пробуем по одному
+            for n in chunk:
+                one, why = fetch_labels(headers, [n])
+                if one is None:
+                    bad += why or [(n, "этикетка не скачалась")]
+                else:
+                    good.append(([n], one))
+            continue
+        if pdf is None:
+            bad += failed
+            continue
+        skipped = {n for n, _ in failed}  # Ozon напечатал не всё: остальное повторим позже
+        good.append(([n for n in chunk if n not in skipped], pdf))
+        bad += failed
+    return good, bad
+
+
+# ---------------------------------------------------------------- подпись и склейка
+
+def label_from_filename(filename):
+    name = os.path.splitext(filename)[0]
+    return name.replace("_", " ").replace("-", " ").strip()
+
+
+def make_top_overlay(page_w, page_h, text, top_margin, font_size):
+    buf = io.BytesIO()
+    c = canvas.Canvas(buf, pagesize=(page_w, page_h))
+    y_center = page_h - top_margin / 2
+    c.setFont(FONT_NAME, font_size)
+    c.drawCentredString(page_w / 2, y_center - font_size * 0.32, text)
+    c.save()
+    buf.seek(0)
+    return PdfReader(buf).pages[0]
+
+
+def make_strip_overlay(total_width_pt, height_pt, strip_width_pt, text, font_size):
+    buf = io.BytesIO()
+    c = canvas.Canvas(buf, pagesize=(total_width_pt, height_pt))
+    c.saveState()
+    c.translate(strip_width_pt / 2, height_pt / 2)
+    c.rotate(90)
+    size = font_size
+    max_len = height_pt - 10
+    while c.stringWidth(text, FONT_NAME, size) > max_len and size > 4:
+        size -= 0.5
+    c.setFont(FONT_NAME, size)
+    c.drawCentredString(0, -size / 3, text)
+    c.restoreState()
+    c.save()
+    buf.seek(0)
+    return PdfReader(buf).pages[0]
+
+
+TIME_FONT_SIZE = 9      # размер шрифта времени заказа
+TIME_STRIP_PT = 12      # нижняя полоса этикетки Ozon, где нет ни QR-кода, ни адреса
+
+
+def time_text(dt):
+    return dt.strftime("%d.%m %H:%M")
+
+
+_FOOTER_FONT = None
+
+
+def footer_font():
+    """Жирный шрифт с русскими буквами (Helvetica их не умеет)."""
+    global _FOOTER_FONT
+    if _FOOTER_FONT is None:
+        _FOOTER_FONT = FONT_NAME
+        windir = os.environ.get("WINDIR", r"C:\Windows")
+        for path in (os.path.join(windir, "Fonts", "arialbd.ttf"),
+                     "/Library/Fonts/Arial Bold.ttf",
+                     "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"):
+            if os.path.exists(path):
+                try:
+                    pdfmetrics.registerFont(TTFont("FooterBold", path))
+                    _FOOTER_FONT = "FooterBold"
+                    break
+                except Exception:  # noqa: BLE001 — нет шрифта, остаётся Helvetica
+                    pass
+    return _FOOTER_FONT
+
+
+def make_footer_overlay(page_w, page_h, left_text, right_text):
+    """Нижняя полоса этикетки: своя надпись слева, время заказа справа."""
+    buf = io.BytesIO()
+    c = canvas.Canvas(buf, pagesize=(page_w, page_h))
+    font, y = footer_font(), 3
+    right_w = c.stringWidth(right_text, font, TIME_FONT_SIZE) if right_text else 0
+    if right_text:
+        x = page_w - 5
+        c.setFillGray(1)
+        c.rect(x - right_w - 2, y - 2, right_w + 4, TIME_FONT_SIZE + 2, stroke=0, fill=1)
+        c.setFillGray(0)
+        c.setFont(font, TIME_FONT_SIZE)
+        c.drawRightString(x, y, right_text)
+    if left_text:
+        x0 = 5
+        room = page_w - x0 - 5 - (right_w + 8 if right_text else 0)
+        size = TIME_FONT_SIZE
+        while size > 5 and c.stringWidth(left_text, font, size) > room:
+            size -= 0.5
+        lw = c.stringWidth(left_text, font, size)
+        c.setFillGray(1)
+        c.rect(x0 - 2, y - 2, lw + 4, TIME_FONT_SIZE + 2, stroke=0, fill=1)
+        c.setFillGray(0)
+        c.setFont(font, size)
+        c.drawString(x0, y, left_text)
+    c.save()
+    buf.seek(0)
+    return PdfReader(buf).pages[0]
+
+
+def make_time_overlay(page_w, page_h, text):
+    return make_footer_overlay(page_w, page_h, "", text)
+
+
+def stamp_times(pdf_bytes, nums, times, barcodes, footer=""):
+    """Ставит время «Принят в обработку» на этикетки одной пачки.
+
+    Какая страница к какому отправлению: сначала по штрихкоду отправления в тексте
+    страницы, иначе по порядку (Ozon отдаёт этикетки в порядке запроса).
+    Возвращает (страницы, сколько подписано, сколько сопоставлено по штрихкоду).
+    """
+    pages = list(PdfReader(io.BytesIO(pdf_bytes)).pages)
+    by_order = len(pages) == len(nums)
+    stamped = matched = 0
+    for i, page in enumerate(pages):
+        text = "".join(page.extract_text().split())
+        hit = [n for n in nums if any("".join(b.split()) in text for b in barcodes.get(n, []))]
+        if len(hit) == 1:
+            num, matched = hit[0], matched + 1
+        elif by_order:
+            num = nums[i]
+        elif len({times.get(n) for n in nums}) == 1:
+            num = nums[0]          # у всех заказов пачки одно время — порядок не важен
+        else:
+            num = None
+        dt = times.get(num) if num else None
+        if dt or footer:
+            w, h = float(page.mediabox.width), float(page.mediabox.height)
+            page.merge_page(make_footer_overlay(w, h, footer, time_text(dt) if dt else ""))
+        if dt:
+            stamped += 1
+    return pages, stamped, matched
+
+
+def merge_folder(folder, output_path, font_size, top_margin):
+    """Подписывает артикул (имя файла) на каждой этикетке и склеивает все PDF
+    папки в одну ленту, сортировка Я->А. Возвращает (файлов, этикеток)."""
+    folder, output_path = Path(folder), Path(output_path)
+    files = sorted((p for p in folder.glob("*.pdf")), key=lambda p: p.name.lower(), reverse=True)
+    if not files:
+        if output_path.exists():
+            output_path.unlink()
+        return 0, 0
+
+    writer = PdfWriter()
+    strip_width_pt = STRIP_WIDTH_MM * MM
+    for f in files:
+        label = label_from_filename(f.name)
+        for page in PdfReader(str(f)).pages:
+            w, h = float(page.mediabox.width), float(page.mediabox.height)
+            if h > top_margin + 10:
+                page.merge_page(make_top_overlay(w, h, label, top_margin, font_size))
+                writer.add_page(page)
+            else:
+                overlay = make_strip_overlay(w + strip_width_pt, h, strip_width_pt, label, font_size)
+                page.add_transformation(Transformation().translate(strip_width_pt, 0))
+                overlay.merge_page(page)
+                writer.add_page(page)
+    pages = len(writer.pages)
+    with open(output_path, "wb") as fh:
+        writer.write(fh)
+    return len(files), pages
+
+
+def merge_all(out, font_size, top_margin, log):
+    """Собирает ленты по обеим папкам производств."""
+    out = Path(out)
+    for prod in PRODUCTIONS:
+        target = out / combined_name(prod)
+        try:
+            files, pages = merge_folder(out / prod, target, font_size, top_margin)
+        except PermissionError:
+            log(f"✖ {target.name}: файл открыт в другой программе — закрой его и нажми «Пересобрать ленты»")
+            continue
+        if files:
+            log(f"✔ {target.name}: {pages} этикеток, {files} артикулов")
+        else:
+            log(f"   {prod}: этикеток нет, лента не создана")
+
+
+# ---------------------------------------------------------------- основной процесс
+
+def log_report(rpt, log, market="Ozon", unit=("отправление", "отправления", "отправлений")):
+    """Пишет в журнал разбор отчёта: красные, жёлтые, смешанные, замечания."""
+    red, yellow, mixed = rpt.red, rpt.yellow, rpt.mixed
+    log(f"В отчёте {unit[2]}: {rpt.total}"
+        + (f", красных (не едут): {len(red)}" if red else "")
+        + (f", жёлтых сверх количества (не едут): {len(yellow)}" if yellow else ""))
+    for note in rpt.notes:
+        log("")
+        log("⚠ ВНИМАНИЕ: " + note)
+    if rpt.limits:
+        log("")
+        log("● ЖЁЛТЫЕ АРТИКУЛЫ — едет только часть, самые старые заказы:")
+        for L in rpt.limits:
+            lim = "не указано" if L["limit"] is None else L["limit"]
+            log(f"●   {L['art']}:  в отчёте {L['total']} шт.,  разрешено {lim},  "
+                f"едет {L['taken']},  не едет {L['total'] - L['taken']}")
+            if L["limit"] is None:
+                log("        число рядом со сводной не указано — не едет ни одно отправление")
+                continue
+            whole = [x for x in L["skipped"] if x[3] > 0]    # не помещается целиком
+            late = [x for x in L["skipped"] if x[3] == 0]    # количество уже набрано
+            for num, when, qty, free in whole:
+                log(f"⚠       Отправление {num} ({when}) — {qty} шт. в одном отправлении, "
+                    f"а жёлтым выбрано {L['limit']}"
+                    + (f" (свободно осталось {free})" if free != L["limit"] else "") + ".")
+                log("│       Собрать не можем: это один целый заказ, частично его отправить нельзя.")
+                log(f"│       Не едет целиком — все {qty} шт. Чтобы отправить часть, раздели его в кабинете {market}.")
+            for num, when, qty, _ in late[:15]:
+                log(f"        не едет — новый заказ, {L['limit']} шт. уже набраны более старыми:  "
+                    f"{num}   {when}   {qty} шт.")
+            if len(late) > 15:
+                log(f"        … и ещё {len(late) - 15} новых (после скачивания полный список — в НЕ_ЕДУТ.txt)")
+    if mixed:
+        log("")
+        log(f"⚠ ВНИМАНИЕ: {plural(len(mixed), 'отправление', 'отправления', 'отправлений')} "
+            f"НЕ ПОЕДЕТ ЦЕЛИКОМ")
+        log("│ Причина: в отправлении несколько товаров, и один из них не едет")
+        log("│ (красный или не вошёл в жёлтое количество).")
+        log("│ Отправление одно, поэтому не собирается и не едет ни один товар из него.")
+        for num, why, r, o in mixed:
+            log("│")
+            log(f"│ Отправление {num}")
+            log(f"│     {why + ':':<31}{', '.join(r)}")
+            log(f"│     {'не поедет вместе с ним:':<31}{', '.join(o)}")
+        log("│")
+        log("│ Что делать: если остальной товар нужно отправить — раздели это отправление")
+        log(f"│ в кабинете {market} вручную и собери нужную часть.")
+        log("")
+
+
+PACKING = "awaiting_packaging"
+LABEL_RETRIES, LABEL_WAIT = 8, 10  # ждём этикетки только что собранных заказов
+
+
+def process(excel, sheet, cabinets, days, out, log, progress, download=True,
+            font_size=DEFAULT_FONT_SIZE, top_margin=DEFAULT_TOP_MARGIN_PT,
+            autoship=False, confirm=lambda text: True, footer=""):
+    """download=False — только проверка отчёта: ничего не собирает и не качает."""
+    rpt = read_report(excel, sheet)
+    postings, red, yellow, mixed = rpt.postings, rpt.red, rpt.yellow, rpt.mixed
+    log_report(rpt, log)
+    # Склад: что едет по остаткам (покрашенное тобой — как покрашено)
+    sk_channel, sk_truck = ozon_channel(footer)
+    colored = {a for a, _ in red} | {L["art"] for L in rpt.limits}
+    postings = sklad_decide("ozon", sk_channel, sk_truck, postings, rpt.times, colored, log, confirm, download)
+    if not postings:
+        return
+
+    # 1. В каком кабинете каждое отправление
+    snap, owner = {}, {}  # кабинет -> его заказы;  номер -> кабинет
+    with ThreadPoolExecutor(max_workers=max(1, len(cabinets))) as pool:
+        lists = {name: pool.submit(list_postings, headers_for(cfg), days) for name, cfg in cabinets.items()}
+    for name in cabinets:  # разбираем в порядке кабинетов в окне
+        try:
+            snap[name] = lists[name].result()
+        except (RuntimeError, requests.RequestException) as e:
+            log(f"✖ {name}: не удалось получить список заказов — {e}")
+            continue
+        mine = [n for n in postings if n in snap[name] and n not in owner]
+        owner.update((n, name) for n in mine)
+        st = [snap[name][n]["status"] for n in mine]
+        log(f"✔ {name}: из отчёта найдено {len(mine)} — ожидают отгрузки {st.count(READY)}, "
+            f"ожидают сборки {st.count(PACKING)}")
+
+    # 2. Что с каждым отправлением делать
+    entries, packing, failed, bulky = [], [], [], []  # entries: (номер, артикул, кабинет)
+    for num, arts in postings.items():
+        first = next(iter(arts))
+        if num not in owner:
+            failed.append((first, num, "-", f"не найден ни в одном кабинете за {days} дн."))
+            continue
+        cab = owner[num]
+        info = snap[cab][num]
+        if info["status"] == READY:
+            entries.append((num, first, cab))
+            if units_of(info) > 1:
+                bulky.append((first, num, cab, units_of(info)))
+        elif info["status"] == PACKING:
+            packing.append((num, first, cab))
+        else:
+            st = STATUS_RU.get(info["status"], info["status"])
+            failed.append((first, num, cab, f"статус «{st}» — этикетка доступна только в «ожидает отгрузки»"))
+    to_ship = packing if autoship else []
+    places = sum(units_of(snap[c][n]) for n, _, c in to_ship)
+    if to_ship and download:
+        log(f"Будет собрано: {plural(len(to_ship), 'заказ', 'заказа', 'заказов')} → "
+            f"{plural(places, 'грузоместо', 'грузоместа', 'грузомест')} (каждая штука отдельно)")
+    if bulky:
+        log("")
+        log(f"⚠ ВНИМАНИЕ: {plural(len(bulky), 'отправление', 'отправления', 'отправлений')} "
+            f"— НЕСКОЛЬКО ШТУК, НО ТОЛЬКО 1 ШК")
+        log("│ Причина: они уже собраны в кабинете одной упаковкой. Разделить собранное нельзя,")
+        log("│ поэтому на каждое такое отправление скачается одна этикетка.")
+        log("│")
+        for art, num, cab, units in bulky[:10]:
+            log(f"│ {num}   {art}   [{cab}]   {units} шт. → 1 ШК")
+        if len(bulky) > 10:
+            log(f"│ … и ещё {len(bulky) - 10}")
+        log("")
+
+    if not download:
+        # Итог проверки: считаем и «ожидают отгрузки», и «ожидают сборки».
+        # В кабинетах при этом ничего не меняется.
+        pack_places = sum(units_of(snap[c][n]) for n, _, c in packing)
+        total = len(entries) + pack_places
+        by_cab, by_prod = defaultdict(int), defaultdict(int)
+        for _, a, c in entries:
+            by_cab[c] += 1
+            by_prod[production_of(a)] += 1
+        for n, a, c in packing:
+            by_cab[c] += units_of(snap[c][n])
+            by_prod[production_of(a)] += units_of(snap[c][n])
+        arts = {a for _, a, _ in entries} | {a for _, a, _ in packing}
+        log("\n=== ИТОГ ПРОВЕРКИ (в кабинетах ничего не изменено) ===")
+        log(f"✔ ВСЕГО ШК БУДЕТ СКАЧАНО: {total}   (артикулов: {len(arts)})")
+        log(f"     из «Ожидают отгрузки»:  {len(entries)}")
+        log(f"     из «Ожидают сборки»:    {pack_places}   "
+            f"({plural(len(packing), 'заказ', 'заказа', 'заказов')}, каждая штука — отдельный ШК)")
+        log("   По кабинетам:      " + ",  ".join(f"{c} — {by_cab[c]}" for c in cabinets if c in snap))
+        log("   По производствам:  " + ",  ".join(f"{p} — {by_prod[p]}" for p in PRODUCTIONS))
+        if packing and not autoship:
+            log("")
+            log("⚠ ВНИМАНИЕ: ГАЛКА АВТОСБОРКИ СНЯТА")
+            log(f"│ Сейчас скачается только {len(entries)} ШК — то, что уже в «Ожидают отгрузки».")
+            log(f"│ {plural(len(packing), 'заказ', 'заказа', 'заказов')} из «Ожидают сборки» "
+                f"({pack_places} ШК) программа не тронет.")
+        if red:
+            log("")
+            log(f"НЕ ЕДУТ — КРАСНЫЕ: {plural(len(red), 'отправление', 'отправления', 'отправлений')}")
+            by_art = defaultdict(int)
+            for art, _ in red:
+                by_art[art] += 1
+            for art, n in sorted(by_art.items()):
+                log(f"     {art} — {n}")
+        if rpt.limits:
+            log("")
+            log(f"● ЖЁЛТЫЕ — ЕДЕТ ЧАСТЬ (не едут новые: "
+                f"{plural(len(yellow), 'отправление', 'отправления', 'отправлений')})")
+            for L in rpt.limits:
+                log(f"     {L['art']} — едет {L['taken']} из {L['total']} шт.")
+        if mixed:
+            log("")
+            log(f"⚠ Из не едущих {len(mixed)} — отправления с несколькими товарами (см. предупреждение выше)")
+        if failed:
+            log("")
+            log(f"✖ НЕ ПОЛУЧИТСЯ СКАЧАТЬ: {plural(len(failed), 'отправление', 'отправления', 'отправлений')}")
+            for art, num, cab, why in failed[:20]:
+                where = f"кабинет {cab}" if cab != "-" else "кабинет не найден"
+                log(f"     {num}   {art}   ({where})")
+                log(f"          причина: {why}")
+            if len(failed) > 20:
+                log(f"     … и ещё {len(failed) - 20}")
+        return
+
+    if not autoship:
+        failed += [(a, n, c, "статус «ожидает сборки» — автосборка выключена") for n, a, c in packing]
+
+    # 3. Сборка заказов «ожидают сборки»
+    fresh = {}   # номер нового отправления -> (артикул, кабинет)
+    origin = {}  # номер нового отправления -> исходное отправление из отчёта
+    if to_ship:
+        if not confirm(f"Собрать {plural(len(to_ship), 'заказ', 'заказа', 'заказов')} "
+                       f"({plural(places, 'грузоместо', 'грузоместа', 'грузомест')}) в кабинетах Ozon?\n\n"
+                       f"Каждая штука станет отдельным отправлением со своей этикеткой. "
+                       f"Отменить сборку потом нельзя."):
+            log("Отменено — ничего не собрано и не скачано.")
+            return
+        log("\nСобираю заказы…")
+        shipped = defaultdict(set)  # кабинет -> номера заказов (без последней цифры)
+        src = {}                    # номер заказа без последней цифры -> исходное отправление
+        api_art = {}
+        with ThreadPoolExecutor(max_workers=WORKERS) as pool:
+            jobs = {pool.submit(ship_posting, headers_for(cabinets[cab]), num, snap[cab][num]["products"]):
+                    (num, first, cab) for num, first, cab in to_ship}
+            results = {}
+            for k, fut in enumerate(as_completed(jobs), 1):
+                results[jobs[fut]] = fut.result()
+                progress(k, len(to_ship))
+        for num, first, cab in to_ship:
+            numbers, arts, err = results[(num, first, cab)]
+            if numbers is None:
+                failed.append((first, num, cab, f"не удалось собрать: {err}"))
+                log(f"✖ {num} {first} [{cab}]: {err}")
+            else:
+                api_art.update(arts)
+                for n in numbers or [num]:
+                    fresh[n] = (first, cab)
+                    origin[n] = num
+                shipped[cab].add(num.rsplit("-", 1)[0])
+                src[num.rsplit("-", 1)[0]] = num
+        # уточняем номера и артикулы получившихся отправлений по свежему списку кабинета
+        time.sleep(3)
+        with ThreadPoolExecutor(max_workers=max(1, len(shipped))) as pool:
+            fresh_lists = {cab: pool.submit(list_postings, headers_for(cabinets[cab]), days) for cab in shipped}
+        for cab, orders in shipped.items():
+            try:
+                new = fresh_lists[cab].result()
+            except (RuntimeError, requests.RequestException):
+                continue
+            for n, info in new.items():
+                was = snap[cab].get(n, {}).get("status")
+                if (n in fresh or n.rsplit("-", 1)[0] in orders) and info["status"] == READY and was != READY:
+                    art = info["products"][0]["offer_id"] if info["products"] else ""
+                    fresh[n] = (api_art.get(n) or art or fresh.get(n, ("", cab))[0], cab)
+                    origin.setdefault(n, src.get(n.rsplit("-", 1)[0], n))
+                    snap[cab].setdefault(n, info)
+        for n, (art, cab) in fresh.items():
+            entries.append((n, api_art.get(n) or art, cab))
+        log(f"✔ Собрано, получилось отправлений: {len(fresh)}")
+
+    # 4. Скачивание. Папки производств очищаются от PDF прошлого запуска,
+    #    чтобы старые этикетки не попали в сегодняшнюю ленту.
+    out = Path(out)
+    for prod in PRODUCTIONS:
+        (out / prod).mkdir(parents=True, exist_ok=True)
+        for old in (out / prod).glob("*.pdf"):
+            old.unlink()
+
+    plan = defaultdict(lambda: defaultdict(list))  # артикул -> кабинет -> номера
+    for num, art, cab in entries:
+        plan[art][cab].append(num)
+    order = list(cabinets)  # порядок кабинетов как в окне
+    todo, done = len(entries), 0
+    writers, pending = {}, []  # имя файла -> [папка, PdfWriter, штук];  pending: (title, cab, номер, ошибка)
+
+    times = {n: rpt.times[origin.get(n, n)] for n, _, _ in entries if origin.get(n, n) in rpt.times}
+    barcodes = {n: info.get("barcodes", []) for cab in snap.values() for n, info in cab.items()}
+    stamp = {"done": 0, "matched": 0}
+
+    def add(title, parts):
+        w = writers.setdefault(title, [out / production_of(title_art[title]), PdfWriter(), 0])
+        for nums, pdf in parts:
+            pages, done_, matched_ = stamp_times(pdf, nums, times, barcodes, footer.strip())
+            stamp["done"] += done_
+            stamp["matched"] += matched_
+            for page in pages:
+                w[1].add_page(page)
+            w[2] += len(nums)
+
+    title_art, title_cab, titles, tasks = {}, {}, [], []
+    for art in sorted(plan):
+        names = [n for n in order if n in plan[art]]
+        for idx, name in enumerate(names):
+            # артикул в двух кабинетах: пачка следующего кабинета — с _X в имени
+            title = art + ("_" + "X" * idx if idx else "")
+            title_art[title], title_cab[title] = art, (name, len(names) > 1)
+            titles.append(title)
+            tasks.append((title, name, plan[art][name]))
+
+    def fetch_groups(groups):
+        """Качает этикетки нескольких пачек параллельно, результат — в порядке пачек."""
+        nonlocal done
+        with ThreadPoolExecutor(max_workers=WORKERS) as pool:
+            futs = [pool.submit(grab_labels, headers_for(cabinets[name]), nums) for _, name, nums in groups]
+            for (title, name, nums), fut in zip(groups, futs):
+                good, bad = fut.result()
+                add(title, good)
+                yield title, name, bad
+                done += len(nums)
+                progress(min(done, todo), todo)
+
+    for title, name, bad in fetch_groups(tasks):
+        pending += [(title, name, n, err) for n, err in bad]
+
+    # только что собранным заказам Ozon делает этикетку не сразу — ждём и повторяем
+    for attempt in range(LABEL_RETRIES):
+        retry = [x for x in pending if x[2] in fresh]
+        if not retry:
+            break
+        log(f"Жду этикетки от Ozon: осталось {len(retry)} (попытка {attempt + 1} из {LABEL_RETRIES})…")
+        time.sleep(LABEL_WAIT)
+        pending = [x for x in pending if x[2] not in fresh]
+        groups = defaultdict(list)
+        for title, name, n, _ in retry:
+            groups[(title, name)].append(n)
+        for title, name, bad in fetch_groups([(t, n, nums) for (t, n), nums in groups.items()]):
+            pending += [(title, name, n, err) for n, err in bad]
+    failed += [(title_art[t], n, name, err) for t, name, n, err in pending]
+
+    # Партия → склад: ровно те этикетки, что скачались (по ним грузчики сверяют зеркала)
+    not_got = {n for _, n, _, _ in failed}
+    sklad_send_batch(today_msk(), "ozon", sk_channel, sk_truck, f"Ozon · {footer.strip() or 'Озон утро'}", [
+        {"posting": n, "origin": origin.get(n, n), "article": a, "production": production_of(a),
+         "codes": barcodes.get(n, []), "ordered_at": iso(times.get(n))}
+        for n, a, _ in entries if n not in not_got], log)
+
+    mixed_note = {n: "; вместе с ним не поехал: " + ", ".join(o) for n, _, _, o in mixed}
+    skipped = ([(a, n, "красный") for a, n in red]
+               + list(yellow))
+    total = 0
+    for title in titles:
+        if title not in writers:
+            log(f"   0  {title}")
+            continue
+        folder, writer, count = writers[title]
+        safe = "".join(c if c.isalnum() or c in " _-." else "_" for c in title)
+        writer.write(folder / f"{safe}.pdf")
+        total += count
+        name, shared = title_cab[title]
+        log(f"{count:>4}  {title}   → {folder.name}" + (f"  [{name}]" if shared else ""))
+
+    log(f"Время заказа подписано на {stamp['done']} из {total} ШК"
+        + (f" (по штрихкоду сверено {stamp['matched']})" if stamp["matched"] else ""))
+    if not times:
+        log("⚠ В отчёте нет колонки «Принят в обработку» — время на ШК не подписано")
+
+    for fname, lines in (("НЕ_СКАЧАНО.txt", ["Артикул\tНомер отправления\tКабинет\tПричина"]
+                          + ["\t".join(f) for f in failed] if failed else None),
+                         ("НЕ_ЕДУТ.txt", ["Артикул\tНомер отправления\tПричина"]
+                          + [f"{a}\t{n}\t{why}{mixed_note.get(n, '')}" for a, n, why in skipped]
+                          if skipped else None),
+                         ("ПРОПУЩЕНО_КРАСНЫЕ.txt", None)):  # старое имя файла — убираем
+        if lines:
+            (out / fname).write_text("\n".join(lines), encoding="utf-8")
+        elif (out / fname).exists():
+            (out / fname).unlink()
+    log("\n=== ИТОГ ===")
+    log(f"Скачано этикеток: {total}")
+    if failed:
+        log(f"✖ НЕ СКАЧАНО: {len(failed)} — номера и причины в файле НЕ_СКАЧАНО.txt")
+    if skipped:
+        log(f"   Не едут по отчёту: красных {len(red)}, жёлтых сверх количества {len(yellow)} "
+            f"— список в файле НЕ_ЕДУТ.txt")
+
+    # 5. Подпись и склейка по производствам
+    log("\nСобираю ленты…")
+    merge_all(out, font_size, top_margin, log)
+    by_prod = defaultdict(int)
+    for folder, _, count in writers.values():
+        by_prod[folder.name] += count
+    log("")
+    log(f"✔ СКАЧАНО ШК: {total}   (" + " · ".join(f"{p} {by_prod[p]}" for p in PRODUCTIONS) + ")")
+    if failed:
+        log(f"✖ НЕ СКАЧАНО: {len(failed)} — список в НЕ_СКАЧАНО.txt")
+
+
+# ================================================================ Wildberries
+
+WB_API = "https://marketplace-api.wildberries.ru"
+WB_CONFIG = BASE_DIR / "wb.json"
+WB_BATCH = 100            # заданий в одном запросе добавления в поставку и стикеров
+WB_GAP = 0.21             # WB: не чаще одного запроса в 200 мс
+WB_CARGO = {1: "МГТ", 2: "СГТ", 3: "КГТ"}
+WB_STATUS_RU = {"new": "новое", "confirm": "на сборке (уже в поставке)",
+                "complete": "в доставке", "cancel": "отменено продавцом"}
+STICKER_W_MM, STICKER_H_MM = 58, 40
+
+_wb_lock = threading.Lock()
+_wb_last = [0.0]
+
+
+def wb_call(method, path, token, **kw):
+    """Запрос к WB: не чаще раза в 200 мс, при 429 — пауза и повтор."""
+    headers = {"Authorization": token.strip()}
+    if "json" in kw:
+        headers["Content-Type"] = "application/json"
+    for wait in RETRY_WAITS + (None,):
+        with _wb_lock:
+            gap = _wb_last[0] + WB_GAP - time.monotonic()
+            if gap > 0:
+                time.sleep(gap)
+            _wb_last[0] = time.monotonic()
+        r = requests.request(method, WB_API + path, headers=headers, timeout=60, **kw)
+        if r.status_code != 429 or wait is None:
+            return r
+        try:
+            wait = max(wait, float(r.headers.get("X-Ratelimit-Retry") or 0))
+        except ValueError:
+            pass
+        time.sleep(wait)
+    return r
+
+
+def wb_error(r):
+    try:
+        data = r.json()
+        msg = data.get("message") or data.get("detail") or data.get("title") or r.text
+    except ValueError:
+        msg = r.text
+    hint = {401: "токен неверный или просрочен",
+            403: "у токена нет доступа к категории «Маркетплейс»",
+            409: "WB не принял задание (статус или габарит не подходит)"}.get(r.status_code, "")
+    return f"ошибка {r.status_code}" + (f" — {hint}" if hint else "") + f" ({str(msg)[:200]})"
+
+
+def wb_ok(r, *codes):
+    if r.status_code not in (codes or (200,)):
+        raise RuntimeError(wb_error(r))
+    return r
+
+
+def wb_time(value):
+    """RFC3339 от WB -> местное время без зоны (как время в отчётах Ozon)."""
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00")).astimezone().replace(tzinfo=None)
+    except ValueError:
+        return None
+
+
+def wb_check(token):
+    wb_ok(wb_call("GET", "/api/v3/supplies", token, params={"limit": 1, "next": 0}))
+
+
+def wb_new_orders(token):
+    """Новые сборочные задания: {id: задание}."""
+    r = wb_ok(wb_call("GET", "/api/v3/orders/new", token))
+    return {str(o["id"]): o for o in r.json().get("orders") or []}
+
+
+def wb_orders(token, days_from, days_to=0):
+    """Все задания за период (дни назад): {id: задание}. WB отдаёт максимум 30 дней за раз."""
+    now = int(time.time())
+    result = {}
+    lo_day = days_to
+    while lo_day < days_from:
+        hi = now - lo_day * 86400
+        lo = now - min(lo_day + 30, days_from) * 86400
+        nxt = 0
+        for _ in range(1000):
+            r = wb_ok(wb_call("GET", "/api/v3/orders", token,
+                              params={"limit": 1000, "next": nxt, "dateFrom": lo, "dateTo": hi}))
+            data = r.json()
+            batch = data.get("orders") or []
+            for o in batch:
+                result[str(o["id"])] = o
+            nxt = data.get("next") or 0
+            if len(batch) < 1000 or not nxt:
+                break
+        lo_day += 30
+    return result
+
+
+def wb_statuses(token, ids):
+    """{id: (статус продавца, статус WB)}."""
+    result = {}
+    ids = [int(i) for i in ids]
+    for i in range(0, len(ids), 1000):
+        r = wb_ok(wb_call("POST", "/api/v3/orders/status", token, json={"orders": ids[i:i + 1000]}))
+        for o in r.json().get("orders") or []:
+            result[str(o["id"])] = (o.get("supplierStatus", ""), o.get("wbStatus", ""))
+    return result
+
+
+def wb_open_supplies(token):
+    """Незакрытые (не переданные в доставку) поставки."""
+    result, nxt = [], 0
+    for _ in range(1000):
+        r = wb_ok(wb_call("GET", "/api/v3/supplies", token, params={"limit": 1000, "next": nxt}))
+        data = r.json()
+        batch = data.get("supplies") or []
+        result += [s for s in batch if not s.get("done")]
+        nxt = data.get("next") or 0
+        if len(batch) < 1000 or not nxt:
+            break
+    return result
+
+
+def wb_supply_orders(token, supply_id):
+    r = wb_ok(wb_call("GET", f"/api/marketplace/v3/supplies/{supply_id}/order-ids", token))
+    data = r.json()
+    return [str(i) for i in (data.get("orderIds") or data.get("orders") or [])]
+
+
+def wb_create_supply(token, name):
+    r = wb_ok(wb_call("POST", "/api/v3/supplies", token, json={"name": name}), 200, 201)
+    return r.json()["id"]
+
+
+def wb_add_orders(token, supply_id, ids):
+    """Добавляет задания в поставку по 100. Возвращает [(id, ошибка)] для не добавленных."""
+    bad = []
+    path = f"/api/marketplace/v3/supplies/{supply_id}/orders"
+    for i in range(0, len(ids), WB_BATCH):
+        chunk = ids[i:i + WB_BATCH]
+        r = wb_call("PATCH", path, token, json={"orders": [int(x) for x in chunk]})
+        if r.status_code in (200, 204):
+            continue
+        if len(chunk) == 1 or r.status_code in (401, 403):
+            bad += [(x, wb_error(r)) for x in chunk]
+            continue
+        for x in chunk:  # одно «плохое» задание валит пачку — добавляем по одному
+            r1 = wb_call("PATCH", path, token, json={"orders": [int(x)]})
+            if r1.status_code not in (200, 204):
+                bad.append((x, wb_error(r1)))
+    return bad
+
+
+def wb_stickers(token, ids):
+    """Стикеры PNG 58×40: ({id: стикер}, [(id, ошибка)])."""
+    good, bad = {}, []
+    for i in range(0, len(ids), WB_BATCH):
+        chunk = ids[i:i + WB_BATCH]
+        r = wb_call("POST", "/api/v3/orders/stickers", token,
+                    params={"type": "png", "width": STICKER_W_MM, "height": STICKER_H_MM},
+                    json={"orders": [int(x) for x in chunk]})
+        if r.status_code != 200:
+            bad += [(x, wb_error(r)) for x in chunk]
+            continue
+        for st in r.json().get("stickers") or []:
+            if st.get("file"):
+                good[str(st["orderId"])] = st
+        bad += [(x, "WB не отдал стикер") for x in chunk if x not in good]
+    return good, bad
+
+
+def pick_order(article):
+    """Порядок почти как в листе подбора WB: по алфавиту, bp_Zerkalo_160x50 — сразу после Zerkalo_160x50."""
+    a = article.lower()
+    return (a[3:] if a.startswith("bp_") else a), a.startswith("bp_"), a
+
+
+def sticker_text(st):
+    return f"{st.get('partA', '')} {st.get('partB', '')}".strip()
+
+
+def stickers_pdf(stickers):
+    """PDF 58×40 мм, один стикер на страницу, в переданном порядке."""
+    import base64
+    from reportlab.lib.utils import ImageReader
+    buf = io.BytesIO()
+    w, h = STICKER_W_MM * MM, STICKER_H_MM * MM
+    c = canvas.Canvas(buf, pagesize=(w, h))
+    for st in stickers:
+        img = ImageReader(io.BytesIO(base64.b64decode(st["file"])))
+        c.drawImage(img, 0, 0, width=w, height=h)
+        c.showPage()
+    c.save()
+    return buf.getvalue()
+
+
+def pick_list_xlsx(path, supply_id, rows, day):
+    """Лист подбора в формате WB: rows — [(артикул, стикер)] в порядке стикеров."""
+    from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Лист подбора"
+    left = Alignment(horizontal="left", vertical="center")
+    wrap = Alignment(horizontal="left", vertical="center", wrap_text=True)
+    thin = Side(style="thin")
+    box = Border(left=thin, right=thin, top=thin, bottom=thin)
+    ws.merge_cells("A1:C1")
+    ws.merge_cells("A2:I2")
+    ws.merge_cells("A4:D4")
+    ws.merge_cells("E4:G4")
+    ws["A1"] = f"Дата: {day:%d.%m.%Y}"
+    ws["A1"].font, ws["A1"].alignment = Font(size=11), left
+    ws["A2"] = f"Лист подбора {supply_id}"
+    ws["A2"].font, ws["A2"].alignment = Font(size=14, bold=True), left
+    ws["A2"].fill = PatternFill("solid", fgColor="FF9A41FE")
+    ws["A4"] = f"Количество товаров: {len(rows)}"
+    ws["A4"].font, ws["A4"].alignment = Font(size=11), left
+    for col, text in (("A", "Артикул продавца"), ("B", "Стикер")):
+        c = ws[f"{col}5"]
+        c.value, c.font, c.alignment, c.border = text, Font(size=11, bold=True), wrap, box
+        c.fill = PatternFill("solid", fgColor="FFE3E4EA")
+    for i, (art, sticker) in enumerate(rows, 6):
+        a, b = ws.cell(i, 1, art), ws.cell(i, 2, sticker)
+        a.font, b.font = Font(size=11), Font(size=11, bold=True)
+        for c in (a, b):
+            c.alignment, c.border = wrap, box
+        ws.row_dimensions[i].height = 68
+    ws.column_dimensions["A"].width = 10
+    ws.column_dimensions["B"].width = 9
+    for r, hgt in ((1, 20), (2, 40), (4, 24), (5, 36)):
+        ws.row_dimensions[r].height = hgt
+    wb.save(path)
+
+
+def wb_supply_name(day, cargo, prod):
+    return f"Поставка от {day:%d.%m.%Y} {cargo} {prod.lower()}"
+
+
+def wb_parse_name(name):
+    """«Поставка от 27.10.2026 МГТ коминтерна» -> (дата, габарит, производство) или None."""
+    import re
+    m = re.match(r"\s*Поставка от (\d\d\.\d\d\.\d{4})\s+(\S+)\s+(\S+)\s*$", name or "", re.I)
+    if not m:
+        return None
+    try:
+        day = datetime.strptime(m.group(1), "%d.%m.%Y").date()
+    except ValueError:
+        return None
+    prod = next((p for p in PRODUCTIONS if p.lower() == m.group(3).lower()), None)
+    return (day, m.group(2).upper(), prod) if prod else None
+
+
+def wb_report_filter(path, sheet=None):
+    """Фильтры сводной WB («Склад продавца», «Доставить на склад») -> (функция-фильтр, описание).
+    В сводной фильтр стоит в ячейке справа от названия поля; «(Все)» — без фильтра."""
+    wbk = openpyxl.load_workbook(path, data_only=True, read_only=True)
+    ws = wbk[sheet] if sheet else wbk.worksheets[0]
+    rows = [list(r) for r in ws.iter_rows(min_row=1, max_row=12, values_only=True)]
+    wbk.close()
+    header = [str(v).strip() if v is not None else "" for v in rows[0]] if rows else []
+    first_empty = header.index("") if "" in header else len(header)
+    want = {}
+    for r_i, row in enumerate(rows):
+        for i in range(first_empty, len(row) - 1):
+            label = str(row[i]).strip() if row[i] is not None else ""
+            if label in ("Склад продавца", "Доставить на склад") and row[i + 1] is not None:
+                val = row[i + 1]
+                val = val.strftime("%d.%m.%Y") if isinstance(val, datetime) else str(val).strip()
+                if val and not val.startswith("(Все") and not val.startswith("(Несколько"):
+                    want[label] = val
+    if not want:
+        return None, "фильтров в сводной нет — берутся все задания"
+
+    def norm(v):
+        return v.strftime("%d.%m.%Y") if isinstance(v, datetime) else str(v if v is not None else "").strip()
+
+    def keep(row):
+        return all(norm(row.get(k)) == v for k, v in want.items() if k in row)
+
+    return keep, ", ".join(f"{k}: {v}" for k, v in want.items())
+
+
+def wb_read_reports(files, times):
+    """Читает один или несколько отчётов WB. Возвращает [(файл, описание фильтра, Report)]."""
+    result = []
+    for path in files:
+        keep, desc = wb_report_filter(path)
+        result.append((path, desc, read_report(path, keep=keep, times=times)))
+    return result
+
+
+WB_SKLAD_CHANNEL = {"МГТ": "WB", "СГТ": "СГТ", "КГТ": "КГТ"}   # габарит поставки → канал склада
+
+
+def wb_save_supply(token, supply, ids, articles, out, day, log, collect=None):
+    """Скачивает стикеры поставки и делает лист подбора. Порядок — как в листе подбора WB:
+    по артикулу, внутри артикула — по номеру стикера. Возвращает (сколько ШК, [(id, ошибка)])."""
+    if not ids:
+        log(f"   {supply['name']} — пустая")
+        return 0, []
+    good, bad = wb_stickers(token, ids)
+    rows = sorted(((articles.get(i, "?"), sticker_text(st), i) for i, st in good.items()),
+                  key=lambda x: (pick_order(x[0]), x[1]))
+    parsed = wb_parse_name(supply["name"])
+    prod = parsed[2] if parsed else production_of(rows[0][0]) if rows else UCHITELSKAYA
+    folder = Path(out) / prod
+    folder.mkdir(parents=True, exist_ok=True)
+    safe = "".join(c if c.isalnum() or c in " _-.()" else "_" for c in supply["name"])
+    if rows:
+        (folder / f"ШК {safe}.pdf").write_bytes(stickers_pdf([good[i] for _, _, i in rows]))
+        pick_list_xlsx(folder / f"Лист подбора {safe}.xlsx", supply["id"], [(a, s) for a, s, _ in rows], day)
+    log(f"✔ {supply['name']} — {len(rows)} ШК")
+    if collect is not None:  # для партии на склад: какие стикеры скачаны
+        cargo = parsed[1] if parsed else "МГТ"
+        for art, _, i in rows:
+            st = good[i]
+            collect.append((cargo, {"posting": str(i), "article": art, "production": prod,
+                                    "codes": [str(st.get("barcode") or ""),
+                                              f"{st.get('partA', '')}{st.get('partB', '')}", str(i)]}))
+    unknown = sum(1 for a, _, _ in rows if a == "?")
+    if unknown:
+        log(f"⚠    у {unknown} заданий WB не отдал артикул — в листе подбора стоит «?»")
+    return len(rows), bad
+
+
+def wb_articles(token, ids, known):
+    """Артикулы заданий: сначала из уже полученных, остальное — из списка заданий за 30, затем 90 дней."""
+    arts = {i: known[i]["article"] for i in ids if i in known}
+    for lo, hi in ((30, 0), (90, 30)):
+        missing = [i for i in ids if i not in arts]
+        if not missing:
+            break
+        found = wb_orders(token, lo, hi)
+        arts.update((i, found[i].get("article", "?")) for i in missing if i in found)
+    return arts
+
+
+def process_wb(files, token, out, log, progress, mode="check", confirm=lambda text: True,
+               today=None):
+    """mode: check — только проверка (в WB ничего не меняется);
+             run — создать поставки, добавить задания, скачать стикеры и листы подбора;
+             stickers — только скачать стикеры и листы открытых поставок программы."""
+    day = today or datetime.now(timezone(timedelta(hours=3))).date()  # дата по Москве
+
+    if mode == "stickers":
+        supplies = [s for s in wb_open_supplies(token) if wb_parse_name(s.get("name"))]
+        if not supplies:
+            log("Открытых поставок «Поставка от …» нет.")
+            return
+        _wb_download(token, supplies, {}, out, day, log, progress)
+        return
+
+    # 1. Новые задания WB: нужны время заказа (для жёлтых) и габарит
+    new = wb_new_orders(token)
+    times = {i: wb_time(o.get("createdAt")) for i, o in new.items() if o.get("createdAt")}
+
+    # 2. Отчёты — по строке на файл, жёлтые — по строке на артикул
+    reports = wb_read_reports(files, times)
+    postings, red, yellow, colored = {}, [], [], set()
+    for path, desc, rpt in reports:
+        log(f"{Path(path).stem}: едут {len(rpt.postings)}"
+            + (f" · красных {len(rpt.red)}" if rpt.red else "")
+            + (f" · жёлтых сверх количества {len(rpt.yellow)}" if rpt.yellow else ""))
+        for L in rpt.limits:
+            lim = "число не указано" if L["limit"] is None else f"едет {L['taken']} из {L['total']}"
+            log(f"●   {L['art']} — {lim}")
+        for note in rpt.notes:
+            log("⚠ " + note)
+        postings.update(rpt.postings)
+        red += rpt.red
+        yellow += rpt.yellow
+        colored |= {a for a, _ in rpt.red} | {L["art"] for L in rpt.limits}
+    if not postings:
+        log("В отчётах нет заданий, которые едут.")
+        return
+
+    # 3. Что с каждым заданием
+    groups = defaultdict(list)  # (габарит, производство, склад) -> [id]
+    failed = []                 # (артикул, id, причина)
+    not_new = [n for n in postings if n not in new]
+    status = wb_statuses(token, not_new) if not_new else {}
+    for num, arts in postings.items():
+        art = next(iter(arts))
+        o = new.get(num)
+        if o is None:
+            st = status.get(num)
+            why = (f"статус «{WB_STATUS_RU.get(st[0], st[0])}»" if st
+                   else "не найдено в WB")
+            failed.append((art, num, why))
+            continue
+        cargo = WB_CARGO.get(o.get("cargoType"), f"габарит {o.get('cargoType')}")
+        groups[(cargo, production_of(o.get("article") or art), o.get("warehouseId"))].append(num)
+
+    # Склад: что едет по остаткам (покрашенное тобой — как покрашено)
+    if sklad_on():
+        by_channel = defaultdict(dict)
+        for (cargo, _, _), ids in groups.items():
+            for i in ids:
+                by_channel[WB_SKLAD_CHANNEL.get(cargo, "WB")][i] = postings[i]
+        allowed = set()
+        for channel, part in by_channel.items():
+            got = sklad_decide("wb", channel, "", part, times, colored, log, confirm, mode == "run")
+            if got is None:
+                return
+            allowed |= set(got)
+        for key in list(groups):
+            groups[key] = [i for i in groups[key] if i in allowed]
+            if not groups[key]:
+                del groups[key]
+
+    # 4. Поставки: сегодняшние с таким именем берём как есть, вчерашние неотгруженные — спрашиваем
+    open_sup = wb_open_supplies(token)
+    by_kind = defaultdict(list)
+    for s in open_sup:
+        p = wb_parse_name(s.get("name"))
+        if p:
+            by_kind[(p[1], p[2])].append((p[0], s))
+    multi_wh = defaultdict(set)
+    for cargo, prod, wh in groups:
+        multi_wh[(cargo, prod)].add(wh)
+
+    plan = []  # (ключ группы, имя, поставка | None, [id])
+    known_arts = dict(new)
+    for key in sorted(groups, key=lambda k: (k[0], PRODUCTIONS.index(k[1]) if k[1] in PRODUCTIONS else 9)):
+        cargo, prod, wh = key
+        ids = groups[key]
+        name = wb_supply_name(day, cargo, prod)
+        if len(multi_wh[(cargo, prod)]) > 1:
+            name += f" склад {wh}"
+        same = [s for d, s in by_kind.get((cargo, prod), []) if d == day and s.get("name") == name]
+        older = sorted(((d, s) for d, s in by_kind.get((cargo, prod), []) if d < day),
+                       key=lambda x: x[0], reverse=True)
+        target = same[0] if same else None
+        if target is None and len(multi_wh[(cargo, prod)]) == 1:
+            for d, s in older:
+                inside = wb_supply_orders(token, s["id"])
+                arts = wb_articles(token, inside, known_arts)
+                cnt = defaultdict(int)
+                for i in inside:
+                    cnt[arts.get(i, "?")] += 1
+                log("")
+                log(f"⚠ Не отгружена вчерашняя «{s['name']}» — в ней {len(inside)} шт.:")
+                for a, n in sorted(cnt.items()):
+                    log(f"│     {a} — {n}")
+                if mode != "run":
+                    target = None
+                    break
+                lines = "\n".join(f"   {a} — {n}" for a, n in sorted(cnt.items())) or "   (пустая)"
+                if confirm(f"Есть неотгруженная поставка:\n«{s['name']}»\n\nВ ней уже лежит:\n{lines}\n\n"
+                           f"Проверь, что эти зеркала есть.\n\n"
+                           f"Добавить в неё сегодняшние {len(ids)} заданий ({cargo} {prod.lower()})?\n\n"
+                           f"Да — добавить в эту поставку\nНет — создать новую «{name}»"):
+                    target = s
+                    log("│ → сегодняшние задания добавятся в неё")
+                    break
+                log("│ → будет новая поставка за сегодня")
+        plan.append((key, name, target, ids))
+
+    log("")
+    for (cargo, prod, _), name, target, ids in plan:
+        where = f" (в «{target['name']}»)" if target and target.get("name") != name else ""
+        log(f"{'→' if mode != 'run' else '•'} {name} — {plural(len(ids), 'задание', 'задания', 'заданий')}{where}")
+    total = sum(len(ids) for *_, ids in plan)
+    if failed:
+        by_why = defaultdict(list)
+        for art, num, why in failed:
+            by_why[why].append((art, num))
+        for why, items in by_why.items():
+            log(f"✖ Не поедут — {why}: {len(items)}")
+            if "уже в поставке" not in why:
+                for art, num in items[:10]:
+                    log(f"│     {num}  {art}")
+    if mode != "run":
+        log(f"✔ ВСЕГО ШК БУДЕТ СКАЧАНО: {total}")
+        return
+    if not plan:
+        return
+
+    # 5. Создание поставок и добавление заданий
+    news = [name for _, name, target, _ in plan if target is None]
+    if not confirm(f"Добавить {plural(total, 'задание', 'задания', 'заданий')} в поставки WB"
+                   + (f" (новых поставок: {len(news)})" if news else "") + "?\n\n"
+                   f"Задания перейдут в статус «На сборке». Вернуть их в «Новые» потом нельзя."):
+        log("Отменено — в WB ничего не изменено.")
+        return
+    touched, done = [], 0
+    for (cargo, prod, _), name, target, ids in plan:
+        try:
+            if target is None:
+                target = {"id": wb_create_supply(token, name), "name": name}
+            bad = wb_add_orders(token, target["id"], ids)
+        except (RuntimeError, requests.RequestException) as e:
+            log(f"✖ {name}: {e}")
+            failed += [(next(iter(postings[i])), i, f"не добавлено: {e}") for i in ids]
+            continue
+        failed += [(next(iter(postings[i])), i, f"не добавлено: {err}") for i, err in bad]
+        for i, err in bad:
+            log(f"✖ Не добавлено {i}  {next(iter(postings[i]))} — {err}")
+        touched.append(target)
+        done += len(ids)
+        progress(done, total)
+
+    # 6. Стикеры и листы подбора
+    sticker_bad = _wb_download(token, touched, known_arts, out, day, log, progress)
+    out_dir = Path(out)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    fails = [(a, n, why) for a, n, why in failed] + [("", n, err) for n, err in sticker_bad]
+    skipped = [(a, n, "красный") for a, n in red] + list(yellow)
+    for fname, lines in (("НЕ_СКАЧАНО.txt", ["Артикул\tНомер задания\tПричина"]
+                          + ["\t".join(f) for f in fails] if fails else None),
+                         ("НЕ_ЕДУТ.txt", ["Артикул\tНомер задания\tПричина"]
+                          + ["\t".join(x) for x in skipped] if skipped else None)):
+        if lines:
+            (out_dir / fname).write_text("\n".join(lines), encoding="utf-8")
+        elif (out_dir / fname).exists():
+            (out_dir / fname).unlink()
+
+
+def _wb_download(token, supplies, known, out, day, log, progress):
+    log("")
+    ids = {s["id"]: wb_supply_orders(token, s["id"]) for s in supplies}
+    every = [i for v in ids.values() for i in v]
+    arts = wb_articles(token, every, known)
+    total, bad, collect = 0, [], []
+    for k, s in enumerate(supplies, 1):
+        n, b = wb_save_supply(token, s, ids[s["id"]], arts, out, day, log, collect)
+        total += n
+        bad += b
+        progress(k, len(supplies))
+    for i, err in bad[:20]:
+        log(f"✖ стикер {i}: {err}")
+    log(f"✔ СКАЧАНО ШК: {total}")
+    # Партии → склад: WB (МГТ), СГТ — по скачанным стикерам
+    by_channel = defaultdict(list)
+    for cargo, item in collect:
+        by_channel[WB_SKLAD_CHANNEL.get(cargo, "WB")].append(item)
+    for channel, items in by_channel.items():
+        sklad_send_batch(day, "wb", channel, "", f"WB · {channel}", items, log)
+    return bad
+
+
+# ================================================================ Утро: отчёты и сборка
+
+MORNING_CONFIG = BASE_DIR / "morning.json"
+MSK = timezone(timedelta(hours=3))   # время в отчётах — московское, как в выгрузках Ozon
+OZON_STATUSES = (PACKING, READY)     # «ожидают сборки» и «ожидают отгрузки»
+# склад с таким словом в названии — отчёт КГТ (в кабинете R он называется «FBS - СГТ Тверь»)
+KGT_WORDS = ("кгт", "kgt", "сгт", "sgt", "крупногабар", "сверхгабар")
+
+
+_TO_CYR = str.maketrans("cskgtaeopxmhby", "сскгтаеорхмнву")  # латинские буквы-двойники -> русские
+
+
+def is_kgt(warehouse):
+    """Ozon иногда пишет «СГТ» латинской C — поэтому сравниваем после замены двойников."""
+    w = " ".join((warehouse or "").lower().split()).translate(_TO_CYR)
+    return any(k.translate(_TO_CYR) in w for k in KGT_WORDS)
+# столбцы «Сборки»: ключ -> как столбец подписан во второй строке листа «Полотна»
+SBORKA_COLS = {"ozon": "OZON", "kgt": "КГТ", "cdek": "СДЭК", "wb": "WB Тверь", "sgt": "ТВ СГТ"}
+SBORKA_SHEETS = ("Полотна", "Алюминий", "Безрамные")
+_LAT = str.maketrans("хХаАоОсСеЕуУрРкКмМтТ", "xXaAoOcCeEyYpPkKmMtT")
+
+
+def norm_article(article):
+    """Артикул к одному виду для сравнения с шаблоном: русские буквы -> латинские, лишние пробелы,
+    bp_Zerkalo_50x160 = Zerkalo_50x160_bp, Zerkalo_200x80 = Zerkalo_80x200, регистр не важен."""
+    import re
+    a = " ".join(str(article).split()).translate(_LAT).replace("Zerkalo.", "Zerkalo_")
+    if a.lower().startswith("bp_"):
+        a = a[3:] + "_bp"
+    m = re.match(r"^(zerkalo)_(\d+)x(\d+)(_.*)?$", a, re.I)
+    if m:
+        x, y = sorted((int(m.group(2)), int(m.group(3))))
+        a = f"Zerkalo_{x}x{y}{m.group(4) or ''}"
+    a = "_".join(p for p in a.split("_") if p)
+    return a.lower()
+
+
+def ozon_time(value):
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00")).astimezone(MSK).replace(tzinfo=None)
+    except ValueError:
+        return None
+
+
+def write_report(path, sheet, header, rows, qty_col, pivot_title, blocks=None):
+    """Отчёт как у тебя: слева список, справа (через 2 пустых столбца) итог по артикулам.
+    rows — списки значений под header; qty_col — индекс количества; артикул — колонка «Артикул…».
+    blocks — вместо rows: список блоков (Z, R, IZ, Z otgr…), между блоками — линия."""
+    from openpyxl.styles import Border, Font, Side
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = sheet
+    ws.append(header)
+    if blocks is not None:
+        rows = [r for b in blocks for r in b]
+    line = Side(style="thin")
+    for b in blocks or [rows]:
+        first = ws.max_row + 1
+        for r in b:
+            ws.append(r)
+        if blocks is not None and b:
+            for c in range(1, len(header) + 1):
+                ws.cell(first, c).border = Border(top=line, bottom=Side())
+                last = ws.cell(ws.max_row, c)
+                last.border = Border(top=line if ws.max_row == first else Side(), bottom=line)
+    for row in ws.iter_rows(min_row=2, max_col=len(header)):
+        for c in row:
+            if isinstance(c.value, datetime):
+                c.number_format = "dd.mm.yyyy h:mm"
+    i_art = next(i for i, h in enumerate(header) if h.startswith("Артикул"))
+    total = defaultdict(int)
+    for r in rows:
+        total[r[i_art]] += r[qty_col]
+    col = len(header) + 3
+    bold = Font(bold=True)
+    ws.cell(1, col, "Названия строк").font = bold
+    ws.cell(1, col + 1, pivot_title).font = bold
+    for k, art in enumerate(sorted(total, key=str.lower), 2):
+        ws.cell(k, col, art)
+        ws.cell(k, col + 1, total[art])
+    end = len(total) + 2
+    ws.cell(end, col, "Общий итог").font = bold
+    ws.cell(end, col + 1, sum(total.values())).font = bold
+    for i, h in enumerate(header, 1):
+        ws.column_dimensions[openpyxl.utils.get_column_letter(i)].width = max(12, len(h) + 2)
+    ws.column_dimensions[openpyxl.utils.get_column_letter(i_art + 1)].width = 34
+    ws.column_dimensions[openpyxl.utils.get_column_letter(col)].width = 34
+    ws.column_dimensions[openpyxl.utils.get_column_letter(col + 1)].width = 12
+    ws.freeze_panes = "A2"
+    wb.save(path)
+    return dict(total)
+
+
+def read_totals(path):
+    """Сумма по артикулам из списка заказов (первый лист): колонка «Артикул…» и «к»/«Количество».
+    Красный цвет не учитывается — в сборку идёт всё."""
+    wb = openpyxl.load_workbook(path, data_only=True, read_only=True)
+    ws = wb.worksheets[0]
+    rows = ws.iter_rows(values_only=True)
+    header = [str(c).strip() if c is not None else "" for c in next(rows)]
+    i_art = _find_col(header, COL_ART)
+    i_qty = _find_col(header, COL_QTY, required=False)
+    total = defaultdict(int)
+    for r in rows:
+        if len(r) <= i_art or r[i_art] is None or not str(r[i_art]).strip():
+            continue
+        try:
+            q = int(r[i_qty]) if i_qty is not None and r[i_qty] is not None else 1
+        except (TypeError, ValueError):
+            q = 1
+        total[str(r[i_art]).strip()] += q
+    wb.close()
+    return dict(total)
+
+
+def put_grand_totals(ws, cols):
+    """Строка над итогом «полотна(без креплений)//алюминий//безрамные»: общая сумма столбца
+    по всем трём листам. Диапазоны берутся из той же итоговой формулы, поэтому шаблон можно менять.
+    Если в ячейке уже что-то есть (своя формула) — не трогаем."""
+    import re
+    for key, c in cols.items():
+        for r in range(3, ws.max_row + 1):
+            f = ws.cell(r, c).value
+            if isinstance(f, str) and f.startswith("=") and '"//"' in f:
+                sums = re.findall(r"SUM\([^)]*\)", f, re.I)
+                target = ws.cell(r - 1, c)
+                if sums and r > 3 and target.value in (None, ""):
+                    target.value = "=" + "+".join(sums)
+                break
+
+
+def fill_sborka(template, out_path, day, data, log, base=None):
+    """Заполняет «Сборку». data: {ключ столбца: {артикул: количество}}.
+    base — уже заполненный файл (тогда меняются только столбцы из data)."""
+    wb = openpyxl.load_workbook(base or template)
+    head = wb[SBORKA_SHEETS[0]] if SBORKA_SHEETS[0] in wb.sheetnames else wb.worksheets[0]
+    cols = {}
+    for c in head[2]:
+        v = " ".join(str(c.value or "").split()).lower()
+        for key, title in SBORKA_COLS.items():
+            if v == title.lower():
+                cols[key] = c.column
+    missing = [SBORKA_COLS[k] for k in data if k not in cols]
+    if missing:
+        raise ValueError("в шаблоне во 2-й строке листа «Полотна» нет столбцов: " + ", ".join(missing))
+    if base is None:
+        head.cell(1, 3, datetime.combine(day, datetime.min.time()))
+    rows = []   # (лист, строка, нормальный артикул)
+    for name in SBORKA_SHEETS:
+        if name not in wb.sheetnames:
+            continue
+        ws = wb[name]
+        for r in range(3, ws.max_row + 1):
+            a = ws.cell(r, 1).value
+            if not isinstance(a, str) or not a.strip() or a.startswith("="):
+                continue
+            rows.append((ws, r, norm_article(a)))
+    where = defaultdict(list)
+    for ws, r, key in rows:
+        where[key].append((ws, r))
+    result = {}
+    for key, totals in data.items():
+        c = cols[key]
+        for ws, r, _ in rows:  # чистим столбец: в шаблоне могли остаться старые числа
+            cell = ws.cell(r, c)
+            if not (isinstance(cell.value, str) and cell.value.startswith("=")):
+                cell.value = None
+        placed, lost = 0, []
+        merged = defaultdict(int)
+        names = defaultdict(list)
+        for art, q in totals.items():
+            merged[norm_article(art)] += q
+            names[norm_article(art)].append(art)
+        for k, q in merged.items():
+            if k in where:
+                ws, r = where[k][0]
+                ws.cell(r, c).value = q
+                placed += q
+            else:
+                lost.append((", ".join(names[k]), q))
+        result[key] = (placed, sum(merged.values()), lost)
+    put_grand_totals(head, cols)
+    wb.save(out_path)
+    lost = [(SBORKA_COLS[k], art, q) for k, (_, _, ls) in result.items() for art, q in ls]
+    if lost:
+        log("⚠ Нет в шаблоне сборки — добавь строками в шаблон, если нужны:")
+        for col, art, q in sorted(lost):
+            log(f"│     {art} — {q} шт. ({col.strip()})")
+    return result
+
+
+def wb_warehouses(token):
+    try:
+        r = wb_call("GET", "/api/v3/warehouses", token)
+        if r.status_code == 200:
+            return {w.get("id"): w.get("name", "") for w in r.json() or []}
+    except requests.RequestException:
+        pass
+    return {}
+
+
+def ozon_reports(cabinets, days, out, log, statuses, names, shk=None, lines=None, truck="Озон1", cabs=None):
+    """Отчёты Ozon из всех кабинетов. statuses — какие статусы брать (в этом порядке блоков);
+    names — {"ozon" | "kgt": имя файла без .xlsx}: какие отчёты делать.
+    cabs — если передан, сюда пишется по каждому кабинету: (сколько отправлений | None, ошибка).
+    Возвращает ({ключ: {артикул: шт}}, {ключ: путь})."""
+    data, files = {}, {}
+    with ThreadPoolExecutor(max_workers=max(1, len(cabinets))) as pool:
+        lists = {n: pool.submit(list_postings, headers_for(c), days) for n, c in cabinets.items()}
+    # блоки как в ручном отчёте: сначала «ожидают сборки» по кабинетам (Z, R, IZ),
+    # потом «ожидают отгрузки» в том же порядке кабинетов
+    order = list(cabinets)
+    blocks = {k: {(st, n): [] for st in statuses for n in order} for k in ("ozon", "kgt")}
+    nowh = 0
+    for name in cabinets:
+        try:
+            snap = lists[name].result()
+        except (RuntimeError, requests.RequestException) as e:
+            log(f"✖ {name}: не удалось получить заказы — {e}")
+            if cabs is not None:
+                cabs[name] = (None, str(e))
+            continue
+        if cabs is not None:
+            cabs[name] = (sum(1 for i in snap.values() if i["status"] in statuses), "")
+        for num, info in snap.items():
+            if info["status"] not in statuses:
+                continue
+            t = ozon_time(info.get("time"))
+            kgt = is_kgt(info.get("warehouse"))
+            if ("kgt" if kgt else "ozon") not in names:
+                continue  # выбран только МГТ или только КГТ — другой вид не трогаем и не пишем
+            nowh += not info.get("warehouse")
+            for pr in info["products"]:
+                blocks["kgt" if kgt else "ozon"][(info["status"], name)].append(
+                    [num, t, pr["offer_id"], pr["quantity"]])
+                if lines is not None:  # заказы дня для склада
+                    lines.append({"market": "ozon", "channel": "КГТ" if kgt else "Ozon",
+                                  "truck": "" if kgt else truck, "posting": num, "article": pr["offer_id"],
+                                  "qty": pr["quantity"], "production": production_of(pr["offer_id"]),
+                                  "ordered_at": iso(t)})
+            # ШК: собранное отправление — одна этикетка, несобранное — по этикетке на каждую штуку
+            if shk is not None:
+                k = "kgt" if kgt else "ozon"
+                shk[k] = shk.get(k, 0) + (1 if info["status"] == READY else units_of(info))
+    if nowh:
+        log(f"⚠ У {nowh} заказов Ozon не указан склад — они попали в отчёт Озон, проверь КГТ вручную")
+    hdr = ["Номер отправления", "Принят в обработку", "Артикул", "Количество"]
+    for key, title in names.items():
+        parts = []
+        for st in statuses:
+            for n in order:
+                b = blocks[key][(st, n)]
+                b.sort(key=lambda r: (r[1] or datetime.max, r[0]))
+                parts.append(b)
+        rows = [r for b in parts for r in b]
+        path = Path(out) / f"{title}.xlsx"
+        data[key] = write_report(path, title.split()[0], hdr, rows, 3, "Сумма по полю Количество", blocks=parts)
+        files[key] = path
+        per_cab = []
+        for n in order:
+            k = len({r[0] for st in statuses for r in blocks[key][(st, n)]})
+            if k:
+                per_cab.append(f"{n} {k}")
+        label = "КГТ" if key == "kgt" else "Озон"
+        log(f"✔ {label:<5} {' · '.join(per_cab) or 'заказов нет'}"
+            + (f"  →  {len({r[0] for r in rows})} отпр., {sum(r[3] for r in rows)} шт." if rows else ""))
+    return data, files
+
+
+def sklad_summary(answer, log):
+    """Итог склада по заказам дня одной строкой."""
+    if not answer:
+        return
+    count = defaultdict(int)
+    for decision, _ in answer.values():
+        count[decision] += 1
+    log(f"✔ Склад: едет {count['go']}"
+        + (f" · вечером в Озон 3 {count['later']}" if count["later"] else "")
+        + (f" · не едет {count['no']}" if count["no"] else "")
+        + (f" · вопрос начальнику {count['ask']}" if count["ask"] else ""))
+
+
+def ozon_wave(cabinets, template, out, days, wave, kgt, log, progress, today=None):
+    """«Озон 2», «Озон 3» в течение дня: только «ожидают сборки» (МГТ или КГТ) и «Сборка»
+    с одним столбцом. «Ожидают отгрузки» не трогаем — на них ШК уже скачаны утром."""
+    day = today or datetime.now(MSK).date()
+    stamp = f"{day:%d.%m}"
+    out = Path(out)
+    out.mkdir(parents=True, exist_ok=True)
+    key = "kgt" if kgt else "ozon"
+    title = f"{wave}{' КГТ' if kgt and 'кгт' not in wave.lower() else ''} {stamp}"
+    shk, lines = {}, []
+    cabs = {}
+    data, files = ozon_reports(cabinets, days, out, log, (PACKING,), {key: title}, shk,
+                               lines=lines, truck=ozon_channel(wave)[1], cabs=cabs)
+    if sklad_on():
+        sources = [(f"Ozon {n}", *cabs.get(n, (None, "нет ответа"))) for n in cabinets]
+        morning_hold(day, lines, [], sources, log, title=title.rsplit(" ", 1)[0])
+    progress(1, 2)
+    if template and key in data:
+        path = out / f"Сборка {title}.xlsx"
+        try:
+            fill_sborka(template, path, day, {key: data[key]}, log)
+            files["sborka"] = path
+        except PermissionError:
+            log(f"✖ {path.name} открыт в Excel — закрой его и запусти ещё раз")
+        except Exception as e:  # noqa: BLE001
+            log(f"✖ Сборка: {e}")
+    progress(2, 2)
+    log(f"✔ ГОТОВО — {title}.xlsx" + (" и сборка" if "sborka" in files else ""))
+    return files
+
+
+def morning(cabinets, token, template, cdek, out, days, log, progress, today=None):
+    """Утренние отчёты: Озон, КГТ, ВБ, СГТ (+ СДЭК из файла) и заполненная «Сборка».
+    В кабинетах ничего не меняется — только чтение. Возвращает пути к отчётам."""
+    day = today or datetime.now(MSK).date()
+    stamp = f"{day:%d.%m}"
+    out = Path(out)
+    out.mkdir(parents=True, exist_ok=True)
+    files, data, shk = {}, {}, {}
+    lines, markets = [], []   # заказы дня для склада: он решает по остаткам, что едет
+    sources = []              # что откуда пришло: (название, отправлений | None, ошибка) — для проверки
+
+    # --- Ozon: все кабинеты сразу
+    if cabinets:
+        cabs = {}
+        d, f = ozon_reports(cabinets, days, out, log, OZON_STATUSES,
+                            {"ozon": f"Озон {stamp}", "kgt": f"КГТ {stamp}"}, shk, lines=lines, cabs=cabs)
+        data.update(d)
+        files.update(f)
+        for name in cabinets:
+            count, err = cabs.get(name, (None, "нет ответа"))
+            sources.append((f"Ozon {name}", count, err))
+        if all(cabs.get(name, (None, ""))[0] is not None for name in cabinets):
+            markets.append("ozon")  # все кабинеты пришли — можно заменить список Ozon на складе
+    else:
+        log("⚠ Ключи Ozon не заполнены — отчёты Озон и КГТ пропущены")
+    progress(1, 3)
+
+    # --- WB: новые задания, МГТ и СГТ (СГТ — на сегодня и просроченные)
+    if token:
+        try:
+            new = wb_new_orders(token)
+            names = wb_warehouses(token)
+        except (RuntimeError, requests.RequestException) as e:
+            log(f"✖ WB: {e}")
+            sources.append(("WB", None, str(e)))
+            new = None
+        if new is not None:
+            mgt, sgt, later = [], [], defaultdict(int)
+            for o in sorted(new.values(), key=lambda o: o.get("createdAt") or ""):
+                wh = names.get(o.get("warehouseId")) or ""
+                row = [int(o["id"]), o.get("article", ""), wh or str(o.get("warehouseId") or "")]
+                # как в ручном отчёте: СГТ — это склад продавца «… СГТ» (фильтр «Склад продавца»);
+                # если WB не отдал название склада — по габариту задания
+                is_sgt = is_kgt(wh) if wh else o.get("cargoType") == 2
+                if is_sgt:
+                    d = o.get("sellerDate") or ""
+                    try:
+                        due = datetime.strptime(d, "%d.%m.%Y").date()
+                    except ValueError:
+                        due = None
+                    if due and due > day:
+                        later[d] += 1
+                        continue
+                    sgt.append(row + [d or "-", 1])
+                else:
+                    mgt.append(row + ["-", 1])
+                lines.append({"market": "wb", "channel": "СГТ" if is_sgt else "WB", "posting": str(o["id"]),
+                              "article": o.get("article", ""), "qty": 1,
+                              "production": production_of(o.get("article", "")),
+                              "ordered_at": iso(wb_time(o.get("createdAt")))})
+            markets.append("wb")
+            sources += [("WB", len(mgt), ""), ("СГТ", len(sgt), "")]
+            hdr = ["№ задания", "Артикул продавца", "Склад продавца", "Доставить на склад", "к"]
+            for key, title, rows in (("wb", "ВБ", mgt), ("sgt", "СГТ", sgt)):
+                path = out / f"{title} {stamp}.xlsx"
+                data[key] = write_report(path, "Сборочные задания", hdr, rows, 4, "Сумма по полю к")
+                files[key] = path
+            shk["wb"], shk["sgt"] = len(mgt), len(sgt)
+            late = sum(1 for r in sgt if r[3] != f"{day:%d.%m.%Y}")
+            log(f"✔ {'ВБ':<5} {plural(len(mgt), 'задание', 'задания', 'заданий')}")
+            log(f"✔ {'СГТ':<5} {plural(len(sgt), 'задание', 'задания', 'заданий')}"
+                + (f"  (из них просроченных {late})" if late else "")
+                + (f"  · на другие дни ещё {sum(later.values())}" if later else ""))
+    else:
+        log("⚠ Токен WB не заполнен — отчёты ВБ и СГТ пропущены")
+    progress(2, 3)
+
+    # --- СДЭК из файла менеджеров
+    if cdek:
+        try:
+            data["cdek"] = read_totals(cdek)
+            log(f"✔ {'СДЭК':<5} {sum(data['cdek'].values())} шт.")
+            markets.append("cdek")
+            sources.append(("СДЭК", len(data["cdek"]), ""))
+            for art, q in data["cdek"].items():  # у СДЭК в файле нет номеров — заказ «на артикул»
+                lines.append({"market": "cdek", "channel": "СДЭК", "posting": f"СДЭК {day:%d.%m} {art}"[:64],
+                              "article": art, "qty": q, "production": production_of(art)})
+        except Exception as e:  # noqa: BLE001
+            log(f"✖ СДЭК: не удалось прочитать {Path(cdek).name} — {e}")
+
+    # --- Склад: заказы дня НЕ уходят сами — сначала проверка, потом кнопка «Отправить на склад»
+    if sklad_on() and (lines or sources):
+        morning_hold(day, lines, markets, sources, log, title="Утро")
+
+    # --- Сборка
+    if template and data:
+        path = out / f"Сборка {stamp}.xlsx"
+        try:
+            fill_sborka(template, path, day, data, log)
+            files["sborka"] = path
+        except PermissionError:
+            log(f"✖ {path.name} открыт в Excel — закрой его и запусти ещё раз")
+        except Exception as e:  # noqa: BLE001
+            log(f"✖ Сборка: {e}")
+    elif not template:
+        log("⚠ Шаблон сборки не выбран — сборка не заполнена")
+    progress(3, 3)
+    log(f"✔ ГОТОВО — отчёты и Сборка {stamp}" if "sborka" in files else "Готово.")
+    return files
+
+
+def add_cdek(template, cdek, out, log, today=None):
+    """Дописывает СДЭК в сегодняшнюю «Сборку» (или делает её из шаблона, если её ещё нет)."""
+    day = today or datetime.now(MSK).date()
+    path = Path(out) / f"Сборка {day:%d.%m}.xlsx"
+    data = {"cdek": read_totals(cdek)}
+    fill_sborka(template, path, day, data, log, base=path if path.exists() else None)
+    log(f"✔ СДЭК {sum(data['cdek'].values())} шт. добавлен в {path.name}")
+    return path
+
+
+# ================================================================ Склад BLAGO
+# Связь со складом: программа отдаёт заказы дня (склад решает по остаткам, что едет)
+# и партии скачанных этикеток (по ним грузчики сверяют зеркала при погрузке).
+# Если склад не настроен — программа работает как раньше, без него.
+
+SKLAD_CONFIG = BASE_DIR / "sklad.json"
+SKLAD_PENDING = BASE_DIR / "sklad_pending.json"   # не ушло на склад — отправится при следующей связи
+SKLAD = {"url": "", "key": ""}                     # заполняется из «Настроек»
+# Что последним ушло на склад — строка состояния над журналом: (ok|err, текст)
+SKLAD_LAST = {"kind": "", "text": ""}
+
+
+def sklad_note(kind, text):
+    SKLAD_LAST["kind"], SKLAD_LAST["text"] = kind, f"{text} · {datetime.now(MSK):%H:%M}"
+
+
+def sklad_on():
+    return bool(SKLAD["url"].strip() and SKLAD["key"].strip())
+
+
+def sklad_post(path, payload, timeout=30):
+    """POST на склад. Возвращает ответ (dict) или бросает RuntimeError с понятным текстом."""
+    url = SKLAD["url"].strip().rstrip("/") + path
+    try:
+        r = requests.post(url, json=payload, timeout=timeout,
+                          headers={"X-API-Key": SKLAD["key"].strip(), "Content-Type": "application/json"})
+    except requests.RequestException as e:
+        raise RuntimeError(f"нет связи со складом ({e.__class__.__name__})") from e
+    if r.status_code == 401:
+        raise RuntimeError("склад не принял ключ — проверь ключ в «Настройках»")
+    try:
+        data = r.json()
+    except ValueError:
+        raise RuntimeError(f"склад ответил непонятно (код {r.status_code})") from None
+    if r.status_code != 200 or not data.get("ok", False):
+        raise RuntimeError(f"склад: {data.get('error') or data.get('detail') or r.status_code}")
+    return data
+
+
+def sklad_check():
+    url = SKLAD["url"].strip().rstrip("/") + "/api/v1/ping"
+    r = requests.get(url, headers={"X-API-Key": SKLAD["key"].strip()}, timeout=15)
+    if r.status_code == 401:
+        raise RuntimeError("ключ не подходит")
+    if r.status_code != 200:
+        raise RuntimeError(f"ошибка {r.status_code}")
+
+
+SKLAD_MORNING = BASE_DIR / "sklad_morning.json"   # заказы ждут проверки и кнопки «Отправить на склад»
+
+
+def morning_load():
+    """Сегодняшние заказы, которые ждут отправки: [{title, day, lines, markets, sources}]."""
+    try:
+        data = json.loads(SKLAD_MORNING.read_text(encoding="utf-8")) if SKLAD_MORNING.exists() else []
+    except ValueError:
+        data = []
+    if isinstance(data, dict):  # файл прошлой версии: одно утро
+        data = [{"title": "Утро", **data}]
+    return [x for x in data if x.get("day") == today_msk().isoformat()]
+
+
+def _morning_save(items):
+    try:
+        if items:
+            SKLAD_MORNING.write_text(json.dumps(items, ensure_ascii=False), encoding="utf-8")
+        elif SKLAD_MORNING.exists():
+            SKLAD_MORNING.unlink()
+    except OSError:
+        pass
+
+
+def morning_clear():
+    _morning_save([])
+
+
+def morning_text(items):
+    """«Утро: Ozon Z 120 · Ozon R ✖ · WB 160 | Озон 2: Ozon Z 15» — что пришло из каждого кабинета."""
+    out = []
+    for item in items:
+        parts = [f"{name} ✖" if count is None else f"{name} {count}" for name, count, _ in item["sources"]]
+        out.append(f"{item['title']}: " + (" · ".join(parts) or "заказов нет"))
+    return " | ".join(out)
+
+
+def morning_problems(items):
+    """Что подозрительно: кабинет не загрузился или пришло 0 заказов (0 в волне — обычное дело)."""
+    bad = []
+    for item in items:
+        for name, count, err in item["sources"]:
+            if count is None:
+                bad.append(f"✖ {item['title']} · {name}: не загрузился ({err[:120]})")
+            elif count == 0 and item["title"] == "Утро":
+                bad.append(f"⚠ {item['title']} · {name}: 0 заказов — точно так?")
+    return bad
+
+
+def morning_hold(day, lines, markets, sources, log, title="Утро"):
+    """Отложить заказы до проверки. На склад они уйдут кнопкой «Отправить на склад».
+
+    Утро заменяет прежнее утро, волна — прежнюю такую же волну (скачал отчёт ещё раз)."""
+    item = {"title": title, "day": day.isoformat(), "lines": lines, "markets": markets,
+            "sources": [list(x) for x in sources]}
+    items = [x for x in morning_load() if x["title"] != title] + [item]
+    _morning_save(items)
+    log("")
+    log(f"⏸ На склад ПОКА НЕ ОТПРАВЛЕНО — {morning_text([item])}")
+    for line in morning_problems([item]):
+        log(f"│ {line}")
+    log("│ Проверь отчёт. Если всё верно — нажми вверху «Отправить на склад».")
+
+
+def morning_send(log):
+    """Отправить на склад всё, что ждёт проверки, по порядку. Не ушедшее остаётся ждать."""
+    items = morning_load()
+    if not items:
+        log("Нечего отправлять: сначала скачай отчёты")
+        return False
+    left = []
+    for item in items:
+        lost = [name for name, count, _ in item["sources"] if count is None]
+        log(f"→ {item['title']}")
+        if lost:
+            log(f"⚠ Без {', '.join(lost)}: их заказы на складе не трогаю")
+        day = datetime.fromisoformat(item["day"]).date()
+        answer = sklad_demand(day, item["lines"], log, replace=item["markets"]) if item["lines"] else {}
+        if answer is None:
+            left.append(item)
+            continue
+        sklad_summary(answer, log)
+    _morning_save(left)
+    return not left
+
+
+def _pending_load():
+    try:
+        return json.loads(SKLAD_PENDING.read_text(encoding="utf-8")) if SKLAD_PENDING.exists() else []
+    except ValueError:
+        return []
+
+
+def _pending_save(items):
+    try:
+        if items:
+            SKLAD_PENDING.write_text(json.dumps(items, ensure_ascii=False), encoding="utf-8")
+        elif SKLAD_PENDING.exists():
+            SKLAD_PENDING.unlink()
+    except OSError:
+        pass
+
+
+def sklad_send_batch(day, market, channel, truck, source, items, log):
+    """Партия скачанных этикеток → склад. Не ушла — сохраняется и отправится позже."""
+    if not sklad_on() or not items:
+        return
+    payload = {"day": day.isoformat(), "market": market, "channel": channel, "truck": truck,
+               "source": source, "items": items}
+    title = ("Озон " + truck.removeprefix("Озон")) if truck else channel
+    sklad_flush(log)
+    try:
+        data = sklad_post("/api/v1/batches", payload, timeout=60)
+    except RuntimeError as e:
+        _pending_save(_pending_load() + [{"path": "/api/v1/batches", "payload": payload}])
+        sklad_note("err", f"партия {title} НЕ ушла на склад")
+        log(f"⚠ Партия {title} НЕ ушла на склад — {e}")
+        log("│ Она сохранена и отправится сама при следующем запуске (или «Настройки → Отправить на склад»).")
+        return
+    log(f"✔ Партия → склад: {title} — новых {data.get('added', 0)}, обновлено {data.get('updated', 0)}")
+    sklad_note("ok", f"партия {title} ушла на склад: {plural(len(items), 'этикетка', 'этикетки', 'этикеток')}")
+    for line in (data.get("kept") or [])[:10]:
+        log(f"│   уже в другой партии или погружено: {line}")
+    unknown = data.get("unknown") or []
+    if unknown:
+        log(f"⚠ На складе нет артикулов ({len(unknown)}) — их зеркала сверить не получится:")
+        for line in unknown[:10]:
+            log(f"│   {line}")
+
+
+def sklad_flush(log):
+    """Отправить то, что не ушло раньше."""
+    pending = _pending_load()
+    if not pending or not sklad_on():
+        return
+    left = []
+    for job in pending:
+        try:
+            sklad_post(job["path"], job["payload"], timeout=60)
+        except (RuntimeError, KeyError):
+            left.append(job)
+    _pending_save(left)
+    sent = len(pending) - len(left)
+    if sent:
+        log(f"✔ На склад дошло отложенное: {sent}")
+        if not left:
+            sklad_note("ok", f"отложенное дошло на склад: {sent}")
+    if left:
+        log(f"⚠ Ещё не ушло на склад: {len(left)}")
+
+
+def sklad_demand(day, lines, log, replace=None):
+    """Заказы → склад. Ответ: {отправление: (решение, почему)} или None, если склада нет/не ответил."""
+    if not sklad_on() or not lines:
+        return None
+    try:
+        data = sklad_post("/api/v1/demand", {"day": day.isoformat(), "lines": lines, "replace": replace or []})
+    except RuntimeError as e:
+        log(f"⚠ Склад не ответил, что едет ({e}) — решаю как раньше, по цветам отчёта")
+        sklad_note("err", "заказы НЕ ушли на склад")
+        return None
+    count = len({ln["posting"] for ln in lines})
+    sklad_note("ok", f"заказы ушли на склад: {plural(count, 'отправление', 'отправления', 'отправлений')}")
+    for q in data.get("questions") or []:
+        if q.get("status") == "open":
+            log(f"● Вопрос начальнику {q['site']}: {q['article']} — нужно {q['need']}, на складе {q['stock']}, "
+                f"в работе {q['in_work']}, не хватает {q['short'] - q.get('promised', 0)}")
+        elif q.get("status") == "yes":
+            log(f"● {q['article']}: начальник обещал {q['promised']} шт. к {q.get('due') or '—'}")
+    return {num: (v.get("decision"), v.get("reason", "")) for num, v in (data.get("postings") or {}).items()}
+
+
+def iso(dt):
+    return dt.isoformat() if isinstance(dt, datetime) else (str(dt) if dt else None)
+
+
+def ozon_channel(wave):
+    """«Озон утро»/«Озон 2»/«КГТ 3» → канал и машина склада."""
+    import re
+    w = " ".join(str(wave or "").lower().split())
+    if w.startswith("кгт"):
+        return "КГТ", ""
+    m = re.search(r"озон\s*(\d)", w)
+    n = int(m.group(1)) if m else 1
+    return "Ozon", f"Озон{n if 1 <= n <= 4 else 1}"
+
+
+def sklad_decide(market, channel, truck, postings, times, colored, log, confirm, download):
+    """Спросить склад, что из отчёта едет. postings — {номер: {артикул: шт}} после покраски.
+
+    Артикулы, которые ты покрасил сам (красный/жёлтый), склад не переспрашивает — твои цвета главнее.
+    Возвращает новый словарь отправлений; None — остановиться (ждём ответа начальника).
+    """
+    if not sklad_on() or not postings:
+        return postings
+    lines = [{"market": market, "channel": channel, "truck": truck, "posting": num, "article": art, "qty": q,
+              "production": production_of(art), "ordered_at": iso(times.get(num))}
+             for num, arts in postings.items() for art, q in arts.items()]
+    log("Спрашиваю склад, что едет…")
+    answer = sklad_demand(today_msk(), lines, log)
+    if answer is None:
+        return postings
+    keep, no, ask, later = {}, defaultdict(list), defaultdict(list), defaultdict(int)
+    for num, arts in postings.items():
+        if any(a in colored for a in arts):
+            keep[num] = arts
+            continue
+        decision, why = answer.get(num, ("go", ""))
+        if decision == "no":
+            no[why or "не едет"].append((num, next(iter(arts))))
+        elif decision == "ask":
+            ask[next(iter(arts))].append(num)
+        elif decision == "later":  # обещано к вечеру — поедет в Озон 3, сейчас не качаем
+            later[next(iter(arts))] += 1
+        else:
+            keep[num] = arts
+    log(f"✔ Склад: едет {len(keep)}" + (f" · не едет {sum(map(len, no.values()))}" if no else "")
+        + (f" · вечером в Озон 3 {sum(later.values())}" if later else "")
+        + (f" · ждёт ответа начальника {sum(map(len, ask.values()))}" if ask else ""))
+    if later:
+        log("● Доделают к вечеру, поедут в Озон 3: "
+            + ", ".join(f"{a} × {n}" for a, n in sorted(later.items())))
+    for why, items in no.items():
+        arts = defaultdict(int)
+        for _, a in items:
+            arts[a] += 1
+        log(f"✖ Не едет — {why}: " + ", ".join(f"{a} × {n}" for a, n in sorted(arts.items())))
+    if ask:
+        text = "\n".join(f"   {a} — {len(n)} шт." for a, n in sorted(ask.items()))
+        log("● Ждут ответа начальника (на складе мало, артикул в работе):")
+        for a, n in sorted(ask.items()):
+            log(f"│   {a} — {len(n)} шт.")
+        if download and not confirm(
+                f"Начальник ещё не ответил по этим зеркалам:\n{text}\n\n"
+                f"Да — качать без них (они поедут следующей волной)\n"
+                f"Нет — остановиться: дождись ответа начальника на складе и нажми ещё раз"):
+            log("Остановлено — жду ответа начальника. Ничего не собрано и не скачано.")
+            return None
+    return keep
+
+
+# ================================================================ окно
+
+# Палитра — «slate dark» для рабочих панелей (UI/UX Pro Max: Financial/Operations dashboard),
+# фирменный золотой акцент BLAGO оставлен. Контраст основного и серого текста — не ниже 4.5:1.
+C = {
+    "side": "#0B1120", "bg": "#0F172A", "card": "#151F33", "field": "#0B1220", "line": "#24314A",
+    "text": "#F1F5F9", "muted": "#94A3B8", "dim": "#64748B", "accent": "#F2B53B", "accent_hi": "#FFC85C",
+    "on_accent": "#1A1405", "btn": "#23304A", "btn_hi": "#2E3D5C", "nav_hi": "#141D30",
+    "ok": "#22C55E", "err": "#F87171", "warn": "#FB923C",
+}
+PAGES = ("Сборка", "Ozon", "Wildberries", "Настройки")
+FONT = "Segoe UI"
+MONTHS = ("Январь", "Февраль", "Март", "Апрель", "Май", "Июнь",
+          "Июль", "Август", "Сентябрь", "Октябрь", "Ноябрь", "Декабрь")
+MONTHS_GEN = ("января", "февраля", "марта", "апреля", "мая", "июня",
+              "июля", "августа", "сентября", "октября", "ноября", "декабря")
+WEEKDAYS = ("понедельник", "вторник", "среда", "четверг", "пятница", "суббота", "воскресенье")
+WAVES = ("Озон 2", "Озон 3", "Озон 4", "КГТ 2", "КГТ 3", "КГТ 4")
+
+
+def today_msk():
+    return datetime.now(MSK).date()
+
+
+class App(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title(APP_NAME)
+        self.geometry("1060x920")
+        self.minsize(960, 760)
+        self.configure(bg=C["bg"])
+        self.q = queue.Queue()
+        self.busy = False
+        self.buttons = []      # кнопки, которые гасятся, пока идёт работа
+        self.cab_rows = []
+        self.wb_files = []
+        self._save_job = None
+        self.setup_style()
+
+        # --- переменные настроек
+        self.template = tk.StringVar()
+        self.root_dir = tk.StringVar(value=str(self.default_root()))
+        self.by_day = tk.BooleanVar(value=False)   # папки по дням больше не делаем: главную папку выбираешь сам
+        self.days = tk.IntVar(value=14)
+        self.top_margin = tk.DoubleVar(value=DEFAULT_TOP_MARGIN_PT)
+        self.font_size = tk.DoubleVar(value=DEFAULT_FONT_SIZE)
+        self.wb_token = tk.StringVar()
+        self.sklad_url = tk.StringVar(value="https://89-169-45-92.sslip.io")
+        self.sklad_key = tk.StringVar()
+        self.excel = tk.StringVar()
+        self.sheet = tk.StringVar()
+        self.footer = tk.StringVar(value="Озон утро")
+        self.autoship = tk.BooleanVar(value=True)
+        self.wave = tk.StringVar(value=WAVES[0])
+        self.show_keys = tk.BooleanVar(value=False)
+
+        # --- боковая панель: логотип, разделы, дата
+        side = tk.Frame(self, bg=C["side"], width=210)
+        side.pack(side="left", fill="y")
+        side.pack_propagate(False)
+        logo = tk.Frame(side, bg=C["side"])
+        logo.pack(fill="x", padx=24, pady=(26, 30))
+        tk.Label(logo, text="BLAGO", bg=C["side"], fg=C["accent"], font=(FONT, 20, "bold")).pack(anchor="w")
+        tk.Label(logo, text="OTGRUZKI", bg=C["side"], fg=C["text"], font=(FONT, 13, "bold")).pack(anchor="w")
+        self.nav = {}
+        for name in PAGES:
+            self.nav[name] = self.nav_item(side, name)
+        d = today_msk()
+        foot = tk.Frame(side, bg=C["side"])
+        foot.pack(side="bottom", fill="x", padx=24, pady=22)
+        tk.Label(foot, text=f"{d.day} {MONTHS_GEN[d.month - 1]}", bg=C["side"], fg=C["text"],
+                 font=(FONT, 13, "bold")).pack(anchor="w")
+        tk.Label(foot, text=WEEKDAYS[d.weekday()], bg=C["side"], fg=C["muted"], font=(FONT, 10)).pack(anchor="w")
+        tk.Label(foot, text=f"версия {APP_VERSION}", bg=C["side"], fg=C["dim"],
+                 font=(FONT, 8)).pack(anchor="w", pady=(10, 0))
+
+        # --- основная часть: заголовок раздела, раздел, журнал
+        main = ttk.Frame(self, style="Bg.TFrame")
+        main.pack(side="left", fill="both", expand=True, padx=28, pady=(22, 20))
+        top = ttk.Frame(main, style="Bg.TFrame")
+        top.pack(fill="x", pady=(0, 10))
+        self.page_title = ttk.Label(top, text="", style="Page.TLabel")
+        self.page_title.pack(side="left")
+        # главная папка дня — видна всегда и меняется в один клик
+        ttk.Button(top, text="Сменить папку…", command=self.pick_root, cursor="hand2").pack(side="right")
+        self.root_label = ttk.Button(top, text="", style="BgPath.TButton", cursor="hand2",
+                                     command=lambda: self.open_out(self.root_dir.get() or self.default_root()))
+        self.root_label.pack(side="right", padx=(0, 10))
+        # Склад: что последним ушло и не застряло ли что-то без интернета
+        srow = tk.Frame(main, bg=C["bg"])
+        srow.pack(fill="x", pady=(0, 10))
+        self.sklad_line = tk.Label(srow, text="", bg=C["bg"], fg=C["muted"], font=(FONT, 10, "bold"), anchor="w")
+        self.sklad_line.pack(side="left")
+        self.sklad_resend = ttk.Button(srow, text="Отправить неотправленное", command=self.flush_sklad,
+                                       cursor="hand2")
+        # Заказы дня уходят на склад только после проверки — этой кнопкой
+        self.sklad_send = ttk.Button(srow, text="Отправить на склад", style="Accent.TButton",
+                                     command=self.send_morning, cursor="hand2")
+        self.page_box = ttk.Frame(main, style="Bg.TFrame")
+        self.page_box.pack(fill="x")
+        self.pages = {name: ttk.Frame(self.page_box, style="Bg.TFrame") for name in PAGES}
+        self.build_sborka(self.pages["Сборка"])
+        self.build_ozon(self.pages["Ozon"])
+        self.build_wb(self.pages["Wildberries"])
+        self.build_settings(self.pages["Настройки"])
+
+        jb = tk.Frame(main, bg=C["line"])
+        jb.pack(fill="both", expand=True, pady=(14, 0))
+        jcard = tk.Frame(jb, bg=C["card"])
+        jcard.pack(fill="both", expand=True, padx=1, pady=1)
+        jh = tk.Frame(jcard, bg=C["card"])
+        jh.pack(fill="x", padx=18, pady=(12, 0))
+        tk.Label(jh, text="Журнал", bg=C["card"], fg=C["text"], font=(FONT, 12, "bold")).pack(side="left")
+        self.state_pill = tk.Label(jh, text="●  готова к работе", bg=C["card"], fg=C["ok"], font=(FONT, 9, "bold"))
+        self.state_pill.pack(side="left", padx=(14, 0))
+        ttk.Button(jh, text="очистить", style="Link.TButton", command=self.clear_log,
+                   cursor="hand2").pack(side="right")
+        self.bar = ttk.Progressbar(jcard, mode="determinate")   # виден только пока идёт работа
+        box = tk.Frame(jcard, bg=C["card"])
+        box.pack(fill="both", expand=True, padx=(8, 4), pady=(6, 8))
+        self._log_frame = box
+        self.log_box = tk.Text(box, height=10, wrap="word", state="disabled", bd=0, relief="flat",
+                               bg=C["card"], fg=C["text"], insertbackground=C["text"],
+                               selectbackground=C["accent"], selectforeground=C["on_accent"],
+                               padx=10, pady=6, font=("Consolas", 10), highlightthickness=0,
+                               spacing1=2, spacing3=2)
+        sb = ttk.Scrollbar(box, command=self.log_box.yview)
+        self.log_box.configure(yscrollcommand=sb.set)
+        sb.pack(side="right", fill="y")
+        self.log_box.pack(fill="both", expand=True)
+        for tag, color, bold in (("ok", C["ok"], False), ("err", C["err"], False), ("head", C["accent"], True),
+                                 ("warn", C["warn"], True), ("warnbody", C["warn"], False),
+                                 ("yellow", C["accent"], False), ("big", C["ok"], True)):
+            self.log_box.tag_configure(tag, foreground=color,
+                                       font=("Consolas", 11 if tag == "big" else 10, "bold" if bold else ""))
+
+        self.setup_clipboard()
+        self.load_settings()
+        self.refresh_wave_chips()
+        self.hand_cursor(self)
+        for var in (self.template, self.root_dir, self.by_day, self.days, self.top_margin, self.font_size,
+                    self.wb_token, self.autoship, self.sklad_url, self.sklad_key):
+            var.trace_add("write", lambda *_: self.schedule_save())
+        self.footer.trace_add("write", lambda *_: self.refresh_links())
+        self.show_page("Сборка")
+        self.protocol("WM_DELETE_WINDOW", self.on_close)
+        self.after(50, self.dark_titlebar)
+        self.after(100, self.poll)
+        self.after(500, self.refresh_sklad_line)
+
+    def refresh_sklad_line(self):
+        """Строка «Склад: …»: подключён ли, что ушло последним, что ждёт отправки."""
+        try:
+            pending = len(_pending_load())
+        except Exception:  # noqa: BLE001
+            pending = 0
+        morning = morning_load() if sklad_on() else None
+        if not sklad_on():
+            text, color = "Склад: не подключён — «Настройки → Склад BLAGO»", C["dim"]
+        elif morning and not pending:
+            warn = morning_problems(morning)
+            text = f"Склад: ждёт проверки — {morning_text(morning)}"
+            color = C["warn"] if warn else C["accent"]
+        elif pending:
+            text = f"Склад: ✖ не ушло {plural(pending, 'партия', 'партии', 'партий')} — нет связи"
+            color = C["err"]
+        elif SKLAD_LAST["text"]:
+            ok = SKLAD_LAST["kind"] == "ok"
+            text, color = f"Склад: {'✔' if ok else '✖'} {SKLAD_LAST['text']}", C["ok"] if ok else C["err"]
+        else:
+            text, color = "Склад: подключён, сегодня ещё ничего не отправлялось", C["muted"]
+        self.sklad_line.configure(text=text, fg=color)
+        if pending and not self.sklad_resend.winfo_ismapped():
+            self.sklad_resend.pack(side="left", padx=(12, 0))
+        elif not pending and self.sklad_resend.winfo_ismapped():
+            self.sklad_resend.pack_forget()
+        show_send = bool(morning) and not pending
+        if show_send and not self.sklad_send.winfo_ismapped():
+            self.sklad_send.pack(side="left", padx=(12, 0))
+        elif not show_send and self.sklad_send.winfo_ismapped():
+            self.sklad_send.pack_forget()
+        self.after(2000, self.refresh_sklad_line)
+
+    # ------------------------------------------------------------ навигация
+    def nav_item(self, parent, name):
+        row = tk.Frame(parent, bg=C["side"], cursor="hand2")
+        row.pack(fill="x")
+        bar = tk.Frame(row, bg=C["side"], width=4)
+        bar.pack(side="left", fill="y")
+        lbl = tk.Label(row, text=name, bg=C["side"], fg=C["muted"], font=(FONT, 11, "bold"),
+                       anchor="w", padx=20, pady=11, cursor="hand2")
+        lbl.pack(side="left", fill="x", expand=True)
+        for w in (row, lbl):
+            w.bind("<Button-1>", lambda e, n=name: self.show_page(n))
+            w.bind("<Enter>", lambda e, n=name: self.paint_nav(n, hover=True))
+            w.bind("<Leave>", lambda e, n=name: self.paint_nav(n))
+        return row, bar, lbl
+
+    def paint_nav(self, name, hover=False):
+        row, bar, lbl = self.nav[name]
+        on = name == getattr(self, "current_page", None)
+        bg = C["nav_hi"] if on or hover else C["side"]
+        for w in (row, lbl):
+            w.configure(bg=bg)
+        bar.configure(bg=C["accent"] if on else bg)
+        lbl.configure(fg=C["text"] if on or hover else C["muted"])
+
+    def show_page(self, name):
+        self.current_page = name
+        for n, frame in self.pages.items():
+            if n == name:
+                frame.pack(fill="x")
+            else:
+                frame.pack_forget()
+        for n in PAGES:
+            self.paint_nav(n)
+        self.page_title.configure(text=name)
+
+    def hand_cursor(self, widget):
+        """Рука над всем, что нажимается."""
+        for w in widget.winfo_children():
+            if isinstance(w, (ttk.Button, ttk.Checkbutton, ttk.Radiobutton, ttk.Combobox, tk.Radiobutton)):
+                try:
+                    w.configure(cursor="hand2")
+                except tk.TclError:
+                    pass
+            self.hand_cursor(w)
+
+    # ------------------------------------------------------------ оформление
+    def setup_style(self):
+        st = ttk.Style(self)
+        st.theme_use("clam")
+        base = (FONT, 10)
+        st.configure(".", background=C["card"], foreground=C["text"], font=base,
+                     bordercolor=C["line"], lightcolor=C["card"], darkcolor=C["card"],
+                     troughcolor=C["field"], focuscolor=C["accent"])
+        st.configure("Bg.TFrame", background=C["bg"])
+        st.configure("Card.TFrame", background=C["card"])
+        st.configure("TLabel", background=C["card"], foreground=C["text"])
+        st.configure("Muted.TLabel", foreground=C["muted"], font=(FONT, 9))
+        st.configure("Info.TLabel", foreground=C["muted"], font=(FONT, 10))
+        st.configure("Field.TLabel", foreground=C["muted"], font=(FONT, 10))
+        st.configure("Caps.TLabel", background=C["bg"], foreground=C["muted"], font=(FONT, 8, "bold"))
+        st.configure("Page.TLabel", background=C["bg"], foreground=C["text"], font=(FONT, 20, "bold"))
+        st.configure("Title.TLabel", font=(FONT, 12, "bold"))
+        st.configure("File.TLabel", font=(FONT, 11, "bold"))
+        st.configure("Status.TLabel", foreground=C["muted"], font=(FONT, 9))
+
+        st.configure("TButton", background=C["btn"], foreground=C["text"], borderwidth=0,
+                     padding=(14, 8), focusthickness=0, relief="flat")
+        st.map("TButton", background=[("disabled", C["card"]), ("pressed", C["line"]), ("active", C["btn_hi"])],
+               foreground=[("disabled", C["dim"])])
+        st.configure("Accent.TButton", background=C["accent"], foreground=C["on_accent"],
+                     font=(FONT, 11, "bold"), padding=(24, 11))
+        st.map("Accent.TButton",
+               background=[("disabled", C["btn"]), ("pressed", C["accent"]), ("active", C["accent_hi"])],
+               foreground=[("disabled", C["dim"])])
+        st.configure("Big.TButton", font=(FONT, 10, "bold"), padding=(18, 11))
+        st.configure("Link.TButton", background=C["card"], foreground=C["muted"], padding=(2, 2),
+                     font=(FONT, 9, "underline"))
+        st.map("Link.TButton", background=[("active", C["card"]), ("pressed", C["card"])],
+               foreground=[("active", C["accent"]), ("disabled", C["dim"])])
+        st.configure("Path.TButton", background=C["card"], foreground=C["muted"], padding=(2, 2),
+                     font=(FONT, 10))
+        st.map("Path.TButton", background=[("active", C["card"]), ("pressed", C["card"])],
+               foreground=[("active", C["text"])])
+        st.configure("BgPath.TButton", background=C["bg"], foreground=C["muted"], padding=(2, 6),
+                     font=(FONT, 10))
+        st.map("BgPath.TButton", background=[("active", C["bg"]), ("pressed", C["bg"])],
+               foreground=[("active", C["text"])])
+        st.configure("BgLink.TButton", background=C["bg"], foreground=C["muted"], padding=(2, 2),
+                     font=(FONT, 9, "underline"))
+        st.map("BgLink.TButton", background=[("active", C["bg"])], foreground=[("active", C["accent"])])
+
+        for w in ("TEntry", "TCombobox", "TSpinbox"):
+            st.configure(w, fieldbackground=C["field"], foreground=C["text"], insertcolor=C["text"],
+                         bordercolor=C["line"], lightcolor=C["field"], darkcolor=C["field"],
+                         arrowcolor=C["muted"], background=C["btn"], padding=6,
+                         selectbackground=C["accent"], selectforeground=C["on_accent"])
+            st.map(w, fieldbackground=[("readonly", C["field"]), ("disabled", C["card"])],
+                   foreground=[("readonly", C["text"])],
+                   bordercolor=[("focus", C["accent"])],
+                   lightcolor=[("focus", C["accent"])], darkcolor=[("focus", C["accent"])],
+                   selectbackground=[("readonly", C["field"])],
+                   selectforeground=[("readonly", C["text"])])
+        self.option_add("*TCombobox*Listbox.background", C["field"])
+        self.option_add("*TCombobox*Listbox.foreground", C["text"])
+        self.option_add("*TCombobox*Listbox.selectBackground", C["accent"])
+        self.option_add("*TCombobox*Listbox.selectForeground", C["on_accent"])
+        self.option_add("*TCombobox*Listbox.font", base)
+
+        st.configure("TCheckbutton", background=C["card"], foreground=C["text"],
+                     indicatorbackground=C["field"], indicatorforeground=C["accent"])
+        st.map("TCheckbutton", background=[("active", C["card"])], foreground=[("active", C["accent_hi"])],
+               indicatorbackground=[("selected", C["field"])])
+        st.configure("TNotebook", background=C["bg"], borderwidth=0, tabmargins=(0, 0, 0, 0))
+        st.configure("TNotebook.Tab", background=C["btn"], foreground=C["muted"], padding=(18, 8),
+                     borderwidth=0, font=(FONT, 10, "bold"))
+        st.map("TNotebook.Tab", background=[("selected", C["accent"]), ("active", C["btn_hi"])],
+               padding=[("selected", (18, 8))], expand=[("selected", (0, 0, 0, 0))],
+               foreground=[("selected", C["on_accent"]), ("active", C["text"])])
+        st.configure("Horizontal.TProgressbar", background=C["accent"], troughcolor=C["field"],
+                     bordercolor=C["card"], lightcolor=C["accent"], darkcolor=C["accent"], thickness=4)
+        st.configure("Vertical.TScrollbar", background=C["btn"], troughcolor=C["card"],
+                     bordercolor=C["card"], arrowcolor=C["muted"], relief="flat")
+        st.map("Vertical.TScrollbar", background=[("active", C["btn_hi"])])
+
+    def card(self, parent, title, side=None, grid=None):
+        """Тёмная карточка с заголовком. side — виджет-функция для правой части заголовка."""
+        border = tk.Frame(parent, bg=C["line"])
+        if grid:
+            border.grid(row=grid[0], column=grid[1], sticky="nsew", pady=5,
+                        padx=(0, 6) if grid[1] == 0 else (6, 0))
+        else:
+            border.pack(fill="x", pady=5)
+        body = ttk.Frame(border, style="Card.TFrame", padding=(18, 12, 18, 16))
+        body.pack(fill="both", expand=True, padx=1, pady=1)
+        head = ttk.Frame(body, style="Card.TFrame")
+        head.pack(fill="x", pady=(0, 10))
+        ttk.Label(head, text=title, style="Title.TLabel").pack(side="left")
+        if side:
+            side(head)
+        return body
+
+    def button(self, parent, text, command, style="TButton", **pack):
+        b = ttk.Button(parent, text=text, command=command, style=style, cursor="hand2")
+        b.pack(side="left", **pack)
+        self.buttons.append(b)
+        return b
+
+    def folder_link(self, parent, sub):
+        """Строка «Сохраняется в: Рабочий стол / Октябрь 2026 / 29.10 / Озон 2» — нажатие открывает папку."""
+        row = ttk.Frame(parent, style="Card.TFrame")
+        row.pack(fill="x", pady=(12, 0))
+        ttk.Label(row, text="Сохраняется в:", style="Field.TLabel").pack(side="left")
+        var = tk.StringVar()
+        ttk.Button(row, textvariable=var, style="Path.TButton",
+                   command=lambda: self.open_out(self.day_dir(sub() if callable(sub) else sub))
+                   ).pack(side="left", padx=(6, 0))
+        self._links = getattr(self, "_links", [])
+        self._links.append((var, sub))
+        return var
+
+    def refresh_links(self):
+        if hasattr(self, "root_label"):
+            r = Path(self.root_dir.get().strip() or self.default_root())
+            self.root_label.configure(text="Папка:  " + "  ›  ".join(r.parts[-3:]))
+        for var, sub in getattr(self, "_links", []):
+            p = self.day_dir(sub() if callable(sub) else sub)
+            var.set("  ›  ".join(p.parts[-2:]) + "     открыть ↗")
+
+    def dark_titlebar(self):
+        """Тёмный заголовок окна в Windows 10/11."""
+        if sys.platform != "win32":
+            return
+        try:
+            import ctypes
+            hwnd = ctypes.windll.user32.GetParent(self.winfo_id())
+            val = ctypes.c_int(1)
+            for attr in (20, 19):
+                ctypes.windll.dwmapi.DwmSetWindowAttribute(hwnd, attr, ctypes.byref(val), ctypes.sizeof(val))
+        except Exception:  # noqa: BLE001 — украшение, не критично
+            pass
+
+    # ------------------------------------------------------------ вкладка «Сборка»
+    def build_sborka(self, tab):
+        c1 = self.card(tab, "Утренняя сборка")
+        row = ttk.Frame(c1, style="Card.TFrame")
+        row.pack(fill="x")
+        self.button(row, "Скачать отчёты и сборку", self.start_morning, "Accent.TButton")
+        self.button(row, "Добавить СДЭК…", self.start_cdek, "Big.TButton", padx=(10, 0))
+        self.folder_link(c1, "Сборка")
+        self.mo_status = ttk.Label(c1, text="", style="Info.TLabel")
+        self.mo_status.pack(anchor="w", pady=(10, 0))
+
+        c2 = self.card(tab, "В течение дня")
+        chips = ttk.Frame(c2, style="Card.TFrame")
+        chips.pack(fill="x")
+        self.wave_chips = {}
+        for i, name in enumerate(WAVES):
+            if i == 3:
+                tk.Frame(chips, bg=C["line"], width=1, height=26).pack(side="left", padx=10)
+            b = tk.Radiobutton(chips, text=name, value=name, variable=self.wave, indicatoron=0,
+                               command=self.refresh_wave_chips, bd=0, relief="flat", cursor="hand2",
+                               font=(FONT, 10, "bold"), padx=16, pady=7, highlightthickness=0,
+                               bg=C["btn"], fg=C["text"], activebackground=C["btn_hi"],
+                               activeforeground=C["text"], selectcolor=C["accent"])
+            b.pack(side="left", padx=(0, 6))
+            self.wave_chips[name] = b
+        row2 = ttk.Frame(c2, style="Card.TFrame")
+        row2.pack(fill="x", pady=(14, 0))
+        self.wave_btn = self.button(row2, "Скачать отчёт и сборку", self.start_wave, "Accent.TButton")
+        self.folder_link(c2, self.wave_name)
+        self.wave_status = ttk.Label(c2, text="", style="Info.TLabel")
+        self.wave_status.pack(anchor="w", pady=(10, 0))
+
+    def wave_name(self):
+        return self.wave.get() or WAVES[0]
+
+    def refresh_wave_chips(self):
+        for name, b in self.wave_chips.items():
+            on = name == self.wave.get()
+            b.configure(bg=C["accent"] if on else C["btn"], fg=C["on_accent"] if on else C["text"],
+                        activebackground=C["accent_hi"] if on else C["btn_hi"],
+                        activeforeground=C["on_accent"] if on else C["text"])
+        self.refresh_links()
+
+    # ------------------------------------------------------------ вкладка Ozon
+    def build_ozon(self, tab):
+        c1 = self.card(tab, "Отчёт")
+        row = ttk.Frame(c1, style="Card.TFrame")
+        row.pack(fill="x")
+        self.excel_name = ttk.Label(row, text="не выбран", style="File.TLabel")
+        self.excel_name.pack(side="left")
+        ttk.Button(row, text="Выбрать файл…", command=self.pick_excel).pack(side="right")
+        self.sheet_box = ttk.Frame(row, style="Card.TFrame")
+        ttk.Label(self.sheet_box, text="лист", style="Field.TLabel").pack(side="left", padx=(0, 6))
+        self.sheet_cb = ttk.Combobox(self.sheet_box, textvariable=self.sheet, state="readonly", width=14)
+        self.sheet_cb.pack(side="left")
+        self.sheet_cb.bind("<<ComboboxSelected>>", lambda e: self.count_report())
+        self.report_info = ttk.Label(c1, text="Отчёт подставляется сам после «Сборки». "
+                                              "Покрась его в Excel, сохрани и закрой.", style="Info.TLabel")
+        self.report_info.pack(anchor="w", pady=(8, 0))
+
+        c2 = self.card(tab, "Этикетки")
+        g = ttk.Frame(c2, style="Card.TFrame")
+        g.pack(fill="x")
+        ttk.Label(g, text="Надпись на ШК", style="Field.TLabel").pack(side="left")
+        fcb = ttk.Combobox(g, textvariable=self.footer, width=16, values=("Озон утро",) + WAVES)
+        fcb.pack(side="left", padx=(10, 24))
+        fcb.bind("<<ComboboxSelected>>", lambda e: self.refresh_links())
+        fcb.bind("<KeyRelease>", lambda e: self.refresh_links())
+        ttk.Checkbutton(g, variable=self.autoship, text="Собирать заказы из «Ожидают сборки»"
+                        ).pack(side="left")
+        row2 = ttk.Frame(c2, style="Card.TFrame")
+        row2.pack(fill="x", pady=(16, 0))
+        self.button(row2, "Проверить", lambda: self.start("check"), "Big.TButton")
+        self.button(row2, "Скачать и собрать", lambda: self.start("run"), "Accent.TButton", padx=(10, 0))
+        self.button(row2, "Пересобрать ленты", lambda: self.start("merge"), padx=(10, 0))
+        self.folder_link(c2, self.ozon_sub)
+
+    def ozon_sub(self):
+        """Папка этикеток Ozon: утренние — «Озон», дальше «Озон 2», «Озон 3», «КГТ 2»…"""
+        name = " ".join(self.footer.get().split())
+        return "Озон" if not name or name.lower() in ("озон утро", "озон 1") else name
+
+    # ------------------------------------------------------------ вкладка Wildberries
+    def build_wb(self, tab):
+        c1 = self.card(tab, "Отчёты ВБ и СГТ")
+        row = ttk.Frame(c1, style="Card.TFrame")
+        row.pack(fill="x")
+        self.wb_files_label = ttk.Label(row, text="не выбраны", style="File.TLabel")
+        self.wb_files_label.pack(side="left")
+        ttk.Button(row, text="Очистить", command=self.clear_wb).pack(side="right")
+        ttk.Button(row, text="Добавить файл…", command=self.pick_wb).pack(side="right", padx=(0, 8))
+        self.wb_info = ttk.Label(c1, text="Отчёты подставляются сами после «Сборки».", style="Info.TLabel",
+                                 justify="left")
+        self.wb_info.pack(anchor="w", pady=(8, 0))
+
+        c2 = self.card(tab, "Поставки и стикеры")
+        row2 = ttk.Frame(c2, style="Card.TFrame")
+        row2.pack(fill="x")
+        self.button(row2, "Проверить", lambda: self.start_wb("check"), "Big.TButton")
+        self.button(row2, "Создать поставки и скачать", lambda: self.start_wb("run"), "Accent.TButton",
+                    padx=(10, 0))
+        self.button(row2, "Скачать ШК открытых поставок", lambda: self.start_wb("stickers"), padx=(10, 0))
+        self.folder_link(c2, "ВБ")
+
+    # ------------------------------------------------------------ вкладка «Настройки»
+    def build_settings(self, tab):
+        c1 = self.card(tab, "Кабинеты Ozon", side=lambda h: ttk.Checkbutton(
+            h, text="показать ключи", variable=self.show_keys, command=self.toggle_keys).pack(side="right"))
+        self.cab_box = ttk.Frame(c1, style="Card.TFrame")
+        self.cab_box.pack(fill="x")
+        for i, t in enumerate(("Название", "Client-Id", "Api-Key", "")):
+            ttk.Label(self.cab_box, text=t, style="Muted.TLabel").grid(row=0, column=i, sticky="w", padx=(0, 8))
+        self.cab_box.columnconfigure(2, weight=1)
+        b1 = ttk.Frame(c1, style="Card.TFrame")
+        b1.pack(fill="x", pady=(8, 0))
+        self.btn_test = self.button(b1, "Проверить ключи", self.test_keys)
+        ttk.Button(b1, text="+ кабинет", command=self.add_cabinet).pack(side="left", padx=(8, 0))
+
+        pair = ttk.Frame(tab, style="Bg.TFrame")
+        pair.pack(fill="x")
+        pair.columnconfigure(0, weight=1, uniform="p")
+        pair.columnconfigure(1, weight=1, uniform="p")
+
+        c2 = self.card(pair, "Wildberries", grid=(0, 0))
+        g = ttk.Frame(c2, style="Card.TFrame")
+        g.pack(fill="x")
+        g.columnconfigure(1, weight=1)
+        ttk.Label(g, text="Токен", style="Field.TLabel").grid(row=0, column=0, sticky="w", padx=(0, 10))
+        self.wb_token_entry = ttk.Entry(g, textvariable=self.wb_token, show="•")
+        self.wb_token_entry.grid(row=0, column=1, sticky="ew")
+        b2 = ttk.Frame(c2, style="Card.TFrame")
+        b2.pack(fill="x", pady=(8, 0))
+        self.button(b2, "Проверить токен", self.test_wb)
+        self.wb_status = ttk.Label(b2, text="", style="Status.TLabel")
+        self.wb_status.pack(side="left", padx=(10, 0))
+        self.wb_show = tk.BooleanVar(value=False)
+        ttk.Checkbutton(b2, text="показать", variable=self.wb_show,
+                        command=lambda: self.wb_token_entry.configure(show="" if self.wb_show.get() else "•")
+                        ).pack(side="right")
+
+        c3 = self.card(pair, "Файлы", grid=(0, 1))
+        g3 = ttk.Frame(c3, style="Card.TFrame")
+        g3.pack(fill="x")
+        g3.columnconfigure(1, weight=1)
+        for r, (label, var, pick) in enumerate((("Шаблон сборки", self.template, self.pick_template),
+                                                ("Куда сохранять", self.root_dir, self.pick_root))):
+            ttk.Label(g3, text=label, style="Field.TLabel").grid(row=r, column=0, sticky="w", padx=(0, 10), pady=3)
+            ttk.Entry(g3, textvariable=var).grid(row=r, column=1, sticky="ew")
+            ttk.Button(g3, text="…", width=3, command=pick).grid(row=r, column=2, padx=(6, 0))
+
+        c5 = self.card(tab, "Склад BLAGO")
+        g5 = ttk.Frame(c5, style="Card.TFrame")
+        g5.pack(fill="x")
+        g5.columnconfigure(1, weight=1)
+        ttk.Label(g5, text="Адрес склада", style="Field.TLabel").grid(row=0, column=0, sticky="w", padx=(0, 10), pady=3)
+        ttk.Entry(g5, textvariable=self.sklad_url).grid(row=0, column=1, sticky="ew")
+        ttk.Label(g5, text="Ключ", style="Field.TLabel").grid(row=1, column=0, sticky="w", padx=(0, 10), pady=3)
+        self.sklad_key_entry = ttk.Entry(g5, textvariable=self.sklad_key, show="•")
+        self.sklad_key_entry.grid(row=1, column=1, sticky="ew")
+        b5 = ttk.Frame(c5, style="Card.TFrame")
+        b5.pack(fill="x", pady=(8, 0))
+        self.button(b5, "Проверить связь", self.test_sklad)
+        self.button(b5, "Отправить на склад неотправленное", self.flush_sklad, padx=(8, 0))
+        self.sklad_status = ttk.Label(b5, text="", style="Status.TLabel")
+        self.sklad_status.pack(side="left", padx=(10, 0))
+        ttk.Label(c5, text="Ключ создаётся на складе: Администратор → Ключи API. Пусто — программа "
+                           "работает без склада, как раньше.", style="Info.TLabel").pack(anchor="w", pady=(8, 0))
+
+        c4 = self.card(tab, "Этикетки Ozon")
+        g4 = ttk.Frame(c4, style="Card.TFrame")
+        g4.pack(fill="x")
+        for text, var, lo, hi in (("Искать заказы за, дней", self.days, 1, 90),
+                                  ("Отступ подписи", self.top_margin, 8, 40),
+                                  ("Шрифт подписи", self.font_size, 6, 24)):
+            ttk.Label(g4, text=text, style="Field.TLabel").pack(side="left")
+            ttk.Spinbox(g4, from_=lo, to=hi, textvariable=var, width=4).pack(side="left", padx=(8, 26))
+
+    # ------------------------------------------------------------ папки и настройки
+    @staticmethod
+    def default_root():
+        desk = Path.home() / "Desktop"
+        return desk if desk.exists() else BASE_DIR
+
+    def day_dir(self, sub):
+        """Рабочая папка / Октябрь 2026 / 29.10 / <sub> (или без дня, если галка снята)."""
+        base = Path(self.root_dir.get().strip() or self.default_root())
+        if self.by_day.get():
+            d = today_msk()
+            base = base / f"{MONTHS[d.month - 1]} {d.year}" / f"{d:%d.%m}"
+        return base / sub
+
+    def load_settings(self):
+        if CONFIG.exists():
+            try:
+                for name, cfg in json.loads(CONFIG.read_text(encoding="utf-8")).items():
+                    self.add_cabinet(name, str(cfg.get("client_id", "")), cfg.get("api_key", ""))
+            except ValueError:
+                self.log(f"✖ Файл {CONFIG.name} повреждён, ключи не загружены")
+        while len(self.cab_rows) < 3:
+            self.add_cabinet()
+        if WB_CONFIG.exists():
+            try:
+                self.wb_token.set(json.loads(WB_CONFIG.read_text(encoding="utf-8")).get("token", ""))
+            except ValueError:
+                pass
+        if SKLAD_CONFIG.exists():
+            try:
+                cfg = json.loads(SKLAD_CONFIG.read_text(encoding="utf-8"))
+                self.sklad_url.set(cfg.get("url") or self.sklad_url.get())
+                self.sklad_key.set(cfg.get("key", ""))
+            except ValueError:
+                pass
+        SKLAD.update(url=self.sklad_url.get(), key=self.sklad_key.get())
+        data = {}
+        if MORNING_CONFIG.exists():
+            try:
+                data = json.loads(MORNING_CONFIG.read_text(encoding="utf-8"))
+            except ValueError:
+                pass
+        self.template.set(data.get("template") or (str(BASE_DIR / "BLAGO.xlsx")
+                                                   if (BASE_DIR / "BLAGO.xlsx").exists() else ""))
+        root = data.get("root")
+        if not root and data.get("out"):
+            # прежняя версия: «…/Октябрь 2026/28.10/Сборка» -> рабочая папка «…»
+            import re
+            p = Path(data["out"])
+            if len(p.parts) > 3 and re.fullmatch(r"\d\d\.\d\d", p.parts[-2]) and re.search(r"\d{4}$", p.parts[-3]):
+                root = str(p.parents[2])
+        if root:
+            self.root_dir.set(root)
+        self.by_day.set(False)
+        for key, var in (("days", self.days), ("margin", self.top_margin), ("font", self.font_size)):
+            if key in data:
+                var.set(data[key])
+        self.autoship.set(data.get("autoship", True))
+
+    def schedule_save(self):
+        if self._save_job:
+            self.after_cancel(self._save_job)
+        self._save_job = self.after(700, self.save_settings)
+
+    def save_settings(self):
+        self._save_job = None
+        try:
+            CONFIG.write_text(json.dumps(self.cabinets(), ensure_ascii=False, indent=2), encoding="utf-8")
+            WB_CONFIG.write_text(json.dumps({"token": self.wb_token.get().strip()}), encoding="utf-8")
+            SKLAD.update(url=self.sklad_url.get().strip(), key=self.sklad_key.get().strip())
+            SKLAD_CONFIG.write_text(json.dumps(SKLAD), encoding="utf-8")
+            MORNING_CONFIG.write_text(json.dumps({
+                "template": self.template.get().strip(), "root": self.root_dir.get().strip(),
+                "by_day": bool(self.by_day.get()), "days": int(self.num(self.days, 14)),
+                "margin": self.num(self.top_margin, DEFAULT_TOP_MARGIN_PT),
+                "font": self.num(self.font_size, DEFAULT_FONT_SIZE), "autoship": bool(self.autoship.get()),
+            }, ensure_ascii=False, indent=2), encoding="utf-8")
+        except OSError as e:
+            self.log(f"✖ Не удалось сохранить настройки: {e}")
+        self.refresh_links()
+
+    def on_close(self):
+        self.save_settings()
+        self.destroy()
+
+    def pick_template(self):
+        path = filedialog.askopenfilename(filetypes=[("Excel", "*.xlsx")])
+        if path:
+            self.template.set(path)
+
+    def pick_root(self):
+        """Рабочая папка — одна на всё; внутри программа сама делает «Октябрь 2026 / 29.10 / …»."""
+        path = filedialog.askdirectory(title="Где хранить отчёты и этикетки",
+                                       initialdir=self.root_dir.get() or str(self.default_root()))
+        if path:
+            self.root_dir.set(path)
+            self.save_settings()
+
+    def open_out(self, path):
+        p = Path(path)
+        if not p.exists():
+            p.mkdir(parents=True, exist_ok=True)
+        if sys.platform == "win32":
+            os.startfile(p)  # noqa: S606
+        else:
+            subprocess.Popen(["open" if sys.platform == "darwin" else "xdg-open", str(p)])
+
+    def check_template(self):
+        t = self.template.get().strip()
+        if t and not Path(t).exists():
+            messagebox.showwarning(APP_NAME, f"Не найден шаблон сборки:\n{t}\n\nВыбери его во вкладке «Настройки».")
+            return None
+        if not t:
+            messagebox.showwarning(APP_NAME, "Выбери шаблон сборки во вкладке «Настройки».")
+            return None
+        return t
+
+    # ------------------------------------------------------------ копирование / вставка
+    def setup_clipboard(self):
+        """Ctrl+C/V/X/A при русской раскладке и меню по правой кнопке мыши."""
+        codes = {86: "<<Paste>>", 67: "<<Copy>>", 88: "<<Cut>>", 65: "<<SelectAll>>"}
+        latin = {"v", "c", "x", "a"}
+
+        def select_all(w):
+            if isinstance(w, tk.Text):
+                w.tag_add("sel", "1.0", "end-1c")
+            else:
+                w.select_range(0, "end")
+                w.icursor("end")
+
+        def on_ctrl_key(event):
+            if sys.platform != "win32" or event.keysym.lower() in latin:
+                return None
+            action = codes.get(event.keycode)
+            if not action:
+                return None
+            if action == "<<SelectAll>>":
+                select_all(event.widget)
+            else:
+                event.widget.event_generate(action)
+            return "break"
+
+        def on_select_all(event):
+            select_all(event.widget)
+            return "break"
+
+        menu = tk.Menu(self, tearoff=0, bg=C["card"], fg=C["text"], bd=0,
+                       activebackground=C["accent"], activeforeground=C["on_accent"])
+
+        def popup(event):
+            w = event.widget
+            w.focus_set()
+            menu.delete(0, "end")
+            readonly = isinstance(w, tk.Text) and str(w.cget("state")) == "disabled"
+            if not readonly:
+                menu.add_command(label="Вставить", command=lambda: w.event_generate("<<Paste>>"))
+                menu.add_command(label="Вырезать", command=lambda: w.event_generate("<<Cut>>"))
+            menu.add_command(label="Копировать", command=lambda: w.event_generate("<<Copy>>"))
+            menu.add_separator()
+            menu.add_command(label="Выделить всё", command=lambda: select_all(w))
+            menu.tk_popup(event.x_root, event.y_root)
+
+        for cls in ("TEntry", "Entry", "Text", "TCombobox", "TSpinbox"):
+            self.bind_class(cls, "<Control-KeyPress>", on_ctrl_key, add="+")
+            self.bind_class(cls, "<Control-a>", on_select_all)
+            self.bind_class(cls, "<Control-A>", on_select_all)
+            self.bind_class(cls, "<Button-3>", popup)
+
+    # ------------------------------------------------------------ кабинеты Ozon
+    def add_cabinet(self, name="", cid="", key=""):
+        if not hasattr(self, "show_keys"):
+            self.show_keys = tk.BooleanVar(value=False)
+        r = len(self.cab_rows) + 1
+        v = (tk.StringVar(value=name or f"Озон {r}"), tk.StringVar(value=cid), tk.StringVar(value=key))
+        e_name = ttk.Entry(self.cab_box, textvariable=v[0], width=14)
+        e_cid = ttk.Entry(self.cab_box, textvariable=v[1], width=12)
+        e_key = ttk.Entry(self.cab_box, textvariable=v[2], show="" if self.show_keys.get() else "•")
+        status = ttk.Label(self.cab_box, text="", width=22, style="Status.TLabel")
+        e_name.grid(row=r, column=0, padx=(0, 8), pady=3)
+        e_cid.grid(row=r, column=1, padx=(0, 8))
+        e_key.grid(row=r, column=2, padx=(0, 10), sticky="ew")
+        status.grid(row=r, column=3, sticky="w")
+        for var in v:
+            var.trace_add("write", lambda *_: self.schedule_save())
+        self.cab_rows.append((v, e_key, status))
+
+    def toggle_keys(self):
+        for _, e_key, _ in self.cab_rows:
+            e_key.configure(show="" if self.show_keys.get() else "•")
+
+    def cabinets(self):
+        """Заполненные кабинеты в порядке строк: {название: {client_id, api_key}}."""
+        result = {}
+        for (name, cid, key), _, _ in self.cab_rows:
+            if cid.get().strip() and key.get().strip():
+                result[name.get().strip() or cid.get().strip()] = {
+                    "client_id": cid.get().strip(), "api_key": key.get().strip()}
+        return result
+
+    def test_keys(self):
+        if self.busy:
+            return
+        rows = [(v[0].get(), v[1].get().strip(), v[2].get().strip(), st) for v, _, st in self.cab_rows]
+        self.save_settings()
+
+        def one(name, cid, key, st):
+            if not cid or not key:
+                self.q.put(("status", st, "не заполнен", C["muted"]))
+                return
+            self.q.put(("status", st, "проверяю…", C["muted"]))
+            try:
+                check_key(headers_for({"client_id": cid, "api_key": key}))
+                self.q.put(("status", st, "✔ работает", C["ok"]))
+            except Exception as e:  # noqa: BLE001
+                self.q.put(("status", st, "✖ ошибка", C["err"]))
+                self.q.put(("log", f"✖ {name}: {e}"))
+
+        def work():
+            with ThreadPoolExecutor(max_workers=max(1, len(rows))) as pool:
+                list(pool.map(lambda r: one(*r), rows))
+            self.q.put(("done",))
+
+        self.run(work)
+
+    def test_sklad(self):
+        self.save_settings()
+        if not sklad_on():
+            self.sklad_status.configure(text="впиши адрес и ключ", foreground=C["muted"])
+            return
+        self.sklad_status.configure(text="проверяю…", foreground=C["muted"])
+
+        def work():
+            try:
+                sklad_check()
+                self.q.put(("status", self.sklad_status, "✔ склад на связи", C["ok"]))
+            except (RuntimeError, requests.RequestException) as e:
+                self.q.put(("status", self.sklad_status, f"✖ {e}", C["err"]))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def send_morning(self):
+        """«Отправить на склад»: заказы дня — только после того, как ты проверил отчёты."""
+        if self.busy:
+            return
+        data = morning_load()
+        if not data:
+            messagebox.showinfo(APP_NAME, "Нечего отправлять: сначала скачай отчёты.")
+            return
+        problems = morning_problems(data)
+        text = "Отправить на склад?\n\n" + morning_text(data).replace(" | ", "\n")
+        if problems:
+            text += ("\n\nВНИМАНИЕ:\n" + "\n".join(problems)
+                     + "\n\nНе загрузившиеся кабинеты на складе не трогаются — там останутся их заказы со вчера."
+                     + "\nЛучше нажать «Утро» ещё раз. Всё равно отправить?")
+        if not messagebox.askyesno(APP_NAME, text, icon="warning" if problems else "question"):
+            return
+        self.headline("ОТПРАВКА ЗАКАЗОВ ДНЯ НА СКЛАД")
+
+        def work():
+            morning_send(lambda t: self.q.put(("log", t)))
+            self.q.put(("done",))
+
+        self.run(work)
+
+    def flush_sklad(self):
+        if self.busy:
+            return
+        self.save_settings()
+        self.headline("ОТПРАВКА НА СКЛАД")
+
+        def work():
+            left = len(_pending_load())
+            if not left:
+                self.q.put(("log", "✔ Всё уже на складе, отправлять нечего"))
+            sklad_flush(lambda t: self.q.put(("log", t)))
+            self.q.put(("done",))
+
+        self.run(work)
+
+    def test_wb(self):
+        if self.busy:
+            return
+        token = self.wb_token.get().strip()
+        if not token:
+            self.wb_status.configure(text="не заполнен", foreground=C["muted"])
+            return
+        self.save_settings()
+        self.wb_status.configure(text="проверяю…", foreground=C["muted"])
+
+        def work():
+            try:
+                wb_check(token)
+                self.q.put(("status", self.wb_status, "✔ работает", C["ok"]))
+            except Exception as e:  # noqa: BLE001
+                self.q.put(("status", self.wb_status, "✖ ошибка", C["err"]))
+                self.q.put(("log", f"✖ WB: {e}"))
+            self.q.put(("done",))
+
+        self.run(work)
+
+    # ------------------------------------------------------------ отчёт Ozon
+    def set_excel(self, path):
+        try:
+            names = sheet_names(path)
+        except Exception as e:  # noqa: BLE001
+            messagebox.showerror("Не удалось открыть файл", str(e))
+            return
+        self.excel.set(path)
+        self.excel_name.configure(text=Path(path).name)
+        self.sheet_cb["values"] = names
+        self.sheet.set(names[0])
+        if len(names) > 1:
+            self.sheet_box.pack(side="right", padx=(0, 14))
+        else:
+            self.sheet_box.pack_forget()
+        self.count_report()
+
+    def pick_excel(self):
+        path = filedialog.askopenfilename(filetypes=[("Excel", "*.xlsx *.xlsm")])
+        if path:
+            self.set_excel(path)
+
+    def count_report(self):
+        try:
+            rpt = read_report(self.excel.get(), self.sheet.get())
+            prods = defaultdict(int)
+            for arts in rpt.postings.values():
+                prods[production_of(next(iter(arts)))] += 1
+            parts = [f"Едут {len(rpt.postings)}"] + [f"{p} {prods[p]}" for p in PRODUCTIONS]
+            if rpt.red:
+                parts.append(f"красных {len(rpt.red)}")
+            if rpt.limits:
+                parts.append(f"жёлтых не едут {len(rpt.yellow)}")
+            if rpt.mixed or rpt.notes:
+                parts.append("⚠ есть замечания — нажми «Проверить»")
+            self.report_info.configure(text="   ·   ".join(parts), foreground=C["text"])
+        except Exception as e:  # noqa: BLE001
+            self.report_info.configure(text=f"Не получилось прочитать: {e}", foreground=C["err"])
+
+    # ------------------------------------------------------------ отчёты WB
+    def clear_wb(self):
+        self.set_wb_files([])
+
+    def set_wb_files(self, files):
+        self.wb_files = list(files)
+        self.wb_files_label.configure(text="   ·   ".join(Path(p).stem for p in files) or "не выбраны")
+        lines = []
+        for p in self.wb_files:
+            try:
+                keep, _ = wb_report_filter(p)
+                rpt = read_report(p, keep=keep)
+                lines.append(f"{Path(p).stem}: едут {len(rpt.postings)}"
+                             + (f" · красных {len(rpt.red)}" if rpt.red else "")
+                             + (f" · жёлтых не едут {len(rpt.yellow)}" if rpt.limits else ""))
+            except Exception as e:  # noqa: BLE001
+                lines.append(f"{Path(p).stem}: не получилось прочитать — {e}")
+        self.wb_info.configure(text="\n".join(lines) or "Отчёты подставляются сами после «Сборки».")
+
+    def pick_wb(self):
+        paths = filedialog.askopenfilenames(filetypes=[("Excel", "*.xlsx *.xlsm")])
+        if paths:
+            self.set_wb_files(self.wb_files + [p for p in paths if p not in self.wb_files])
+
+    # ------------------------------------------------------------ запуск работ
+    def run(self, work):
+        self.set_busy(True)
+        threading.Thread(target=work, daemon=True).start()
+
+    def headline(self, text):
+        self.bar["value"] = 0
+        self.log("")
+        self.log(f"=== {text} ===")
+
+    def start_morning(self):
+        if self.busy:
+            return
+        template = self.check_template()
+        if not template:
+            return
+        cabinets, token = self.cabinets(), self.wb_token.get().strip()
+        if not cabinets and not token:
+            messagebox.showwarning(APP_NAME, "Заполни ключи Ozon и токен WB во вкладке «Настройки».")
+            return
+        self.save_settings()
+        out, days = self.day_dir("Сборка"), int(self.num(self.days, 14))
+        d = today_msk()
+        self.headline(f"УТРЕННЯЯ СБОРКА · {d:%d.%m}")
+        self.mo_status.configure(text="скачиваю…", foreground=C["muted"])
+
+        def work():
+            try:
+                files = morning(cabinets, token, template, "", out, days,
+                                log=lambda s: self.q.put(("log", s)),
+                                progress=lambda a, b: self.q.put(("progress", a, b)))
+                self.q.put(("call", lambda: self.after_morning(files)))
+            except Exception as e:  # noqa: BLE001
+                self.q.put(("log", f"✖ Ошибка: {e}"))
+                self.q.put(("status", self.mo_status, "✖ ошибка — см. журнал", C["err"]))
+            self.q.put(("done",))
+
+        self.run(work)
+
+    def after_morning(self, files):
+        if files.get("ozon"):
+            self.set_excel(str(files["ozon"]))
+            self.footer.set("Озон утро")
+        wb = [str(files[k]) for k in ("wb", "sgt") if files.get(k)]
+        if wb:
+            self.set_wb_files(wb)
+        self.refresh_links()
+        t = datetime.now(MSK)
+        self.mo_status.configure(text=f"✔ Готово в {t:%H:%M}. Отчёты уже стоят на вкладках Ozon и Wildberries.",
+                                 foreground=C["ok"])
+
+    def start_cdek(self):
+        if self.busy:
+            return
+        template = self.check_template()
+        if not template:
+            return
+        cdek = filedialog.askopenfilename(title="Файл СДЭК", filetypes=[("Excel", "*.xlsx *.xlsm")])
+        if not cdek:
+            return
+        out = self.day_dir("Сборка")
+        self.headline("СДЭК В СБОРКУ")
+
+        def work():
+            try:
+                add_cdek(template, cdek, out, log=lambda s: self.q.put(("log", s)))
+            except PermissionError:
+                self.q.put(("log", "✖ Файл сборки открыт в Excel — закрой его и нажми ещё раз"))
+            except Exception as e:  # noqa: BLE001
+                self.q.put(("log", f"✖ Ошибка: {e}"))
+            self.q.put(("done",))
+
+        self.run(work)
+
+    def start_wave(self):
+        if self.busy:
+            return
+        cabinets = self.cabinets()
+        if not cabinets:
+            messagebox.showwarning(APP_NAME, "Заполни ключи Ozon во вкладке «Настройки».")
+            return
+        template = self.check_template()
+        if not template:
+            return
+        wave = self.wave_name()
+        kgt = "кгт" in wave.lower()
+        out, days = self.day_dir(wave), int(self.num(self.days, 14))
+        self.save_settings()
+        self.headline(f"{wave.upper()} · {'КГТ' if kgt else 'МГТ'} · только «ожидают сборки»")
+        self.wave_status.configure(text="скачиваю…", foreground=C["muted"])
+
+        def work():
+            try:
+                files = ozon_wave(cabinets, template, out, days, wave, kgt,
+                                  log=lambda s: self.q.put(("log", s)),
+                                  progress=lambda a, b: self.q.put(("progress", a, b)))
+                self.q.put(("call", lambda: self.after_wave(wave, files)))
+            except Exception as e:  # noqa: BLE001
+                self.q.put(("log", f"✖ Ошибка: {e}"))
+                self.q.put(("status", self.wave_status, "✖ ошибка — см. журнал", C["err"]))
+            self.q.put(("done",))
+
+        self.run(work)
+
+    def after_wave(self, wave, files):
+        report = files.get("kgt") or files.get("ozon")
+        if report:
+            self.set_excel(str(report))
+        self.footer.set(wave)
+        self.refresh_links()
+        t = datetime.now(MSK)
+        self.wave_status.configure(text=f"✔ {wave} готов в {t:%H:%M}. Отчёт уже стоит на вкладке Ozon.",
+                                   foreground=C["ok"])
+
+    def start_wb(self, mode):
+        if self.busy:
+            return
+        token = self.wb_token.get().strip()
+        if not token:
+            messagebox.showwarning(APP_NAME, "Вставь токен WB во вкладке «Настройки».")
+            return
+        if mode != "stickers" and not self.wb_files:
+            messagebox.showwarning(APP_NAME, "Добавь отчёты ВБ и СГТ.")
+            return
+        self.save_settings()
+        out = self.day_dir("ВБ")
+        self.headline({"run": "WB · ПОСТАВКИ И СТИКЕРЫ", "check": "WB · ПРОВЕРКА",
+                       "stickers": "WB · СТИКЕРЫ ОТКРЫТЫХ ПОСТАВОК"}[mode])
+        files = list(self.wb_files)
+
+        def work():
+            try:
+                process_wb(files, token, out, log=lambda s: self.q.put(("log", s)),
+                           progress=lambda a, b: self.q.put(("progress", a, b)),
+                           mode=mode, confirm=self.ask)
+            except Exception as e:  # noqa: BLE001
+                self.q.put(("log", f"✖ Ошибка: {e}"))
+            self.q.put(("done",))
+
+        self.run(work)
+
+    def num(self, var, default):
+        try:
+            return float(var.get())
+        except (tk.TclError, ValueError):
+            return default
+
+    def start(self, mode):
+        """Вкладка Ozon. mode: run — скачать и собрать, check — проверка, merge — пересобрать ленты."""
+        if self.busy:
+            return
+        font, margin = self.num(self.font_size, DEFAULT_FONT_SIZE), self.num(self.top_margin, DEFAULT_TOP_MARGIN_PT)
+        out = self.day_dir(self.ozon_sub())
+        if mode == "merge":
+            self.headline("ПЕРЕСБОРКА ЛЕНТ")
+
+            def work():
+                try:
+                    merge_all(out, font, margin, lambda s: self.q.put(("log", s)))
+                except Exception as e:  # noqa: BLE001
+                    self.q.put(("log", f"✖ Ошибка: {e}"))
+                self.q.put(("done",))
+        else:
+            cabinets = self.cabinets()
+            if not cabinets:
+                messagebox.showwarning(APP_NAME, "Заполни ключи Ozon во вкладке «Настройки».")
+                return
+            if not self.excel.get():
+                messagebox.showwarning(APP_NAME, "Выбери отчёт.")
+                return
+            self.save_settings()
+            self.headline(f"OZON · {'СКАЧИВАНИЕ И СБОРКА' if mode == 'run' else 'ПРОВЕРКА'} · {self.ozon_sub()}")
+            args = (self.excel.get(), self.sheet.get(), cabinets, int(self.num(self.days, 14)), out)
+            autoship, footer = bool(self.autoship.get()), self.footer.get()
+
+            def work():
+                try:
+                    process(*args, log=lambda s: self.q.put(("log", s)),
+                            progress=lambda a, b: self.q.put(("progress", a, b)),
+                            download=mode == "run", font_size=font, top_margin=margin,
+                            autoship=autoship, confirm=self.ask, footer=footer)
+                except Exception as e:  # noqa: BLE001
+                    self.q.put(("log", f"✖ Ошибка: {e}"))
+                self.q.put(("done",))
+
+        self.run(work)
+
+    def ask(self, text):
+        """Вопрос «да/нет» из рабочего потока (сам диалог показывается в окне)."""
+        done, answer = threading.Event(), {}
+        self.q.put(("ask", text, done, answer))
+        done.wait()
+        return answer.get("ok", False)
+
+    def set_busy(self, busy):
+        self.busy = busy
+        self.state_pill.configure(text="●  работаю…" if busy else "●  готова к работе",
+                                  fg=C["accent"] if busy else C["ok"])
+        self.configure(cursor="watch" if busy else "")
+        if busy:
+            self.bar.pack(fill="x", padx=18, pady=(10, 0), before=self._log_frame)
+        else:
+            self.bar.pack_forget()
+        for b in self.buttons:
+            b.configure(state="disabled" if busy else "normal")
+        for b in getattr(self, "wave_chips", {}).values():
+            b.configure(state="disabled" if busy else "normal")
+
+    # ------------------------------------------------------------ журнал
+    def clear_log(self):
+        self.log_box.configure(state="normal")
+        self.log_box.delete("1.0", "end")
+        self.log_box.configure(state="disabled")
+
+    def log(self, text):
+        s = text.lstrip()
+        tag = ("big" if s.startswith(("✔ ВСЕГО ШК", "✔ СКАЧАНО ШК", "✔ ГОТОВО")) else
+               "ok" if s.startswith("✔") else "err" if s.startswith("✖") else
+               "head" if s.startswith("===") else "warn" if s.startswith("⚠") else
+               "warnbody" if s.startswith("│") else "yellow" if s.startswith("●") else "")
+        if tag == "head":
+            text = s.strip("= ").strip()
+        self.log_box.configure(state="normal")
+        self.log_box.insert("end", text + "\n", tag)
+        self.log_box.see("end")
+        self.log_box.configure(state="disabled")
+
+    def poll(self):
+        try:
+            while True:
+                m = self.q.get_nowait()
+                if m[0] == "log":
+                    self.log(m[1])
+                elif m[0] == "progress":
+                    self.bar["maximum"], self.bar["value"] = max(m[2], 1), m[1]
+                elif m[0] == "status":
+                    m[1].configure(text=m[2], foreground=m[3])
+                elif m[0] == "ask":
+                    m[3]["ok"] = messagebox.askyesno(APP_NAME, m[1])
+                    m[2].set()
+                elif m[0] == "call":
+                    m[1]()
+                elif m[0] == "done":
+                    self.set_busy(False)
+        except queue.Empty:
+            pass
+        self.after(100, self.poll)
+
+
+if __name__ == "__main__":
+    App().mainloop()

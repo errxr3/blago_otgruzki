@@ -1,0 +1,14 @@
+# Ключи и личные настройки — никогда не в репозиторий
+cabinets.json
+wb.json
+sklad.json
+morning.json
+# Что ждёт отправки на склад — у каждого компьютера своё
+sklad_pending.json
+sklad_morning.json
+__pycache__/
+build/
+dist/
+*.spec
+*.pdf
+*.xlsx
