@@ -69,7 +69,7 @@ from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.pdfgen import canvas
 
 APP_NAME = "BLAGO OTGRUZKI"
-APP_VERSION = "1.19"  # при каждом обновлении +0.1, запись в CHANGELOG.md
+APP_VERSION = "1.20"  # при каждом обновлении +0.1, запись в CHANGELOG.md
 API = "https://api-seller.ozon.ru"
 BATCH = 20                   # максимум отправлений в одном запросе этикеток
 READY = "awaiting_deliver"   # статус, в котором Ozon отдаёт этикетку
@@ -2582,18 +2582,44 @@ def cdek_filter(path, orders, log=None):
     return keep, stopped
 
 
-def write_cdek_stopped(path, stopped):
-    """Список «не уехало» для менеджеров: что вернуть в таблицу."""
+def write_cdek_stopped(path, stopped, source=None):
+    """Общий список «не уехало» для менеджеров: все колонки из файла заказов + производство и почему."""
+    header, rows = ["№ задания", "Артикул продавца", "трэк"], {}
+    if source:  # строки как в исходном файле — со всеми колонками, что там есть
+        wb_in = openpyxl.load_workbook(source, data_only=True, read_only=True)
+        try:
+            it = wb_in.worksheets[0].iter_rows(values_only=True)
+            head = [str(c).strip() if c is not None else "" for c in next(it, ())]
+            width = 0
+            while width < len(head) and head[width]:
+                width += 1
+            i_task = _find_col(head, COL_TASK, required=False)
+            if width and i_task is not None and i_task < width:
+                header = head[:width]
+                for r in it:
+                    task = _num(r[i_task]) if i_task < len(r) else ""
+                    if task:
+                        rows.setdefault(task, [_num(v) if isinstance(v, (int, float))
+                                               else v.replace("\xa0", " ").strip() if isinstance(v, str) else v
+                                               for v in r[:width]])
+        finally:
+            wb_in.close()
     wb = openpyxl.Workbook()
     ws = wb.active
     ws.title = "Не уехало"
-    ws.append(["№ задания", "Артикул продавца", "трэк", "Почему"])
+    ws.append(header + ["Номер WB", "Производство", "Почему"])
     for o in stopped:
-        ws.append([int(o["task"]) if o["task"].isdigit() else o["task"], o["article"], o["track"], o["why"]])
+        base = rows.get(o["task"]) or [o["task"], o["article"], o["track"]][:len(header)]
+        base = [int(v) if isinstance(v, str) and v.isdigit() and len(v) < 16 else v for v in base]
+        ws.append(base + [f"WB-DBS-{o['task']}" if o["task"] else "", production_of(o["article"]), o["why"]])
     for cell in ws[1]:
         cell.font = openpyxl.styles.Font(bold=True)
-    for col, width in (("A", 14), ("B", 32), ("C", 14), ("D", 60)):
-        ws.column_dimensions[col].width = width
+    for i in range(1, ws.max_column + 1):
+        ws.column_dimensions[openpyxl.utils.get_column_letter(i)].width = 18
+    ws.column_dimensions[openpyxl.utils.get_column_letter(ws.max_column)].width = 60
+    for i, name in enumerate(header + ["Номер WB", "Производство", "Почему"], start=1):
+        if "Артикул" in name:
+            ws.column_dimensions[openpyxl.utils.get_column_letter(i)].width = 32
     wb.save(path)
 
 
@@ -3724,7 +3750,7 @@ class App(tk.Tk):
                 if stopped:
                     Path(out).mkdir(parents=True, exist_ok=True)
                     name = f"СДЭК не уехало {datetime.now(MSK):%d.%m}.xlsx"
-                    write_cdek_stopped(Path(out) / name, stopped)
+                    write_cdek_stopped(Path(out) / name, stopped, path)
                     log(f"⛔ Не уехало {len(stopped)} — список для менеджеров: «СДЭК» / {name}")
                     log("│ " + ", ".join(o["task"] for o in stopped))
                     self.q.put(("status", self.cdek_done,
