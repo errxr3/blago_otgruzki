@@ -69,7 +69,7 @@ from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.pdfgen import canvas
 
 APP_NAME = "BLAGO OTGRUZKI"
-APP_VERSION = "1.11"  # при каждом обновлении +0.1, запись в CHANGELOG.md
+APP_VERSION = "1.12"  # при каждом обновлении +0.1, запись в CHANGELOG.md
 API = "https://api-seller.ozon.ru"
 BATCH = 20                   # максимум отправлений в одном запросе этикеток
 READY = "awaiting_deliver"   # статус, в котором Ozon отдаёт этикетку
@@ -2752,7 +2752,7 @@ class App(tk.Tk):
         self.build_sborka(self.pages["Сборка"])
         self.build_ozon(self.pages["Ozon"])
         self.build_wb(self.pages["Wildberries"])
-        self.build_settings(self.pages["Настройки"])
+        self.build_settings(self.scroll_page(self.pages["Настройки"]))
 
         jb = tk.Frame(main, bg=C["line"])
         jb.pack(fill="both", expand=True, pady=(14, 0))
@@ -3120,6 +3120,39 @@ class App(tk.Tk):
         self.folder_link(c2, "ВБ")
 
     # ------------------------------------------------------------ вкладка «Настройки»
+    def scroll_page(self, page):
+        """Страница с прокруткой: длинные настройки листаются колесом, журнал внизу остаётся виден."""
+        canvas = tk.Canvas(page, bg=C["bg"], highlightthickness=0, bd=0, height=300)
+        bar = ttk.Scrollbar(page, orient="vertical", command=canvas.yview)
+        inner = ttk.Frame(canvas, style="Bg.TFrame")
+        win = canvas.create_window((0, 0), window=inner, anchor="nw")
+        canvas.configure(yscrollcommand=bar.set)
+        canvas.pack(side="left", fill="x", expand=True)
+        bar.pack(side="right", fill="y", padx=(6, 0))
+        journal_min = 190  # столько оставляем журналу внизу окна
+
+        def fit(_=None):
+            need = inner.winfo_reqheight()
+            top = self.page_box.winfo_rooty() - self.winfo_rooty()
+            room = max(220, self.winfo_height() - top - journal_min)
+            height = min(need, room)
+            if int(canvas.cget("height")) != height:
+                canvas.configure(height=height)
+            canvas.configure(scrollregion=(0, 0, 0, need))
+
+        def wheel(e):
+            if getattr(self, "current_page", "") != "Настройки":
+                return
+            w = self.winfo_containing(e.x_root, e.y_root)
+            if w is not None and str(w).startswith(str(canvas)):
+                canvas.yview_scroll(-1 if e.delta > 0 else 1, "units")
+
+        inner.bind("<Configure>", fit)
+        canvas.bind("<Configure>", lambda e: canvas.itemconfigure(win, width=e.width))
+        self.bind("<Configure>", fit, add="+")
+        self.bind_all("<MouseWheel>", wheel, add="+")
+        return inner
+
     def build_settings(self, tab):
         c1 = self.card(tab, "Кабинеты Ozon", side=lambda h: ttk.Checkbutton(
             h, text="показать ключи", variable=self.show_keys, command=self.toggle_keys).pack(side="right"))
