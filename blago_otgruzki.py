@@ -69,7 +69,7 @@ from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.pdfgen import canvas
 
 APP_NAME = "BLAGO OTGRUZKI"
-APP_VERSION = "1.21"  # при каждом обновлении +0.1, запись в CHANGELOG.md
+APP_VERSION = "1.22"  # при каждом обновлении +0.1, запись в CHANGELOG.md
 API = "https://api-seller.ozon.ru"
 BATCH = 20                   # максимум отправлений в одном запросе этикеток
 READY = "awaiting_deliver"   # статус, в котором Ozon отдаёт этикетку
@@ -3798,6 +3798,12 @@ class App(tk.Tk):
         return inner
 
     def build_settings(self, tab):
+        top = ttk.Frame(tab, style="Bg.TFrame")
+        top.pack(fill="x", pady=(0, 4))
+        self.button(top, "Сохранить настройки", self.save_now, "Accent.TButton")
+        self.save_status = tk.Label(top, text=f"Настройки и ключи хранятся в папке программы: {BASE_DIR}",
+                                    bg=C["bg"], fg=C["muted"], font=(FONT, 9), anchor="w")
+        self.save_status.pack(side="left", padx=(12, 0))
         c1 = self.card(tab, "Кабинеты Ozon", side=lambda h: ttk.Checkbutton(
             h, text="показать ключи", variable=self.show_keys, command=self.toggle_keys).pack(side="right"))
         self.cab_box = ttk.Frame(c1, style="Card.TFrame")
@@ -4055,6 +4061,26 @@ class App(tk.Tk):
             messagebox.showwarning(APP_NAME, "Заполни ключи Ozon во вкладке «Настройки».")
             return
         self.passes_bg(ozon_passes, cabinets)
+
+    def save_now(self):
+        """Кнопка «Сохранить настройки»: сохранить сразу и проверить, что всё записалось."""
+        if self._save_job:
+            self.after_cancel(self._save_job)
+        self.save_settings()
+        try:
+            saved = json.loads(MORNING_CONFIG.read_text(encoding="utf-8")).get("passes") or {}
+            ok = saved.get("phone", "") == self.pass_cfg()["phone"]
+        except (OSError, ValueError):
+            ok = False
+        t = datetime.now(MSK)
+        if ok:
+            self.save_status.configure(text=f"✔ Сохранено в {t:%H:%M} — папка {BASE_DIR}", foreground=C["ok"])
+            self.log(f"✔ Настройки сохранены: {BASE_DIR}")
+        else:
+            self.save_status.configure(text=f"✖ Не сохранилось — нет доступа к папке {BASE_DIR}",
+                                       foreground=C["err"])
+            self.log(f"✖ Настройки не сохранились в {BASE_DIR}. Перенеси программу в обычную папку "
+                     f"(например, на Рабочий стол) и запускай всегда оттуда.")
 
     def on_close(self):
         self.save_settings()
