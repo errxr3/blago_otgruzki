@@ -69,7 +69,7 @@ from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.pdfgen import canvas
 
 APP_NAME = "BLAGO OTGRUZKI"
-APP_VERSION = "1.18"  # при каждом обновлении +0.1, запись в CHANGELOG.md
+APP_VERSION = "1.19"  # при каждом обновлении +0.1, запись в CHANGELOG.md
 API = "https://api-seller.ozon.ru"
 BATCH = 20                   # максимум отправлений в одном запросе этикеток
 READY = "awaiting_deliver"   # статус, в котором Ozon отдаёт этикетку
@@ -2570,14 +2570,31 @@ def cdek_filter(path, orders, log=None):
     rpt = read_report(path)
     going = set(rpt.postings)
     keep = [o for o in orders if not o["task"] or o["task"] in going]
+    why = {num: "красный" for _, num in rpt.red}
+    why.update({num: reason for _, num, reason in rpt.yellow})
+    stopped = [{**o, "why": why.get(o["task"], "не едет")} for o in orders if o["task"] and o["task"] not in going]
     if log:
-        for art, num in rpt.red:
-            log(f"⛔ СДЭК не едет (красный): {num} · {art}")
-        for art, num, why in rpt.yellow:
-            log(f"⛔ СДЭК не едет: {num} · {art} — {why}")
+        for o in stopped:
+            log(f"⛔ СДЭК не едет: {o['task']} · {o['article']} — {o['why']}")
         for note in rpt.notes:
-            log(f"⚠ {note}")
-    return keep, len(rpt.red) + len(rpt.yellow)
+            if "Принят в обработку" not in note:  # у СДЭК времени нет — жёлтые идут по порядку файла
+                log(f"⚠ {note}")
+    return keep, stopped
+
+
+def write_cdek_stopped(path, stopped):
+    """Список «не уехало» для менеджеров: что вернуть в таблицу."""
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Не уехало"
+    ws.append(["№ задания", "Артикул продавца", "трэк", "Почему"])
+    for o in stopped:
+        ws.append([int(o["task"]) if o["task"].isdigit() else o["task"], o["article"], o["track"], o["why"]])
+    for cell in ws[1]:
+        cell.font = openpyxl.styles.Font(bold=True)
+    for col, width in (("A", 14), ("B", 32), ("C", 14), ("D", 60)):
+        ws.column_dimensions[col].width = width
+    wb.save(path)
 
 
 def make_cdek(orders, out, log, today=None):
@@ -3667,7 +3684,7 @@ class App(tk.Tk):
         """Прочитать файл заказов: сколько едет на каждое производство с учётом покраски."""
         try:
             orders = read_cdek_orders(path)
-            going, stopped = cdek_filter(path, orders) if orders else ([], 0)
+            going, stopped = cdek_filter(path, orders) if orders else ([], [])
         except Exception as e:  # noqa: BLE001
             messagebox.showerror(APP_NAME, f"Не удалось прочитать файл: {e}")
             return
@@ -3679,7 +3696,7 @@ class App(tk.Tk):
         kom = sum(production_of(o["article"]) == KOMINTERNA for o in going)
         text = f"Едут {len(going)}: {KOMINTERNA} {kom}, {UCHITELSKAYA} {len(going) - kom}"
         if stopped:
-            text += f" · не едут (покраска): {stopped}"
+            text += f" · не едут (покраска): {len(stopped)}"
         self.cdek_info.configure(text=text + ". Покрасил или поправил файл — выбери его ещё раз.")
 
     def start_cdek_docs(self):
@@ -3699,11 +3716,17 @@ class App(tk.Tk):
         def work():
             log = lambda s: self.q.put(("log", s))  # noqa: E731
             try:
-                orders, _ = cdek_filter(path, read_cdek_orders(path), log)  # файл читаем заново — свежая покраска
+                orders, stopped = cdek_filter(path, read_cdek_orders(path), log)  # заново — свежая покраска
                 if not orders:
                     log("✖ В файле не осталось заказов, которые едут")
                 else:
                     make_cdek(orders, out, log)
+                if stopped:
+                    Path(out).mkdir(parents=True, exist_ok=True)
+                    name = f"СДЭК не уехало {datetime.now(MSK):%d.%m}.xlsx"
+                    write_cdek_stopped(Path(out) / name, stopped)
+                    log(f"⛔ Не уехало {len(stopped)} — список для менеджеров: «СДЭК» / {name}")
+                    log("│ " + ", ".join(o["task"] for o in stopped))
                     self.q.put(("status", self.cdek_done,
                                 f"✔ Готово в {datetime.now(MSK):%H:%M} — {len(orders)} заказов, папка «СДЭК»",
                                 C["ok"]))
