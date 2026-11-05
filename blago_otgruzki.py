@@ -69,7 +69,7 @@ from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.pdfgen import canvas
 
 APP_NAME = "BLAGO OTGRUZKI"
-APP_VERSION = "1.25"  # при каждом обновлении +0.1, запись в CHANGELOG.md
+APP_VERSION = "1.26"  # при каждом обновлении +0.1, запись в CHANGELOG.md
 API = "https://api-seller.ozon.ru"
 BATCH = 20                   # максимум отправлений в одном запросе этикеток
 READY = "awaiting_deliver"   # статус, в котором Ozon отдаёт этикетку
@@ -1968,7 +1968,7 @@ def sklad_summary(answer, log):
     count = defaultdict(int)
     for decision, _ in answer.values():
         count[decision] += 1
-    log(f"✔ Склад: едет {count['go']}"
+    log(f"✔ Склад, заказов: едет {count['go']}"
         + (f" · вечером в Озон 3 {count['later']}" if count["later"] else "")
         + (f" · не едет {count['no']}" if count["no"] else "")
         + (f" · вопрос начальнику {count['ask']}" if count["ask"] else ""))
@@ -2965,36 +2965,41 @@ def sklad_decide(market, channel, truck, postings, times, colored, log, confirm,
     answer = sklad_demand(today_msk(), lines, log)
     if answer is None:
         return postings
-    keep, no, ask, later = {}, defaultdict(list), defaultdict(list), defaultdict(int)
+    # Считаем штуки, а не отправления: один заказ на 15 зеркал — это 15 шт., а не 1
+    keep = {}
+    no = defaultdict(lambda: defaultdict(int))
+    ask, later = defaultdict(int), defaultdict(int)
     for num, arts in postings.items():
         if any(a in colored for a in arts):
             keep[num] = arts
             continue
         decision, why = answer.get(num, ("go", ""))
         if decision == "no":
-            no[why or "не едет"].append((num, next(iter(arts))))
+            for a, q in arts.items():
+                no[why or "не едет"][a] += q
         elif decision == "ask":
-            ask[next(iter(arts))].append(num)
+            for a, q in arts.items():
+                ask[a] += q
         elif decision == "later":  # обещано к вечеру — поедет в Озон 3, сейчас не качаем
-            later[next(iter(arts))] += 1
+            for a, q in arts.items():
+                later[a] += q
         else:
             keep[num] = arts
-    log(f"✔ Склад: едет {len(keep)}" + (f" · не едет {sum(map(len, no.values()))}" if no else "")
-        + (f" · вечером в Озон 3 {sum(later.values())}" if later else "")
-        + (f" · ждёт ответа начальника {sum(map(len, ask.values()))}" if ask else ""))
+    pieces = sum(q for arts in keep.values() for q in arts.values())
+    no_pieces = sum(q for arts in no.values() for q in arts.values())
+    log(f"✔ Склад: едет {pieces} шт." + (f" · не едет {no_pieces} шт." if no else "")
+        + (f" · вечером в Озон 3 {sum(later.values())} шт." if later else "")
+        + (f" · ждёт ответа начальника {sum(ask.values())} шт." if ask else ""))
     if later:
         log("● Доделают к вечеру, поедут в Озон 3: "
             + ", ".join(f"{a} × {n}" for a, n in sorted(later.items())))
-    for why, items in no.items():
-        arts = defaultdict(int)
-        for _, a in items:
-            arts[a] += 1
+    for why, arts in no.items():
         log(f"✖ Не едет — {why}: " + ", ".join(f"{a} × {n}" for a, n in sorted(arts.items())))
     if ask:
-        text = "\n".join(f"   {a} — {len(n)} шт." for a, n in sorted(ask.items()))
+        text = "\n".join(f"   {a} — {n} шт." for a, n in sorted(ask.items()))
         log("● Ждут ответа начальника (на складе мало, артикул в работе):")
         for a, n in sorted(ask.items()):
-            log(f"│   {a} — {len(n)} шт.")
+            log(f"│   {a} — {n} шт.")
         if download and not confirm(
                 f"Начальник ещё не ответил по этим зеркалам:\n{text}\n\n"
                 f"Да — качать без них (они поедут следующей волной)\n"
