@@ -69,7 +69,7 @@ from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.pdfgen import canvas
 
 APP_NAME = "BLAGO OTGRUZKI"
-APP_VERSION = "1.23"  # при каждом обновлении +0.1, запись в CHANGELOG.md
+APP_VERSION = "1.24"  # при каждом обновлении +0.1, запись в CHANGELOG.md
 API = "https://api-seller.ozon.ru"
 BATCH = 20                   # максимум отправлений в одном запросе этикеток
 READY = "awaiting_deliver"   # статус, в котором Ozon отдаёт этикетку
@@ -3119,7 +3119,7 @@ def _make_pass(h, cab, cid, where, cars, driver, phone, log, tries=1):
     return False
 
 
-def ozon_passes(cabinets, cfg, log, form=None, confirm=lambda text: True):
+def ozon_passes(cabinets, cfg, log, form=None, confirm=lambda text: True, ask_count=None):
     """Пропуска Ozon (обе машины) на сегодняшние отгрузки без пропуска.
     form = {кабинет: {склады}} — сначала сформировать отгрузку по этим складам (как кнопка
     «Сформировать» в кабинете: в неё попадают все собранные отправления склада), потом пропуск.
@@ -3184,19 +3184,30 @@ def ozon_passes(cabinets, cfg, log, form=None, confirm=lambda text: True):
             log(f"✖ Отгрузка {cab} · {name}: Ozon не вернул номер отгрузки — проверь в кабинете")
             continue
         log(f"… отгрузка {cab} · {name} № {cid} создана, подтверждаю")
-        a, err = None, ""
+        a, err, body = None, "", {"carriage_id": int(cid)}
         for i in range(8):   # Ozon собирает отгрузку не сразу — подтверждение может пройти со 2–3 раза
             if i:
                 time.sleep(5)
             try:
-                a = ozon_post(f"{API}/v1/carriage/approve", headers=h, timeout=60, net_retry=False,
-                              json={"carriage_id": int(cid)})
+                a = ozon_post(f"{API}/v1/carriage/approve", headers=h, timeout=60, net_retry=False, json=body)
             except requests.RequestException as e:
                 err = str(e)
                 continue
             if a.status_code == 200:
                 break
             err = api_error(a)
+            # склад с грузоместами: Ozon просит указать, сколько коробок/паллет в отгрузке
+            if a.status_code == 400 and "CONTAINERS_COUNT" in a.text:
+                if "containers_count" in body or ask_count is None:
+                    err += " — Ozon не принял число грузомест" if "containers_count" in body else ""
+                    break
+                n = ask_count(f"Отгрузка {cab} · {name} № {cid}\n\nOzon просит указать количество грузомест "
+                              f"(коробок или паллет), которые уезжают в этой отгрузке.\n\nСколько грузомест?")
+                if not n:
+                    err += " — число грузомест не указано"
+                    break
+                body = {"carriage_id": int(cid), "containers_count": int(n)}
+                log(f"… подтверждаю отгрузку № {cid}: грузомест {n}")
         if a is None or a.status_code != 200:
             log(f"✖ Отгрузка {cab} · {name} № {cid} создана, но не подтверждена: {err} "
                 f"— подтверди в кабинете и пришли скриншот этой строки")
@@ -4695,7 +4706,7 @@ class App(tk.Tk):
                     if mode == "run" and pass_cfg and form:
                         self.q.put(("log", "\n=== ОТГРУЗКА И ПРОПУСКА ==="))
                         ozon_passes(cabinets, pass_cfg, lambda s: self.q.put(("log", s)),
-                                    form=form, confirm=self.ask)
+                                    form=form, confirm=self.ask, ask_count=self.ask_int)
                 except Exception as e:  # noqa: BLE001
                     self.q.put(("log", f"✖ Ошибка: {e}"))
                 self.q.put(("done",))
@@ -4708,6 +4719,13 @@ class App(tk.Tk):
         self.q.put(("ask", text, done, answer))
         done.wait()
         return answer.get("ok", False)
+
+    def ask_int(self, text):
+        """Число из рабочего потока (окно ввода показывается в главном окне). Отмена — None."""
+        done, answer = threading.Event(), {}
+        self.q.put(("askint", text, done, answer))
+        done.wait()
+        return answer.get("value")
 
     def set_busy(self, busy):
         self.busy = busy
@@ -4761,6 +4779,10 @@ class App(tk.Tk):
                     m[1].configure(text=m[2], foreground=m[3])
                 elif m[0] == "ask":
                     m[3]["ok"] = messagebox.askyesno(APP_NAME, m[1])
+                    m[2].set()
+                elif m[0] == "askint":
+                    from tkinter import simpledialog
+                    m[3]["value"] = simpledialog.askinteger(APP_NAME, m[1], parent=self, minvalue=1, maxvalue=999)
                     m[2].set()
                 elif m[0] == "call":
                     m[1]()
