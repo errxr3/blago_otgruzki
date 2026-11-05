@@ -2,6 +2,7 @@
 cabinets.json
 wb.json
 sklad.json
+cdek.json
 morning.json
 # Что ждёт отправки на склад — у каждого компьютера своё
 sklad_pending.json

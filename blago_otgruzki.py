@@ -69,7 +69,7 @@ from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.pdfgen import canvas
 
 APP_NAME = "BLAGO OTGRUZKI"
-APP_VERSION = "1.13"  # при каждом обновлении +0.1, запись в CHANGELOG.md
+APP_VERSION = "1.14"  # при каждом обновлении +0.1, запись в CHANGELOG.md
 API = "https://api-seller.ozon.ru"
 BATCH = 20                   # максимум отправлений в одном запросе этикеток
 READY = "awaiting_deliver"   # статус, в котором Ozon отдаёт этикетку
@@ -2126,18 +2126,268 @@ def morning(cabinets, token, template, cdek, out, days, log, progress, today=Non
     return files
 
 
-def add_cdek(template, cdek, out, log, today=None):
+def add_cdek(template, cdek, out, log, today=None, send_sklad=True):
     """Дописывает СДЭК в сегодняшнюю «Сборку» (или делает её из шаблона, если её ещё нет)."""
     day = today or datetime.now(MSK).date()
     path = Path(out) / f"Сборка {day:%d.%m}.xlsx"
     data = {"cdek": read_totals(cdek)}
     fill_sborka(template, path, day, data, log, base=path if path.exists() else None)
     log(f"✔ СДЭК {sum(data['cdek'].values())} шт. добавлен в {path.name}")
-    if sklad_on():  # на склад — в ту же очередь «Отправить на склад», что и утро
+    if sklad_on() and send_sklad:  # на склад — в ту же очередь «Отправить на склад», что и утро
         lines = [{"market": "cdek", "channel": "СДЭК", "posting": f"СДЭК {day:%d.%m} {art}"[:64],
                   "article": art, "qty": q, "production": production_of(art)} for art, q in data["cdek"].items()]
         morning_hold(day, lines, ["cdek"], [("СДЭК", len(lines), "")], log, title="СДЭК")
     return path
+
+
+# ---------------------------------------------------------------- СДЭК по заказам (WB DBS)
+# Файл заказов: «№ задания», «Артикул продавца», «трэк» (номер заказа СДЭК, статус «Создан»).
+# На каждое производство: лист сборки, ШК СДЭК в том же порядке и акт приёма-передачи.
+CDEK_CONFIG = BASE_DIR / "cdek.json"
+CDEK_API = "https://api.cdek.ru/v2"
+CDEK = {"account": "", "secure": ""}
+ACT_COMPANY = "ИП Таюпов Р.Ф."
+COL_TASK = ("№ задания", "Номер задания", "Номер отправления ИМ")
+COL_TRACK = ("трэк", "трек", "Трэк", "Трек", "Номер заказа", "Номер заказа СДЭК")
+MONTHS_GEN = ("Января", "Февраля", "Марта", "Апреля", "Мая", "Июня", "Июля", "Августа", "Сентября",
+              "Октября", "Ноября", "Декабря")
+
+
+def _num(value):
+    """Номер из ячейки: 10343931083 / '10343931083\xa0' / 1.0343931083E10 -> '10343931083'."""
+    if value is None:
+        return ""
+    if isinstance(value, float) and value.is_integer():
+        value = int(value)
+    return "".join(str(value).split()).replace("\xa0", "")
+
+
+def read_cdek_orders(path):
+    """Заказы СДЭК из файла: [{task, article, track}] в порядке файла. Нет колонки «трэк» — пусто."""
+    wb = openpyxl.load_workbook(path, data_only=True, read_only=True)
+    try:
+        rows = wb.worksheets[0].iter_rows(values_only=True)
+        header = [str(c).strip() if c is not None else "" for c in next(rows, ())]
+        i_track = _find_col(header, COL_TRACK, required=False)
+        if i_track is None:
+            return []
+        i_art = _find_col(header, COL_ART)
+        i_task = _find_col(header, COL_TASK, required=False)
+        out = []
+        for r in rows:
+            art = str(r[i_art]).strip() if i_art < len(r) and r[i_art] is not None else ""
+            track = _num(r[i_track]) if i_track < len(r) else ""
+            if not art or not track:
+                continue
+            task = _num(r[i_task]) if i_task is not None and i_task < len(r) else ""
+            out.append({"task": task, "article": art, "track": track})
+        return out
+    finally:
+        wb.close()
+
+
+def cdek_order(orders):
+    """Порядок листа сборки: по артикулу от Я к А без учёта регистра (Zerkalo, bp_Zerkalo, Alum rama, Alum Noga),
+    одинаковые артикулы — в порядке файла."""
+    return sorted(orders, key=lambda o: o["article"].casefold(), reverse=True)
+
+
+def cdek_on():
+    return bool(CDEK.get("account") and CDEK.get("secure"))
+
+
+def cdek_token():
+    r = requests.post(f"{CDEK_API}/oauth/token", timeout=30, data={
+        "grant_type": "client_credentials", "client_id": CDEK["account"], "client_secret": CDEK["secure"]})
+    if r.status_code != 200 or "access_token" not in r.text:
+        raise RuntimeError(f"СДЭК не пустил по ключам ({r.status_code}): {r.text[:150]}")
+    return r.json()["access_token"]
+
+
+def cdek_barcodes_api(tracks, log, wait=90):
+    """ШК мест заказов СДЭК через API: заказ на печать → ждём готовности → PDF. Возвращает [pdf]."""
+    token = cdek_token()
+    h = {"Authorization": f"Bearer {token}"}
+    files = []
+    for i in range(0, len(tracks), 100):
+        chunk = tracks[i:i + 100]
+        r = requests.post(f"{CDEK_API}/print/barcodes", headers=h, timeout=60, json={
+            "orders": [{"cdek_number": int(t) if t.isdigit() else t} for t in chunk],
+            "copy_count": 1, "format": "A6", "lang": "RUS"})
+        if r.status_code not in (200, 202):
+            raise RuntimeError(f"СДЭК не принял печать ШК ({r.status_code}): {r.text[:200]}")
+        uuid = (r.json().get("entity") or {}).get("uuid")
+        if not uuid:
+            raise RuntimeError(f"СДЭК не вернул номер печати: {r.text[:200]}")
+        deadline = time.time() + wait
+        while True:
+            info = requests.get(f"{CDEK_API}/print/barcodes/{uuid}", headers=h, timeout=30).json()
+            codes = [st.get("code") for st in (info.get("entity") or {}).get("statuses") or []]
+            if "READY" in codes:
+                break
+            if "INVALID" in codes or time.time() > deadline:
+                errs = "; ".join(e.get("message", "") for e in info.get("errors") or [])
+                raise RuntimeError(f"СДЭК не подготовил ШК ({', '.join(codes) or 'нет ответа'}) {errs}")
+            time.sleep(2)
+        pdf = requests.get(f"{CDEK_API}/print/barcodes/{uuid}.pdf", headers=h, timeout=60)
+        if pdf.status_code != 200 or pdf.content[:4] != b"%PDF":
+            raise RuntimeError(f"СДЭК не отдал файл ШК ({pdf.status_code})")
+        files.append(pdf.content)
+        log(f"… ШК СДЭК: скачано {min(i + 100, len(tracks))} из {len(tracks)}")
+    return files
+
+
+def cdek_pages(pdfs):
+    """Страницы ШК по номеру заказа СДЭК (номер — первый текст на этикетке) и код [ITM] с этикетки."""
+    import re
+    pages, itm = {}, {}
+    for data in pdfs:
+        for page in PdfReader(io.BytesIO(data)).pages:
+            text = page.extract_text() or ""
+            m = re.search(r"\b(\d{9,12})\b", text)
+            if not m:
+                continue
+            pages.setdefault(m.group(1), []).append(page)
+            i = re.search(r"\[ITM\]\s*(\d+)", text)
+            if i:
+                itm[m.group(1)] = i.group(1)
+    return pages, itm
+
+
+def write_cdek_sheet(path, orders):
+    """Лист сборки: задания сверху вниз (как лягут ШК) и справа — сколько каждого артикула."""
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Сборочные задания"
+    ws.append(["№ задания", "Артикул продавца", "трэк"])
+    for o in orders:
+        ws.append([int(o["task"]) if o["task"].isdigit() else o["task"], o["article"], o["track"]])
+    counts = defaultdict(int)
+    for o in orders:
+        counts[o["article"]] += 1
+    ws["E1"], ws["F1"] = "Артикул", "Количество"
+    for i, (art, n) in enumerate(sorted(counts.items(), key=lambda x: x[0].casefold(), reverse=True), start=2):
+        ws.cell(row=i, column=5, value=art)
+        ws.cell(row=i, column=6, value=n)
+    ws.cell(row=len(counts) + 2, column=5, value="Итого")
+    ws.cell(row=len(counts) + 2, column=6, value=len(orders))
+    for cell in (*ws[1], ws.cell(row=len(counts) + 2, column=5), ws.cell(row=len(counts) + 2, column=6)):
+        cell.font = openpyxl.styles.Font(bold=True)
+    for col, width in (("A", 14), ("B", 32), ("C", 14), ("E", 32), ("F", 12)):
+        ws.column_dimensions[col].width = width
+    wb.save(path)
+
+
+def _x(text):
+    return (str(text).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"))
+
+
+def write_cdek_act(path, orders, day, company=ACT_COMPANY):
+    """Акт приёма-передачи заказов (Word): №, номер заказа СДЭК, номер отправления ИМ, мест."""
+    import zipfile
+
+    def p(text, bold=False, center=False, size=22):
+        jc = '<w:jc w:val="center"/>' if center else ""
+        b = "<w:b/>" if bold else ""
+        return (f'<w:p><w:pPr>{jc}<w:spacing w:after="80"/></w:pPr><w:r><w:rPr>{b}<w:sz w:val="{size}"/></w:rPr>'
+                f'<w:t xml:space="preserve">{_x(text)}</w:t></w:r></w:p>')
+
+    def cell(text, w, bold=False):
+        b = "<w:b/>" if bold else ""
+        return (f'<w:tc><w:tcPr><w:tcW w:w="{w}" w:type="dxa"/></w:tcPr><w:p><w:pPr><w:jc w:val="center"/></w:pPr>'
+                f'<w:r><w:rPr>{b}<w:sz w:val="20"/></w:rPr><w:t xml:space="preserve">{_x(text)}</w:t></w:r></w:p></w:tc>')
+
+    widths = (700, 3000, 3000, 2000)
+    head = "".join(cell(t, w, True) for t, w in zip(("№", "Номер заказа", "Номер отправления ИМ", "Количество мест"),
+                                                      widths))
+    rows = [f"<w:tr>{head}</w:tr>"] + [
+        "<w:tr>" + "".join(cell(t, w) for t, w in zip((i, o["track"], o["task"], 1), widths)) + "</w:tr>"
+        for i, o in enumerate(orders, start=1)]
+    border = "".join(f'<w:{s} w:val="single" w:sz="4" w:space="0" w:color="000000"/>'
+                     for s in ("top", "left", "bottom", "right", "insideH", "insideV"))
+    grid = "".join('<w:gridCol w:w="%d"/>' % w for w in widths)
+    table = (f'<w:tbl><w:tblPr><w:tblW w:w="0" w:type="auto"/><w:jc w:val="center"/><w:tblBorders>{border}'
+             f'</w:tblBorders></w:tblPr><w:tblGrid>{grid}</w:tblGrid>' + "".join(rows) + "</w:tbl>")
+    n = len(orders)
+    body = (p(f"от «{day.day}» {MONTHS_GEN[day.month - 1]} {day.year} г.") + p("№ __________")
+            + p(f"Наименование компании        {company}") + p("АКТ ПРИЕМА ПЕРЕДАЧИ ЗАКАЗОВ", True, True, 26)
+            + table + p("") + p(f"Принято: {n} накладная; мест: {n}.")
+            + p("Передал :") + p("Должность ___________________________ Ф.И.О.") + p("М.П.") + p("")
+            + p("Принял :") + p("Должность ___________________________ Ф.И.О.") + p("М.П."))
+    document = ('<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+                '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body>'
+                + body + '<w:sectPr><w:pgSz w:w="11906" w:h="16838"/><w:pgMar w:top="1000" w:right="850" '
+                'w:bottom="1000" w:left="1200" w:header="0" w:footer="0" w:gutter="0"/></w:sectPr></w:body></w:document>')
+    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as z:
+        z.writestr("[Content_Types].xml", '<?xml version="1.0" encoding="UTF-8"?><Types xmlns="http://schemas.'
+                   'openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/'
+                   'vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/'
+                   'xml"/><Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-'
+                   'officedocument.wordprocessingml.document.main+xml"/></Types>')
+        z.writestr("_rels/.rels", '<?xml version="1.0" encoding="UTF-8"?><Relationships xmlns="http://schemas.'
+                   'openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.'
+                   'openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/>'
+                   '</Relationships>')
+        z.writestr("word/document.xml", document)
+
+
+def make_cdek(orders, out, log, barcodes_pdf=None, today=None):
+    """Лист сборки, ШК и акт на каждое производство + партия СДЭК на склад (сверка штрихкода и зеркала)."""
+    day = today or datetime.now(MSK).date()
+    out = Path(out)
+    pdfs, source = [], ""
+    if cdek_on():
+        log(f"… качаю ШК СДЭК: {len(orders)} заказов")
+        try:
+            pdfs, source = cdek_barcodes_api([o["track"] for o in orders], log), "из СДЭК"
+        except (RuntimeError, requests.RequestException, ValueError) as e:
+            log(f"✖ ШК из СДЭК не скачались — {e}")
+    if not pdfs and barcodes_pdf:
+        pdfs, source = [Path(barcodes_pdf).read_bytes()], Path(barcodes_pdf).name
+    pages, itm = cdek_pages(pdfs) if pdfs else ({}, {})
+    by_prod = defaultdict(list)
+    for o in orders:
+        by_prod[production_of(o["article"])].append(o)
+    missing = []
+    for prod in (KOMINTERNA, UCHITELSKAYA):
+        group = cdek_order(by_prod.get(prod, []))
+        if not group:
+            continue
+        folder = out / prod
+        folder.mkdir(parents=True, exist_ok=True)
+        write_cdek_sheet(folder / f"СДЭК сборка {day:%d.%m}.xlsx", group)
+        write_cdek_act(folder / f"СДЭК акт {day:%d.%m}.docx", group, day)
+        line = f"✔ {prod}: {len(group)} заказов — лист сборки и акт"
+        if pages:
+            writer, got = PdfWriter(), 0
+            for o in group:
+                found = pages.get(o["track"]) or []
+                if not found:
+                    missing.append(o)
+                for page in found:
+                    writer.add_page(page)
+                got += bool(found)
+            if got:
+                with open(folder / f"СДЭК ШК {day:%d.%m}.pdf", "wb") as f:
+                    writer.write(f)
+                line += f", ШК {got} шт. (в порядке листа)"
+        log(line)
+    if pdfs:
+        for o in missing:
+            log(f"⚠ Нет ШК для заказа СДЭК {o['track']} ({o['article']}) — его нет в {source}")
+    else:
+        log("⚠ ШК СДЭК не сделаны: нет ключей СДЭК и не выбран PDF штрихкодов из кабинета")
+    if sklad_on():
+        lines = [{"market": "cdek", "channel": "СДЭК", "posting": o["track"], "article": o["article"], "qty": 1,
+                  "production": production_of(o["article"])} for o in orders]
+        morning_hold(day, lines, ["cdek"], [("СДЭК", len(lines), "")], log, title="СДЭК")
+        # Партия: грузчик пикает штрихкод СДЭК ([CDK]номер) и нашу этикетку — склад сверяет артикул
+        sklad_send_batch(day, "cdek", "СДЭК", "", "СДЭК", [
+            {"posting": o["track"], "origin": o["task"] or o["track"], "article": o["article"],
+             "production": production_of(o["article"]),
+             "codes": [f"[CDK]{o['track']}", o["track"]] + ([f"[ITM]{itm[o['track']]}"] if o["track"] in itm else [])}
+            for o in orders], log)
+    return out
 
 
 # ================================================================ Склад BLAGO
@@ -2691,6 +2941,8 @@ class App(tk.Tk):
         self.wb_token = tk.StringVar()
         self.sklad_url = tk.StringVar(value="https://89-169-45-92.sslip.io")
         self.sklad_key = tk.StringVar()
+        self.cdek_account = tk.StringVar()
+        self.cdek_secure = tk.StringVar()
         self.excel = tk.StringVar()
         self.sheet = tk.StringVar()
         self.footer = tk.StringVar(value="Озон утро")
@@ -2791,7 +3043,7 @@ class App(tk.Tk):
         self.hand_cursor(self)
         for var in (self.template, self.root_dir, self.by_day, self.days, self.top_margin, self.font_size,
                     self.wb_token, self.autoship, self.pass_on, self.pass_driver, self.pass_phone,
-                    self.pass_cars, self.sklad_url, self.sklad_key):
+                    self.pass_cars, self.sklad_url, self.sklad_key, self.cdek_account, self.cdek_secure):
             var.trace_add("write", lambda *_: self.schedule_save())
         self.footer.trace_add("write", lambda *_: self.refresh_links())
         self.show_page("Сборка")
@@ -3222,6 +3474,22 @@ class App(tk.Tk):
         ttk.Label(c5, text="Ключ создаётся на складе: Администратор → Ключи API. Пусто — программа "
                            "работает без склада, как раньше.", style="Info.TLabel").pack(anchor="w", pady=(8, 0))
 
+        c6 = self.card(tab, "СДЭК")
+        g6 = ttk.Frame(c6, style="Card.TFrame")
+        g6.pack(fill="x")
+        g6.columnconfigure(1, weight=1)
+        ttk.Label(g6, text="Account", style="Field.TLabel").grid(row=0, column=0, sticky="w", padx=(0, 10), pady=3)
+        ttk.Entry(g6, textvariable=self.cdek_account).grid(row=0, column=1, sticky="ew")
+        ttk.Label(g6, text="Secure", style="Field.TLabel").grid(row=1, column=0, sticky="w", padx=(0, 10), pady=3)
+        ttk.Entry(g6, textvariable=self.cdek_secure, show="•").grid(row=1, column=1, sticky="ew")
+        b6 = ttk.Frame(c6, style="Card.TFrame")
+        b6.pack(fill="x", pady=(8, 0))
+        self.button(b6, "Проверить ключи", self.test_cdek)
+        self.cdek_status = ttk.Label(b6, text="", style="Status.TLabel")
+        self.cdek_status.pack(side="left", padx=(10, 0))
+        ttk.Label(c6, text="Ключи — в кабинете СДЭК: Интеграция → Ключи API. Без ключей ШК берутся из PDF, "
+                           "скачанного в кабинете («Печать штрихкодов»).", style="Info.TLabel").pack(anchor="w", pady=(8, 0))
+
         c4 = self.card(tab, "Этикетки Ozon")
         g4 = ttk.Frame(c4, style="Card.TFrame")
         g4.pack(fill="x")
@@ -3314,6 +3582,14 @@ class App(tk.Tk):
             except ValueError:
                 pass
         SKLAD.update(url=self.sklad_url.get(), key=self.sklad_key.get())
+        if CDEK_CONFIG.exists():
+            try:
+                cfg = json.loads(CDEK_CONFIG.read_text(encoding="utf-8"))
+                self.cdek_account.set(cfg.get("account", ""))
+                self.cdek_secure.set(cfg.get("secure", ""))
+            except ValueError:
+                pass
+        CDEK.update(account=self.cdek_account.get().strip(), secure=self.cdek_secure.get().strip())
         data = {}
         if MORNING_CONFIG.exists():
             try:
@@ -3354,6 +3630,8 @@ class App(tk.Tk):
             WB_CONFIG.write_text(json.dumps({"token": self.wb_token.get().strip()}), encoding="utf-8")
             SKLAD.update(url=self.sklad_url.get().strip(), key=self.sklad_key.get().strip())
             SKLAD_CONFIG.write_text(json.dumps(SKLAD), encoding="utf-8")
+            CDEK.update(account=self.cdek_account.get().strip(), secure=self.cdek_secure.get().strip())
+            CDEK_CONFIG.write_text(json.dumps(CDEK), encoding="utf-8")
             MORNING_CONFIG.write_text(json.dumps({
                 "template": self.template.get().strip(), "root": self.root_dir.get().strip(),
                 "by_day": bool(self.by_day.get()), "days": int(self.num(self.days, 14)),
@@ -3548,6 +3826,22 @@ class App(tk.Tk):
                 self.q.put(("status", self.sklad_status, "✔ склад на связи", C["ok"]))
             except (RuntimeError, requests.RequestException) as e:
                 self.q.put(("status", self.sklad_status, f"✖ {e}", C["err"]))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def test_cdek(self):
+        self.save_settings()
+        if not cdek_on():
+            self.cdek_status.configure(text="впиши Account и Secure", foreground=C["muted"])
+            return
+        self.cdek_status.configure(text="проверяю…", foreground=C["muted"])
+
+        def work():
+            try:
+                cdek_token()
+                self.q.put(("status", self.cdek_status, "✔ СДЭК пустил по ключам", C["ok"]))
+            except (RuntimeError, requests.RequestException) as e:
+                self.q.put(("status", self.cdek_status, f"✖ {e}", C["err"]))
 
         threading.Thread(target=work, daemon=True).start()
 
@@ -3750,12 +4044,25 @@ class App(tk.Tk):
         cdek = filedialog.askopenfilename(title="Файл СДЭК", filetypes=[("Excel", "*.xlsx *.xlsm")])
         if not cdek:
             return
+        try:
+            orders = read_cdek_orders(cdek)
+        except Exception as e:  # noqa: BLE001
+            messagebox.showerror(APP_NAME, f"Не удалось прочитать файл СДЭК: {e}")
+            return
+        barcodes = None
+        if orders and not cdek_on():
+            barcodes = filedialog.askopenfilename(
+                title="PDF штрихкодов из кабинета СДЭК (Отмена — без ШК)", filetypes=[("PDF", "*.pdf")]) or None
         out = self.day_dir("Сборка")
+        cdek_out = self.day_dir("СДЭК")
         self.headline("СДЭК В СБОРКУ")
 
         def work():
+            log = lambda s: self.q.put(("log", s))  # noqa: E731
             try:
-                add_cdek(template, cdek, out, log=lambda s: self.q.put(("log", s)))
+                add_cdek(template, cdek, out, log=log, send_sklad=not orders)
+                if orders:
+                    make_cdek(orders, cdek_out, log, barcodes)
             except PermissionError:
                 self.q.put(("log", "✖ Файл сборки открыт в Excel — закрой его и нажми ещё раз"))
             except Exception as e:  # noqa: BLE001
