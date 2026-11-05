@@ -69,7 +69,7 @@ from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.pdfgen import canvas
 
 APP_NAME = "BLAGO OTGRUZKI"
-APP_VERSION = "1.20"  # при каждом обновлении +0.1, запись в CHANGELOG.md
+APP_VERSION = "1.21"  # при каждом обновлении +0.1, запись в CHANGELOG.md
 API = "https://api-seller.ozon.ru"
 BATCH = 20                   # максимум отправлений в одном запросе этикеток
 READY = "awaiting_deliver"   # статус, в котором Ozon отдаёт этикетку
@@ -2583,7 +2583,7 @@ def cdek_filter(path, orders, log=None):
 
 
 def write_cdek_stopped(path, stopped, source=None):
-    """Общий список «не уехало» для менеджеров: все колонки из файла заказов + производство и почему."""
+    """Общий список «не уехало» для менеджеров: все колонки из файла заказов + номер WB и производство."""
     header, rows = ["№ задания", "Артикул продавца", "трэк"], {}
     if source:  # строки как в исходном файле — со всеми колонками, что там есть
         wb_in = openpyxl.load_workbook(source, data_only=True, read_only=True)
@@ -2607,17 +2607,16 @@ def write_cdek_stopped(path, stopped, source=None):
     wb = openpyxl.Workbook()
     ws = wb.active
     ws.title = "Не уехало"
-    ws.append(header + ["Номер WB", "Производство", "Почему"])
+    ws.append(header + ["Номер WB", "Производство"])
     for o in stopped:
         base = rows.get(o["task"]) or [o["task"], o["article"], o["track"]][:len(header)]
         base = [int(v) if isinstance(v, str) and v.isdigit() and len(v) < 16 else v for v in base]
-        ws.append(base + [f"WB-DBS-{o['task']}" if o["task"] else "", production_of(o["article"]), o["why"]])
+        ws.append(base + [f"WB-DBS-{o['task']}" if o["task"] else "", production_of(o["article"])])
     for cell in ws[1]:
         cell.font = openpyxl.styles.Font(bold=True)
     for i in range(1, ws.max_column + 1):
         ws.column_dimensions[openpyxl.utils.get_column_letter(i)].width = 18
-    ws.column_dimensions[openpyxl.utils.get_column_letter(ws.max_column)].width = 60
-    for i, name in enumerate(header + ["Номер WB", "Производство", "Почему"], start=1):
+    for i, name in enumerate(header + ["Номер WB", "Производство"], start=1):
         if "Артикул" in name:
             ws.column_dimensions[openpyxl.utils.get_column_letter(i)].width = 32
     wb.save(path)
