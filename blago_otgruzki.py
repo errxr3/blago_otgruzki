@@ -69,7 +69,7 @@ from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.pdfgen import canvas
 
 APP_NAME = "BLAGO OTGRUZKI"
-APP_VERSION = "1.16"  # при каждом обновлении +0.1, запись в CHANGELOG.md
+APP_VERSION = "1.17"  # при каждом обновлении +0.1, запись в CHANGELOG.md
 API = "https://api-seller.ozon.ru"
 BATCH = 20                   # максимум отправлений в одном запросе этикеток
 READY = "awaiting_deliver"   # статус, в котором Ozon отдаёт этикетку
@@ -2921,7 +2921,7 @@ C = {
     "on_accent": "#1A1405", "btn": "#23304A", "btn_hi": "#2E3D5C", "nav_hi": "#141D30",
     "ok": "#22C55E", "err": "#F87171", "warn": "#FB923C",
 }
-PAGES = ("Сборка", "Ozon", "Wildberries", "Настройки")
+PAGES = ("Сборка", "Ozon", "Wildberries", "СДЭК", "Настройки")
 FONT = "Segoe UI"
 MONTHS = ("Январь", "Февраль", "Март", "Апрель", "Май", "Июнь",
           "Июль", "Август", "Сентябрь", "Октябрь", "Ноябрь", "Декабрь")
@@ -3236,6 +3236,7 @@ class App(tk.Tk):
         self.build_sborka(self.pages["Сборка"])
         self.build_ozon(self.pages["Ozon"])
         self.build_wb(self.pages["Wildberries"])
+        self.build_cdek(self.pages["СДЭК"])
         self.build_settings(self.scroll_page(self.pages["Настройки"]))
 
         jb = tk.Frame(main, bg=C["line"])
@@ -3343,6 +3344,8 @@ class App(tk.Tk):
 
     def show_page(self, name):
         self.current_page = name
+        if name == "СДЭК" and hasattr(self, "cdek_pdf_label"):
+            self.set_cdek_pdf(self.cdek_pdf)  # ключи могли появиться в «Настройках»
         for n, frame in self.pages.items():
             if n == name:
                 frame.pack(fill="x")
@@ -3608,6 +3611,101 @@ class App(tk.Tk):
                     padx=(10, 0))
         self.button(row2, "Скачать ШК открытых поставок", lambda: self.start_wb("stickers"), padx=(10, 0))
         self.folder_link(c2, "ВБ")
+
+    # ------------------------------------------------------------ вкладка «СДЭК»
+    def build_cdek(self, tab):
+        self.cdek_file, self.cdek_pdf = None, None
+        c1 = self.card(tab, "Заказы СДЭК")
+        row = ttk.Frame(c1, style="Card.TFrame")
+        row.pack(fill="x")
+        self.cdek_file_label = ttk.Label(row, text="не выбран", style="File.TLabel")
+        self.cdek_file_label.pack(side="left")
+        ttk.Button(row, text="Выбрать файл…", command=self.pick_cdek_file).pack(side="right")
+        self.cdek_info = ttk.Label(c1, text="Файл из «макса»: № задания, Артикул продавца, трэк.", style="Info.TLabel",
+                                   justify="left")
+        self.cdek_info.pack(anchor="w", pady=(8, 0))
+
+        c2 = self.card(tab, "Штрихкоды СДЭК")
+        row2 = ttk.Frame(c2, style="Card.TFrame")
+        row2.pack(fill="x")
+        self.cdek_pdf_label = ttk.Label(row2, text="", style="File.TLabel")
+        self.cdek_pdf_label.pack(side="left")
+        ttk.Button(row2, text="Очистить", command=lambda: self.set_cdek_pdf(None)).pack(side="right")
+        ttk.Button(row2, text="PDF из кабинета…", command=self.pick_cdek_pdf).pack(side="right", padx=(0, 8))
+        self.cdek_pdf_info = ttk.Label(c2, text="", style="Info.TLabel")
+        self.cdek_pdf_info.pack(anchor="w", pady=(8, 0))
+
+        c3 = self.card(tab, "Листы сборки, ШК и акты")
+        row3 = ttk.Frame(c3, style="Card.TFrame")
+        row3.pack(fill="x")
+        self.button(row3, "Сделать листы, ШК и акты", self.start_cdek_docs, "Accent.TButton")
+        self.folder_link(c3, "СДЭК")
+        self.cdek_done = ttk.Label(c3, text="", style="Info.TLabel")
+        self.cdek_done.pack(anchor="w", pady=(10, 0))
+        self.set_cdek_pdf(None)
+
+    def set_cdek_pdf(self, path):
+        self.cdek_pdf = path
+        if path:
+            text, info = Path(path).name, "ШК возьмутся из этого PDF и лягут в порядке листа."
+        elif cdek_on():
+            text, info = "по ключам СДЭК", "Программа сама скачает ШК по номерам заказов (ключи — в «Настройках»)."
+        else:
+            text, info = "не выбран", ("Нет ключей СДЭК: в кабинете выдели заказы «Создан» → «Печать штрихкодов» "
+                                       "и выбери этот PDF.")
+        self.cdek_pdf_label.configure(text=text)
+        self.cdek_pdf_info.configure(text=info)
+
+    def pick_cdek_file(self):
+        path = filedialog.askopenfilename(title="Заказы СДЭК", filetypes=[("Excel", "*.xlsx *.xlsm")])
+        if not path:
+            return
+        try:
+            orders = read_cdek_orders(path)
+        except Exception as e:  # noqa: BLE001
+            messagebox.showerror(APP_NAME, f"Не удалось прочитать файл: {e}")
+            return
+        if not orders:
+            messagebox.showwarning(APP_NAME, "В файле нет колонки «трэк» или нет заказов с трэком.")
+            return
+        self.cdek_file = path
+        self.cdek_file_label.configure(text=Path(path).name)
+        kom = sum(production_of(o["article"]) == KOMINTERNA for o in orders)
+        self.cdek_info.configure(text=f"Заказов {len(orders)}: {KOMINTERNA} {kom}, {UCHITELSKAYA} {len(orders) - kom}")
+
+    def pick_cdek_pdf(self):
+        path = filedialog.askopenfilename(title="PDF штрихкодов СДЭК", filetypes=[("PDF", "*.pdf")])
+        if path:
+            self.set_cdek_pdf(path)
+
+    def start_cdek_docs(self):
+        if self.busy:
+            return
+        if not self.cdek_file:
+            messagebox.showwarning(APP_NAME, "Сначала выбери файл заказов СДЭК.")
+            return
+        self.set_cdek_pdf(self.cdek_pdf)
+        if not cdek_on() and not self.cdek_pdf:
+            if not messagebox.askyesno(APP_NAME, "Нет ключей СДЭК и не выбран PDF штрихкодов.\n"
+                                                 "Сделать только листы сборки и акты, без ШК?"):
+                return
+        path, pdf, out = self.cdek_file, self.cdek_pdf, self.day_dir("СДЭК")
+        self.headline("СДЭК: ЛИСТЫ, ШК И АКТЫ")
+        self.cdek_done.configure(text="… делаю", foreground=C["muted"])
+
+        def work():
+            log = lambda s: self.q.put(("log", s))  # noqa: E731
+            try:
+                make_cdek(read_cdek_orders(path), out, log, pdf)
+                self.q.put(("status", self.cdek_done,
+                            f"✔ Готово в {datetime.now(MSK):%H:%M} — папка «СДЭК»", C["ok"]))
+            except PermissionError:
+                log("✖ Файл в папке «СДЭК» открыт (Excel/Word/PDF) — закрой и нажми ещё раз")
+            except Exception as e:  # noqa: BLE001
+                log(f"✖ Ошибка: {e}")
+            self.q.put(("done",))
+
+        self.run(work)
 
     # ------------------------------------------------------------ вкладка «Настройки»
     def scroll_page(self, page):
@@ -4281,20 +4379,16 @@ class App(tk.Tk):
         except Exception as e:  # noqa: BLE001
             messagebox.showerror(APP_NAME, f"Не удалось прочитать файл СДЭК: {e}")
             return
-        barcodes = None
-        if orders and not cdek_on():
-            barcodes = filedialog.askopenfilename(
-                title="PDF штрихкодов из кабинета СДЭК (Отмена — без ШК)", filetypes=[("PDF", "*.pdf")]) or None
         out = self.day_dir("Сборка")
-        cdek_out = self.day_dir("СДЭК")
         self.headline("СДЭК В СБОРКУ")
 
         def work():
             log = lambda s: self.q.put(("log", s))  # noqa: E731
             try:
+                # файл с трэками: склад, листы, ШК и акты — на странице «СДЭК»
                 add_cdek(template, cdek, out, log=log, send_sklad=not orders)
                 if orders:
-                    make_cdek(orders, cdek_out, log, barcodes)
+                    log("│ Листы сборки, ШК и акты СДЭК — на странице «СДЭК» слева.")
             except PermissionError:
                 self.q.put(("log", "✖ Файл сборки открыт в Excel — закрой его и нажми ещё раз"))
             except Exception as e:  # noqa: BLE001
