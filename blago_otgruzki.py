@@ -69,7 +69,7 @@ from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.pdfgen import canvas
 
 APP_NAME = "BLAGO OTGRUZKI"
-APP_VERSION = "1.15"  # при каждом обновлении +0.1, запись в CHANGELOG.md
+APP_VERSION = "1.16"  # при каждом обновлении +0.1, запись в CHANGELOG.md
 API = "https://api-seller.ozon.ru"
 BATCH = 20                   # максимум отправлений в одном запросе этикеток
 READY = "awaiting_deliver"   # статус, в котором Ozon отдаёт этикетку
@@ -2476,7 +2476,6 @@ ACT_TEMPLATE = (  # акт приёма-передачи заказов СДЭК
     "UHJvcHMvY29yZS54bWxQSwECFAMUAAAACADxQmVdLgbDiiQBAAAOAgAAEwAAAAAAAAAAAAAAgAEZNQAAZG9jUHJvcHMvY3VzdG9t"
     "LnhtbFBLBQYAAAAADAAMAAIDAABuNgAAAAA="
 )
-ACT_FILE = BASE_DIR / "Акт СДЭК.docx"  # свой образец рядом с программой — берётся он
 
 
 def _x(text):
@@ -2519,7 +2518,7 @@ def write_cdek_act(path, orders, day):
     import base64
     import re
     import zipfile
-    src = ACT_FILE if ACT_FILE.exists() else io.BytesIO(base64.b64decode("".join(ACT_TEMPLATE)))
+    src = io.BytesIO(base64.b64decode("".join(ACT_TEMPLATE)))
     with zipfile.ZipFile(src) as zin:
         parts = {i.filename: zin.read(i.filename) for i in zin.infolist()}
     x = parts["word/document.xml"].decode("utf-8")
@@ -2528,6 +2527,10 @@ def write_cdek_act(path, orders, day):
     tbl = x[a:b]
     rows = re.findall(r"<w:tr[ >].*?</w:tr>", tbl, flags=re.S)
     tmpl = rows[1]
+    # много заказов — таблица продолжается на следующих листах, шапка повторяется на каждом
+    head = rows[0].replace("<w:trPr>", "<w:trPr><w:tblHeader/>", 1)
+    tbl = tbl.replace(rows[0], head, 1)
+    rows[0] = head
 
     def row(n, o):
         cells = re.findall(r"<w:tc>.*?</w:tc>", tmpl, flags=re.S)
@@ -2539,10 +2542,10 @@ def write_cdek_act(path, orders, day):
     start = tbl.index(rows[1])
     end = tbl.index(rows[-1]) + len(rows[-1])
     tbl = tbl[:start] + body + tbl[end:]
-    # колонка «№» шире, чтобы «10», «11»… не переносились
-    tbl = re.sub(r'<w:gridCol w:w="\d+"/>', '<w:gridCol w:w="560"/>', tbl, count=1)
+    # колонка «№» шире, чтобы «10», «100» не переносились
+    tbl = re.sub(r'<w:gridCol w:w="\d+"/>', '<w:gridCol w:w="700"/>', tbl, count=1)
     tbl = re.sub(r"<w:tr[ >].*?</w:tr>",
-                 lambda r: re.sub(r'<w:tcW w:w="\d+" w:type="dxa"/>', '<w:tcW w:w="560" w:type="dxa"/>',
+                 lambda r: re.sub(r'<w:tcW w:w="\d+" w:type="dxa"/>', '<w:tcW w:w="700" w:type="dxa"/>',
                                   r.group(0), count=1), tbl, flags=re.S)
     x = x[:a] + tbl + x[b:]
 
