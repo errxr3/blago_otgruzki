@@ -69,7 +69,7 @@ from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.pdfgen import canvas
 
 APP_NAME = "BLAGO OTGRUZKI"
-APP_VERSION = "1.22"  # при каждом обновлении +0.1, запись в CHANGELOG.md
+APP_VERSION = "1.23"  # при каждом обновлении +0.1, запись в CHANGELOG.md
 API = "https://api-seller.ozon.ru"
 BATCH = 20                   # максимум отправлений в одном запросе этикеток
 READY = "awaiting_deliver"   # статус, в котором Ozon отдаёт этикетку
@@ -2236,6 +2236,42 @@ def cdek_barcodes_api(tracks, log, wait=90):
     return files
 
 
+CDEK_STATUS_RU = {"CREATED": "Создан", "ACCEPTED": "Принят", "INVALID": "Некорректный", "CANCELED": "Отменён",
+                  "CANCELLED": "Отменён", "DELIVERED": "Вручён", "NOT_DELIVERED": "Не вручён"}
+
+
+def cdek_check(orders, log):
+    """Проверка по API: каждый заказ найден в СДЭК и ещё «Создан». Возвращает число проблем."""
+    token = cdek_token()
+    h = {"Authorization": f"Bearer {token}"}
+
+    def one(o):
+        try:
+            r = requests.get(f"{CDEK_API}/orders", headers=h, params={"cdek_number": o["track"]}, timeout=30)
+        except requests.RequestException as e:
+            return o, None, f"нет связи: {e}"
+        if r.status_code == 404:
+            return o, None, "не найден в СДЭК"
+        if r.status_code != 200:
+            return o, None, f"СДЭК ответил {r.status_code}"
+        ent = (r.json() or {}).get("entity") or {}
+        sts = ent.get("statuses") or []
+        last = max(sts, key=lambda x: x.get("date_time") or "") if sts else {}
+        return o, last.get("code") or "", ""
+
+    bad = 0
+    with ThreadPoolExecutor(max_workers=WORKERS) as pool:
+        for o, code, err in pool.map(one, orders):
+            if err:
+                bad += 1
+                log(f"✖ {o['track']} ({o['article']}): {err}")
+            elif code and code != "CREATED":
+                bad += 1
+                log(f"⚠ {o['track']} ({o['article']}): в СДЭК статус «{CDEK_STATUS_RU.get(code, code)}», "
+                    f"а не «Создан»")
+    return bad
+
+
 def cdek_pages(pdfs):
     """Страницы ШК по номеру заказа СДЭК (номер — первый текст на этикетке) и код [ITM] с этикетки."""
     import re
@@ -3686,7 +3722,8 @@ class App(tk.Tk):
         c3 = self.card(tab, "Листы сборки, ШК и акты")
         row3 = ttk.Frame(c3, style="Card.TFrame")
         row3.pack(fill="x")
-        self.button(row3, "Сделать листы, ШК и акты", self.start_cdek_docs, "Accent.TButton")
+        self.button(row3, "Проверить", self.start_cdek_check, "Big.TButton")
+        self.button(row3, "Сделать листы, ШК и акты", self.start_cdek_docs, "Accent.TButton", padx=(10, 0))
         self.cdek_keys = ttk.Label(row3, text="", style="Info.TLabel")
         self.cdek_keys.pack(side="left", padx=(14, 0))
         self.folder_link(c3, "СДЭК")
@@ -3723,6 +3760,54 @@ class App(tk.Tk):
         if stopped:
             text += f" · не едут (покраска): {len(stopped)}"
         self.cdek_info.configure(text=text + ". Покрасил или поправил файл — выбери его ещё раз.")
+
+    def start_cdek_check(self):
+        """«Проверить»: что уедет, что не едет по покраске и как заказы выглядят в СДЭК. Ничего не создаёт."""
+        if self.busy:
+            return
+        if not self.cdek_file:
+            messagebox.showwarning(APP_NAME, "Сначала выбери файл заказов СДЭК.")
+            return
+        self.refresh_cdek()
+        path = self.cdek_file
+        self.headline("СДЭК: ПРОВЕРКА")
+        self.cdek_done.configure(text="… проверяю", foreground=C["muted"])
+
+        def work():
+            log = lambda s: self.q.put(("log", s))  # noqa: E731
+            try:
+                orders, stopped = cdek_filter(path, read_cdek_orders(path), log)
+                for prod in (KOMINTERNA, UCHITELSKAYA):
+                    mine = [o for o in orders if production_of(o["article"]) == prod]
+                    if mine:
+                        arts = defaultdict(int)
+                        for o in mine:
+                            arts[o["article"]] += 1
+                        log(f"✔ {prod}: едут {len(mine)}")
+                        for art, n in sorted(arts.items(), key=lambda x: x[0].casefold(), reverse=True):
+                            log(f"│   {art} — {n}")
+                if stopped:
+                    log(f"⛔ Не едут (покраска): {len(stopped)}")
+                if not cdek_on():
+                    log("⚠ Ключей СДЭК нет — заказы в СДЭК не проверены и ШК не скачаются")
+                    text, color = f"Едут {len(orders)}, не едут {len(stopped)} · без проверки в СДЭК", C["warn"]
+                else:
+                    log(f"… проверяю в СДЭК {len(orders)} заказов")
+                    bad = cdek_check(orders, log)
+                    if bad:
+                        text, color = f"⚠ Едут {len(orders)}, в СДЭК проблем: {bad} — смотри журнал", C["err"]
+                    else:
+                        log(f"✔ В СДЭК все {len(orders)} заказов найдены и «Созданы»")
+                        text, color = f"✔ Едут {len(orders)}, не едут {len(stopped)} · в СДЭК всё в порядке", C["ok"]
+                self.q.put(("status", self.cdek_done, text, color))
+            except (RuntimeError, requests.RequestException) as e:
+                log(f"✖ СДЭК: {e}")
+                self.q.put(("status", self.cdek_done, "✖ проверка не прошла — смотри журнал", C["err"]))
+            except Exception as e:  # noqa: BLE001
+                log(f"✖ Ошибка: {e}")
+            self.q.put(("done",))
+
+        self.run(work)
 
     def start_cdek_docs(self):
         if self.busy:
