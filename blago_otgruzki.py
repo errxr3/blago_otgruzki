@@ -69,7 +69,7 @@ from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.pdfgen import canvas
 
 APP_NAME = "BLAGO OTGRUZKI"
-APP_VERSION = "1.12"  # при каждом обновлении +0.1, запись в CHANGELOG.md
+APP_VERSION = "1.13"  # при каждом обновлении +0.1, запись в CHANGELOG.md
 API = "https://api-seller.ozon.ru"
 BATCH = 20                   # максимум отправлений в одном запросе этикеток
 READY = "awaiting_deliver"   # статус, в котором Ozon отдаёт этикетку
@@ -2953,9 +2953,15 @@ class App(tk.Tk):
                foreground=[("selected", C["on_accent"]), ("active", C["text"])])
         st.configure("Horizontal.TProgressbar", background=C["accent"], troughcolor=C["field"],
                      bordercolor=C["card"], lightcolor=C["accent"], darkcolor=C["accent"], thickness=4)
-        st.configure("Vertical.TScrollbar", background=C["btn"], troughcolor=C["card"],
-                     bordercolor=C["card"], arrowcolor=C["muted"], relief="flat")
-        st.map("Vertical.TScrollbar", background=[("active", C["btn_hi"])])
+        # Ползунок — одна гладкая полоса: без стрелок, без рисок и объёмных краёв
+        st.layout("Vertical.TScrollbar", [("Vertical.Scrollbar.trough", {"sticky": "ns", "children": [
+            ("Vertical.Scrollbar.thumb", {"expand": "1", "sticky": "nswe"})]})])
+        st.configure("Vertical.TScrollbar", background=C["btn_hi"], troughcolor=C["card"], bordercolor=C["card"],
+                     lightcolor=C["btn_hi"], darkcolor=C["btn_hi"], gripcount=0, relief="flat", arrowsize=8,
+                     borderwidth=0)
+        st.map("Vertical.TScrollbar", background=[("active", C["muted"]), ("pressed", C["muted"])],
+               lightcolor=[("active", C["muted"]), ("pressed", C["muted"])],
+               darkcolor=[("active", C["muted"]), ("pressed", C["muted"])])
 
     def card(self, parent, title, side=None, grid=None):
         """Тёмная карточка с заголовком. side — виджет-функция для правой части заголовка."""
