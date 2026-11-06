@@ -69,7 +69,7 @@ from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.pdfgen import canvas
 
 APP_NAME = "BLAGO OTGRUZKI"
-APP_VERSION = "1.27"  # при каждом обновлении +0.1, запись в CHANGELOG.md
+APP_VERSION = "1.28"  # при каждом обновлении +0.1, запись в CHANGELOG.md
 API = "https://api-seller.ozon.ru"
 BATCH = 20                   # максимум отправлений в одном запросе этикеток
 READY = "awaiting_deliver"   # статус, в котором Ozon отдаёт этикетку
@@ -809,7 +809,9 @@ def process(excel, sheet, cabinets, days, out, log, progress, download=True,
     # Склад: что едет по остаткам (покрашенное тобой — как покрашено)
     sk_channel, sk_truck = ozon_channel(footer)
     colored = {a for a, _ in red} | {L["art"] for L in rpt.limits}
-    postings = sklad_decide("ozon", sk_channel, sk_truck, postings, rpt.times, colored, log, confirm, download)
+    cut = [n for _, n in red] + [n for _, n, _ in yellow]
+    postings = sklad_decide("ozon", sk_channel, sk_truck, postings, rpt.times, colored, log, confirm, download,
+                            drop=cut)
     if not postings:
         return
 
@@ -1538,12 +1540,13 @@ def process_wb(files, token, out, log, progress, mode="check", confirm=lambda te
     # Склад: что едет по остаткам (покрашенное тобой — как покрашено)
     if sklad_on():
         by_channel = defaultdict(dict)
-        for (cargo, _, _), ids in groups.items():
+        for (cargo, *_), ids in groups.items():
             for i in ids:
                 by_channel[WB_SKLAD_CHANNEL.get(cargo, "WB")][i] = postings[i]
         allowed = set()
         for channel, part in by_channel.items():
-            got = sklad_decide("wb", channel, "", part, times, colored, log, confirm, mode == "run")
+            cut = [n for _, n in red] + [n for _, n, _ in yellow]  # покрашено «не едет» — складу «убрано»
+            got = sklad_decide("wb", channel, "", part, times, colored, log, confirm, mode == "run", drop=cut)
             if got is None:
                 return
             allowed |= set(got)
@@ -2845,8 +2848,9 @@ def morning_send(log):
         if lost:
             log(f"⚠ Без {', '.join(lost)}: их заказы на складе не трогаю")
         day = datetime.fromisoformat(item["day"]).date()
-        lines = colored_lines(item, log)
-        answer = sklad_demand(day, lines, log, replace=item["markets"]) if lines else {}
+        lines = item["lines"]
+        drop = colored_drop(item, log)
+        answer = sklad_demand(day, lines, log, replace=item["markets"], drop=drop) if lines else {}
         if answer is None:
             left.append(item)
             continue
@@ -2855,34 +2859,28 @@ def morning_send(log):
     return not left
 
 
-def colored_lines(item, log):
-    """Заказы для склада с учётом твоей покраски отчёта (1.27).
+def colored_drop(item, log):
+    """Отправления, которые ты покрасил «не едет» в отчёте (1.28).
 
-    Список запоминается при скачивании отчёта, ещё до покраски. Перед «Отправить на склад»
-    отчёты перечитываются: красное и то, что не вошло в жёлтое количество, на склад не уходит —
-    иначе в «Плане отгрузки» висели бы заказы, на которые этикетки никто не скачает."""
-    lines = item["lines"]
-    skip = set()
+    Список заказов запоминается при скачивании отчёта, ещё до покраски. Перед «Отправить на склад»
+    отчёты перечитываются: красное и не вошедшее в жёлтое количество уходит на склад отдельным
+    списком — в «Плане отгрузки» видно, сколько упало всего, сколько едет и сколько убрано."""
+    drop = set()
     for path, market in item.get("reports") or []:
         report = Path(path)
         if not report.exists():
             continue
         try:
             rpt = read_report(report)
-        except Exception as e:  # noqa: BLE001 — открыт в Excel, испорчен: шлём как есть
-            log(f"⚠ Покраску {report.name} прочитать не удалось ({e}) — на склад уйдёт весь список")
+        except Exception as e:  # noqa: BLE001 — открыт в Excel, испорчен: шлём без покраски
+            log(f"⚠ Покраску {report.name} прочитать не удалось ({e}) — на складе всё будет «едет»")
             continue
-        skip |= {(market, num) for _, num in rpt.red}
-        skip |= {(market, num) for _, num, _ in rpt.yellow}
-    if not skip:
-        return lines
-    kept = [x for x in lines if (x.get("market"), x.get("posting")) not in skip]
-    key = lambda x: (x.get("market"), x.get("posting"))  # noqa: E731
-    gone = len({key(x) for x in lines} - {key(x) for x in kept})
-    if gone:
-        log(f"● Покраска учтена: {plural(gone, 'отправление', 'отправления', 'отправлений')} "
-            f"{'не едет' if gone % 10 == 1 and gone % 100 != 11 else 'не едут'} — на склад не отправляю")
-    return kept
+        drop |= {(market, num) for _, num in rpt.red}
+        drop |= {(market, num) for _, num, _ in rpt.yellow}
+    if drop:
+        log(f"● Покраска учтена: {plural(len(drop), 'отправление', 'отправления', 'отправлений')} "
+            f"убрано — на складе в плане видно, но не едет")
+    return [{"market": m, "posting": n} for m, n in sorted(drop)]
 
 
 def _pending_load():
@@ -2950,18 +2948,21 @@ def sklad_flush(log):
         log(f"⚠ Ещё не ушло на склад: {len(left)}")
 
 
-def sklad_demand(day, lines, log, replace=None):
-    """Заказы → склад. Ответ: {отправление: (решение, почему)} или None, если склада нет/не ответил."""
-    if not sklad_on() or not lines:
+def sklad_demand(day, lines, log, replace=None, drop=None):
+    """Заказы → склад. Ответ: {отправление: (решение, почему)} или None, если склада нет/не ответил.
+    drop — [{market, posting}] покрашенные «не едет»: в плане склада остаются, но убраны из отгрузки."""
+    if not sklad_on() or not (lines or drop):
         return None
     try:
-        data = sklad_post("/api/v1/demand", {"day": day.isoformat(), "lines": lines, "replace": replace or []})
+        data = sklad_post("/api/v1/demand", {"day": day.isoformat(), "lines": lines, "replace": replace or [],
+                                             "drop": drop or []})
     except RuntimeError as e:
         log(f"⚠ Склад не ответил, что едет ({e}) — решаю как раньше, по цветам отчёта")
         sklad_note("err", "заказы НЕ ушли на склад")
         return None
     count = len({ln["posting"] for ln in lines})
-    sklad_note("ok", f"заказы ушли на склад: {plural(count, 'отправление', 'отправления', 'отправлений')}")
+    if count:
+        sklad_note("ok", f"заказы ушли на склад: {plural(count, 'отправление', 'отправления', 'отправлений')}")
     for q in data.get("questions") or []:
         if q.get("status") == "open":
             log(f"● Вопрос начальнику {q['site']}: {q['article']} — нужно {q['need']}, на складе {q['stock']}, "
@@ -2986,7 +2987,7 @@ def ozon_channel(wave):
     return "Ozon", f"Озон{n if 1 <= n <= 4 else 1}"
 
 
-def sklad_decide(market, channel, truck, postings, times, colored, log, confirm, download):
+def sklad_decide(market, channel, truck, postings, times, colored, log, confirm, download, drop=None):
     """Спросить склад, что из отчёта едет. postings — {номер: {артикул: шт}} после покраски.
 
     Артикулы, которые ты покрасил сам (красный/жёлтый), склад не переспрашивает — твои цвета главнее.
@@ -2998,7 +2999,8 @@ def sklad_decide(market, channel, truck, postings, times, colored, log, confirm,
               "production": production_of(art), "ordered_at": iso(times.get(num))}
              for num, arts in postings.items() for art, q in arts.items()]
     log("Спрашиваю склад, что едет…")
-    answer = sklad_demand(today_msk(), lines, log)
+    # Покрашенное «не едет» — складу отдельным списком: даже если «Отправить на склад» было до покраски
+    answer = sklad_demand(today_msk(), lines, log, drop=[{"market": market, "posting": n} for n in drop or []])
     if answer is None:
         return postings
     # Считаем штуки, а не отправления: один заказ на 15 зеркал — это 15 шт., а не 1
