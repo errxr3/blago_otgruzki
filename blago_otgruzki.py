@@ -69,7 +69,7 @@ from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.pdfgen import canvas
 
 APP_NAME = "BLAGO OTGRUZKI"
-APP_VERSION = "1.26"  # при каждом обновлении +0.1, запись в CHANGELOG.md
+APP_VERSION = "1.27"  # при каждом обновлении +0.1, запись в CHANGELOG.md
 API = "https://api-seller.ozon.ru"
 BATCH = 20                   # максимум отправлений в одном запросе этикеток
 READY = "awaiting_deliver"   # статус, в котором Ozon отдаёт этикетку
@@ -1989,7 +1989,8 @@ def ozon_wave(cabinets, template, out, days, wave, kgt, log, progress, today=Non
                                lines=lines, truck=ozon_channel(wave)[1], cabs=cabs)
     if sklad_on():
         sources = [(f"Ozon {n}", *cabs.get(n, (None, "нет ответа"))) for n in cabinets]
-        morning_hold(day, lines, [], sources, log, title=title.rsplit(" ", 1)[0])
+        morning_hold(day, lines, [], sources, log, title=title.rsplit(" ", 1)[0],
+                     reports=[(p, "ozon") for p in files.values()])
     progress(1, 2)
     if template and key in data:
         path = out / f"Сборка {title}.xlsx"
@@ -2103,7 +2104,9 @@ def morning(cabinets, token, template, cdek, out, days, log, progress, today=Non
 
     # --- Склад: заказы дня НЕ уходят сами — сначала проверка, потом кнопка «Отправить на склад»
     if sklad_on() and (lines or sources):
-        morning_hold(day, lines, markets, sources, log, title="Утро")
+        reports = [(files[k], "ozon") for k in ("ozon", "kgt") if k in files]
+        reports += [(files[k], "wb") for k in ("wb", "sgt") if k in files]
+        morning_hold(day, lines, markets, sources, log, title="Утро", reports=reports)
 
     # --- Сборка
     if template and data and not ozon_failed:
@@ -2812,12 +2815,14 @@ def morning_problems(items):
     return bad
 
 
-def morning_hold(day, lines, markets, sources, log, title="Утро"):
+def morning_hold(day, lines, markets, sources, log, title="Утро", reports=None):
     """Отложить заказы до проверки. На склад они уйдут кнопкой «Отправить на склад».
 
-    Утро заменяет прежнее утро, волна — прежнюю такую же волну (скачал отчёт ещё раз)."""
+    Утро заменяет прежнее утро, волна — прежнюю такую же волну (скачал отчёт ещё раз).
+    reports — [(путь к отчёту, маркетплейс)]: перед отправкой программа перечитает их покраску."""
     item = {"title": title, "day": day.isoformat(), "lines": lines, "markets": markets,
-            "sources": [list(x) for x in sources]}
+            "sources": [list(x) for x in sources],
+            "reports": [[str(path), market] for path, market in (reports or [])]}
     items = [x for x in morning_load() if x["title"] != title] + [item]
     _morning_save(items)
     log("")
@@ -2840,13 +2845,44 @@ def morning_send(log):
         if lost:
             log(f"⚠ Без {', '.join(lost)}: их заказы на складе не трогаю")
         day = datetime.fromisoformat(item["day"]).date()
-        answer = sklad_demand(day, item["lines"], log, replace=item["markets"]) if item["lines"] else {}
+        lines = colored_lines(item, log)
+        answer = sklad_demand(day, lines, log, replace=item["markets"]) if lines else {}
         if answer is None:
             left.append(item)
             continue
         sklad_summary(answer, log)
     _morning_save(left)
     return not left
+
+
+def colored_lines(item, log):
+    """Заказы для склада с учётом твоей покраски отчёта (1.27).
+
+    Список запоминается при скачивании отчёта, ещё до покраски. Перед «Отправить на склад»
+    отчёты перечитываются: красное и то, что не вошло в жёлтое количество, на склад не уходит —
+    иначе в «Плане отгрузки» висели бы заказы, на которые этикетки никто не скачает."""
+    lines = item["lines"]
+    skip = set()
+    for path, market in item.get("reports") or []:
+        report = Path(path)
+        if not report.exists():
+            continue
+        try:
+            rpt = read_report(report)
+        except Exception as e:  # noqa: BLE001 — открыт в Excel, испорчен: шлём как есть
+            log(f"⚠ Покраску {report.name} прочитать не удалось ({e}) — на склад уйдёт весь список")
+            continue
+        skip |= {(market, num) for _, num in rpt.red}
+        skip |= {(market, num) for _, num, _ in rpt.yellow}
+    if not skip:
+        return lines
+    kept = [x for x in lines if (x.get("market"), x.get("posting")) not in skip]
+    key = lambda x: (x.get("market"), x.get("posting"))  # noqa: E731
+    gone = len({key(x) for x in lines} - {key(x) for x in kept})
+    if gone:
+        log(f"● Покраска учтена: {plural(gone, 'отправление', 'отправления', 'отправлений')} "
+            f"{'не едет' if gone % 10 == 1 and gone % 100 != 11 else 'не едут'} — на склад не отправляю")
+    return kept
 
 
 def _pending_load():
