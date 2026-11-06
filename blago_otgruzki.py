@@ -69,7 +69,7 @@ from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.pdfgen import canvas
 
 APP_NAME = "BLAGO OTGRUZKI"
-APP_VERSION = "1.28"  # при каждом обновлении +0.1, запись в CHANGELOG.md
+APP_VERSION = "1.29"  # при каждом обновлении +0.1, запись в CHANGELOG.md
 API = "https://api-seller.ozon.ru"
 BATCH = 20                   # максимум отправлений в одном запросе этикеток
 READY = "awaiting_deliver"   # статус, в котором Ozon отдаёт этикетку
@@ -1913,8 +1913,7 @@ def ozon_reports(cabinets, days, out, log, statuses, names, shk=None, lines=None
             if cabs is not None:
                 cabs[name] = (None, why)
             continue
-        if cabs is not None:
-            cabs[name] = (sum(1 for i in snap.values() if i["status"] in statuses), "")
+        taken = 0  # сколько отправлений кабинета вошло в этот отчёт (КГТ 2 — только КГТ)
         for num, info in snap.items():
             if info["status"] not in statuses:
                 continue
@@ -1922,6 +1921,7 @@ def ozon_reports(cabinets, days, out, log, statuses, names, shk=None, lines=None
             kgt = is_kgt(info.get("warehouse"))
             if ("kgt" if kgt else "ozon") not in names:
                 continue  # выбран только МГТ или только КГТ — другой вид не трогаем и не пишем
+            taken += 1
             nowh += not info.get("warehouse")
             for pr in info["products"]:
                 blocks["kgt" if kgt else "ozon"][(info["status"], name)].append(
@@ -1935,6 +1935,8 @@ def ozon_reports(cabinets, days, out, log, statuses, names, shk=None, lines=None
             if shk is not None:
                 k = "kgt" if kgt else "ozon"
                 shk[k] = shk.get(k, 0) + (1 if info["status"] == READY else units_of(info))
+        if cabs is not None:
+            cabs[name] = (taken, "")
     if broken:
         # без одного кабинета отчёт был бы неполным — такой не делаем, чтобы не отгрузить не всё
         raise RuntimeError(f"отчёт НЕ сделан — не загрузился кабинет {', '.join(broken)}. "
