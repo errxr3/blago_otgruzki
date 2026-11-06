@@ -70,7 +70,7 @@ from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.pdfgen import canvas
 
 APP_NAME = "BLAGO OTGRUZKI"
-APP_VERSION = "1.30"  # при каждом обновлении +0.1, запись в CHANGELOG.md
+APP_VERSION = "1.31"  # при каждом обновлении +0.1, запись в CHANGELOG.md
 API = "https://api-seller.ozon.ru"
 BATCH = 20                   # максимум отправлений в одном запросе этикеток
 READY = "awaiting_deliver"   # статус, в котором Ozon отдаёт этикетку
@@ -2976,8 +2976,9 @@ def sklad_demand(day, lines, log, replace=None, drop=None):
     if not sklad_on() or not (lines or drop):
         return None
     try:
+        # Склад пересчитывает остатки по всем заказам — на большом дне это дольше 30 с (1.31)
         data = sklad_post("/api/v1/demand", {"day": day.isoformat(), "lines": lines, "replace": replace or [],
-                                             "drop": drop or []})
+                                             "drop": drop or []}, timeout=120)
     except RuntimeError as e:
         log(f"⚠ Склад не ответил, что едет ({e}) — решаю как раньше, по цветам отчёта")
         sklad_note("err", "заказы НЕ ушли на склад")
