@@ -50,6 +50,7 @@ import io
 import json
 import os
 import queue
+import re
 import subprocess
 import sys
 import threading
@@ -69,7 +70,7 @@ from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.pdfgen import canvas
 
 APP_NAME = "BLAGO OTGRUZKI"
-APP_VERSION = "1.29"  # при каждом обновлении +0.1, запись в CHANGELOG.md
+APP_VERSION = "1.30"  # при каждом обновлении +0.1, запись в CHANGELOG.md
 API = "https://api-seller.ozon.ru"
 BATCH = 20                   # максимум отправлений в одном запросе этикеток
 READY = "awaiting_deliver"   # статус, в котором Ozon отдаёт этикетку
@@ -664,11 +665,26 @@ def make_time_overlay(page_w, page_h, text):
     return make_footer_overlay(page_w, page_h, "", text)
 
 
-def stamp_times(pdf_bytes, nums, times, barcodes, footer=""):
+STICKER_CODE = re.compile(r"(ii)\s*(\d[\d ]{7,}\d)", re.I)
+
+
+def sticker_codes(text):
+    """Код с наклейки Ozon, которого нет в ответе Ozon: на КГТ печатается только «ii5019607 3009»
+    (это и есть штрихкод, без номера отправления). Склад узнаёт наклейку по нему (1.30)."""
+    out = []
+    for line in str(text or "").splitlines():
+        m = STICKER_CODE.fullmatch(line.strip())
+        if m:
+            out.append(m.group(1).lower() + "".join(m.group(2).split()))
+    return out
+
+
+def stamp_times(pdf_bytes, nums, times, barcodes, footer="", found=None):
     """Ставит время «Принят в обработку» на этикетки одной пачки.
 
     Какая страница к какому отправлению: сначала по штрихкоду отправления в тексте
     страницы, иначе по порядку (Ozon отдаёт этикетки в порядке запроса).
+    found — {отправление: [коды с наклейки]}: сюда пишутся коды «ii…» каждой страницы.
     Возвращает (страницы, сколько подписано, сколько сопоставлено по штрихкоду).
     """
     pages = list(PdfReader(io.BytesIO(pdf_bytes)).pages)
@@ -685,6 +701,9 @@ def stamp_times(pdf_bytes, nums, times, barcodes, footer=""):
             num = nums[0]          # у всех заказов пачки одно время — порядок не важен
         else:
             num = None
+        if num and found is not None:
+            for code in sticker_codes(page.extract_text()):
+                found.setdefault(num, []).append(code)
         dt = times.get(num) if num else None
         if dt or footer:
             w, h = float(page.mediabox.width), float(page.mediabox.height)
@@ -1003,11 +1022,12 @@ def process(excel, sheet, cabinets, days, out, log, progress, download=True,
     times = {n: rpt.times[origin.get(n, n)] for n, _, _ in entries if origin.get(n, n) in rpt.times}
     barcodes = {n: info.get("barcodes", []) for cab in snap.values() for n, info in cab.items()}
     stamp = {"done": 0, "matched": 0}
+    sticker = {}  # {отправление: коды «ii…» с наклейки} — их Ozon не отдаёт, берём из PDF (1.30)
 
     def add(title, parts):
         w = writers.setdefault(title, [out / production_of(title_art[title]), PdfWriter(), 0])
         for nums, pdf in parts:
-            pages, done_, matched_ = stamp_times(pdf, nums, times, barcodes)
+            pages, done_, matched_ = stamp_times(pdf, nums, times, barcodes, found=sticker)
             stamp["done"] += done_
             stamp["matched"] += matched_
             for page in pages:
@@ -1061,7 +1081,7 @@ def process(excel, sheet, cabinets, days, out, log, progress, download=True,
     not_got = {n for _, n, _, _ in failed}
     sklad_send_batch(today_msk(), "ozon", sk_channel, sk_truck, f"Ozon · {footer.strip() or 'Озон утро'}", [
         {"posting": n, "origin": origin.get(n, n), "article": a, "production": production_of(a),
-         "codes": barcodes.get(n, []), "ordered_at": iso(times.get(n))}
+         "codes": barcodes.get(n, []) + sticker.get(n, []), "ordered_at": iso(times.get(n))}
         for n, a, _ in entries if n not in not_got], log)
 
     mixed_note = {n: "; вместе с ним не поехал: " + ", ".join(o) for n, _, _, o in mixed}
