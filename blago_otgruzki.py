@@ -70,7 +70,7 @@ from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.pdfgen import canvas
 
 APP_NAME = "BLAGO OTGRUZKI"
-APP_VERSION = "1.32"  # при каждом обновлении +0.1, запись в CHANGELOG.md
+APP_VERSION = "1.33"  # при каждом обновлении +0.1, запись в CHANGELOG.md
 API = "https://api-seller.ozon.ru"
 BATCH = 20                   # максимум отправлений в одном запросе этикеток
 READY = "awaiting_deliver"   # статус, в котором Ozon отдаёт этикетку
@@ -739,6 +739,14 @@ def left_numbers(paths):
                                 found.add(stickers[code])
                             else:
                                 unknown += 1
+            elif str(path).lower().endswith((".csv", ".txt")):  # выгрузка из кабинета Ozon в CSV
+                raw = Path(path).read_bytes()
+                try:
+                    text = raw.decode("utf-8-sig")
+                except UnicodeDecodeError:
+                    text = raw.decode("cp1251", errors="replace")
+                found |= {f"{a}-{b}" for a, b in POSTING_NUM.findall(text)}
+                orders |= {order_of(x) for x in found}
             else:
                 wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
                 try:
@@ -4682,7 +4690,8 @@ class App(tk.Tk):
             return
         paths = filedialog.askopenfilenames(
             title="Что не уехало вчера: PDF с ШК Ozon или отчёт Excel",
-            filetypes=[("ШК или отчёт", "*.pdf *.xlsx *.xlsm"), ("PDF", "*.pdf"), ("Excel", "*.xlsx *.xlsm")])
+            filetypes=[("ШК или отчёт", "*.pdf *.xlsx *.xlsm *.csv"), ("PDF", "*.pdf"),
+                       ("Excel или CSV", "*.xlsx *.xlsm *.csv")])
         if paths:
             self.set_left(list(paths))
 
