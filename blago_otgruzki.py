@@ -70,7 +70,7 @@ from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.pdfgen import canvas
 
 APP_NAME = "BLAGO OTGRUZKI"
-APP_VERSION = "1.31"  # при каждом обновлении +0.1, запись в CHANGELOG.md
+APP_VERSION = "1.32"  # при каждом обновлении +0.1, запись в CHANGELOG.md
 API = "https://api-seller.ozon.ru"
 BATCH = 20                   # максимум отправлений в одном запросе этикеток
 READY = "awaiting_deliver"   # статус, в котором Ozon отдаёт этикетку
@@ -679,6 +679,91 @@ def sticker_codes(text):
     return out
 
 
+STICKERS_FILE = BASE_DIR / "stickers.json"  # код «ii…» → отправление, за 14 дней (1.32)
+
+
+def remember_stickers(found):
+    """Запомнить, какой код «ii…» с наклейки к какому отправлению: на КГТ-этикетке номера нет."""
+    if not found:
+        return
+    try:
+        known = json.loads(STICKERS_FILE.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        known = {}
+    today = today_msk()
+    edge = (today - timedelta(days=14)).isoformat()
+    known = {k: v for k, v in known.items() if isinstance(v, list) and len(v) == 2 and v[1] >= edge}
+    for posting, codes in found.items():
+        for code in codes:
+            known[code] = [posting, today.isoformat()]
+    try:
+        STICKERS_FILE.write_text(json.dumps(known, ensure_ascii=False), encoding="utf-8")
+    except OSError:
+        pass  # не записалось — «Не уехало вчера» для КГТ попросит Excel
+
+
+def known_stickers():
+    try:
+        return {k: v[0] for k, v in json.loads(STICKERS_FILE.read_text(encoding="utf-8")).items()}
+    except (OSError, ValueError, AttributeError, IndexError, TypeError):
+        return {}
+
+
+POSTING_NUM = re.compile(r"(?<![\d-])(\d{6,12}-\d{4})-(\d{1,3})(?![\d-])")
+
+
+def order_of(posting):
+    """«05742108-1571-3» → «05742108-1571»: номер заказа без номера отправления."""
+    return str(posting).rsplit("-", 1)[0]
+
+
+def left_numbers(paths):
+    """Номера отправлений Ozon из файлов «что не уехало вчера»: PDF с ШК или Excel-отчёт (1.32).
+    Возвращает (отправления, заказы, сообщения). Заказы — только из Excel: после сборки Ozon
+    может дать отправлению новый номер («-1» → «-3»), а номер заказа остаётся тот же."""
+    postings, orders, notes = set(), set(), []
+    stickers = None
+    for path in paths:
+        name = Path(path).name
+        found, unknown = set(), 0
+        try:
+            if str(path).lower().endswith(".pdf"):
+                for page in PdfReader(str(path)).pages:
+                    text = page.extract_text() or ""
+                    nums = {f"{a}-{b}" for a, b in POSTING_NUM.findall(text)}
+                    found |= nums
+                    if not nums:  # КГТ: на этикетке только код «ii…» — номер помним с момента скачивания
+                        for code in sticker_codes(text):
+                            stickers = known_stickers() if stickers is None else stickers
+                            if code in stickers:
+                                found.add(stickers[code])
+                            else:
+                                unknown += 1
+            else:
+                wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
+                try:
+                    for ws in wb.worksheets:
+                        for row in ws.iter_rows(values_only=True):
+                            for value in row:
+                                if isinstance(value, str):
+                                    found |= {f"{a}-{b}" for a, b in POSTING_NUM.findall(value)}
+                finally:
+                    wb.close()
+                orders |= {order_of(x) for x in found}
+        except Exception as e:  # noqa: BLE001
+            notes.append(f"✖ {name}: не прочитался — {e}")
+            continue
+        postings |= found
+        if found:
+            notes.append(f"• {name}: {plural(len(found), 'отправление', 'отправления', 'отправлений')}")
+        if unknown:
+            notes.append(f"⚠ {name}: {plural(unknown, 'наклейку', 'наклейки', 'наклеек')} ii не узнал "
+                         f"(скачаны не на этом компьютере или раньше 1.32) — выбери ещё Excel-отчёт этой волны")
+        elif not found:
+            notes.append(f"⚠ {name}: номеров отправлений Ozon не нашёл")
+    return postings, orders, notes
+
+
 def stamp_times(pdf_bytes, nums, times, barcodes, footer="", found=None):
     """Ставит время «Принят в обработку» на этикетки одной пачки.
 
@@ -1077,6 +1162,7 @@ def process(excel, sheet, cabinets, days, out, log, progress, download=True,
             pending += [(title, name, n, err) for n, err in bad]
     failed += [(title_art[t], n, name, err) for t, name, n, err in pending]
 
+    remember_stickers(sticker)  # «Не уехало вчера»: PDF КГТ — только коды ii, номер узнаём по ним
     # Партия → склад: ровно те этикетки, что скачались (по ним грузчики сверяют зеркала)
     not_got = {n for _, n, _, _ in failed}
     sklad_send_batch(today_msk(), "ozon", sk_channel, sk_truck, f"Ozon · {footer.strip() or 'Озон утро'}", [
@@ -1909,10 +1995,12 @@ def wb_warehouses(token):
     return {}
 
 
-def ozon_reports(cabinets, days, out, log, statuses, names, shk=None, lines=None, truck="Озон1", cabs=None):
+def ozon_reports(cabinets, days, out, log, statuses, names, shk=None, lines=None, truck="Озон1", cabs=None,
+                 skip=None):
     """Отчёты Ozon из всех кабинетов. statuses — какие статусы брать (в этом порядке блоков);
     names — {"ozon" | "kgt": имя файла без .xlsx}: какие отчёты делать.
     cabs — если передан, сюда пишется по каждому кабинету: (сколько отправлений | None, ошибка).
+    skip — (отправления, заказы), которые не берём: вчерашняя волна не уехала (1.32).
     Возвращает ({ключ: {артикул: шт}}, {ключ: путь})."""
     data, files = {}, {}
     log(f"… получаю заказы Ozon из {plural(len(cabinets), 'кабинета', 'кабинетов', 'кабинетов')}")
@@ -1923,6 +2011,8 @@ def ozon_reports(cabinets, days, out, log, statuses, names, shk=None, lines=None
     order = list(cabinets)
     blocks = {k: {(st, n): [] for st in statuses for n in order} for k in ("ozon", "kgt")}
     nowh, broken = 0, []
+    skip_postings, skip_orders = skip or (set(), set())
+    skipped = defaultdict(set)  # кабинет → отправления, не взятые в отчёт
     for name in cabinets:
         try:
             snap = lists[name].result()
@@ -1941,6 +2031,9 @@ def ozon_reports(cabinets, days, out, log, statuses, names, shk=None, lines=None
             kgt = is_kgt(info.get("warehouse"))
             if ("kgt" if kgt else "ozon") not in names:
                 continue  # выбран только МГТ или только КГТ — другой вид не трогаем и не пишем
+            if num in skip_postings or order_of(num) in skip_orders:
+                skipped[name].add(num)
+                continue
             taken += 1
             nowh += not info.get("warehouse")
             for pr in info["products"]:
@@ -1961,6 +2054,17 @@ def ozon_reports(cabinets, days, out, log, statuses, names, shk=None, lines=None
         # без одного кабинета отчёт был бы неполным — такой не делаем, чтобы не отгрузить не всё
         raise RuntimeError(f"отчёт НЕ сделан — не загрузился кабинет {', '.join(broken)}. "
                            f"Подожди минуту и нажми ещё раз.")
+    if skip_postings:
+        total = sum(len(v) for v in skipped.values())
+        per = " · ".join(f"{n} {len(skipped[n])}" for n in order if skipped[n])
+        log(f"✔ Не уехало вчера: {plural(total, 'отправление', 'отправления', 'отправлений')} "
+            f"в отчёт не беру" + (f" ({per})" if per else ""))
+        taken_orders = {order_of(x) for v in skipped.values() for x in v}
+        rest = len({x for x in skip_postings
+                    if x not in set().union(*skipped.values()) and order_of(x) not in taken_orders})
+        if rest > 0:
+            log(f"   ещё {plural(rest, 'номер', 'номера', 'номеров')} из файла в Ozon уже не ждут отгрузки — "
+                f"их и так нет в отчёте")
     if nowh:
         log(f"⚠ У {nowh} заказов Ozon не указан склад — они попали в отчёт Озон, проверь КГТ вручную")
     hdr = ["Номер отправления", "Принят в обработку", "Артикул", "Количество"]
@@ -2031,9 +2135,10 @@ def ozon_wave(cabinets, template, out, days, wave, kgt, log, progress, today=Non
     return files
 
 
-def morning(cabinets, token, template, cdek, out, days, log, progress, today=None):
+def morning(cabinets, token, template, cdek, out, days, log, progress, today=None, left=None):
     """Утренние отчёты: Озон, КГТ, ВБ, СГТ (+ СДЭК из файла) и заполненная «Сборка».
-    В кабинетах ничего не меняется — только чтение. Возвращает пути к отчётам."""
+    В кабинетах ничего не меняется — только чтение. Возвращает пути к отчётам.
+    left — файлы «не уехало вчера» (PDF с ШК Ozon или Excel-отчёт): эти отправления в утро не берём."""
     day = today or datetime.now(MSK).date()
     stamp = f"{day:%d.%m}"
     out = Path(out)
@@ -2044,11 +2149,19 @@ def morning(cabinets, token, template, cdek, out, days, log, progress, today=Non
 
     # --- Ozon: все кабинеты сразу
     ozon_failed = False
+    skip = None
+    if left:
+        postings, orders, notes = left_numbers(left)
+        log("… не уехало вчера: читаю " + plural(len(left), "файл", "файла", "файлов"))
+        for note in notes:
+            log(note)
+        skip = (postings, orders)
     if cabinets:
         cabs = {}
         try:
             d, f = ozon_reports(cabinets, days, out, log, OZON_STATUSES,
-                                {"ozon": f"Озон {stamp}", "kgt": f"КГТ {stamp}"}, shk, lines=lines, cabs=cabs)
+                                {"ozon": f"Озон {stamp}", "kgt": f"КГТ {stamp}"}, shk, lines=lines, cabs=cabs,
+                                skip=skip)
             data.update(d)
             files.update(f)
             markets.append("ozon")  # все кабинеты пришли — можно заменить список Ozon на складе
@@ -3679,6 +3792,10 @@ class App(tk.Tk):
         row.pack(fill="x")
         self.button(row, "Скачать отчёты и сборку", self.start_morning, "Accent.TButton")
         self.button(row, "Добавить СДЭК…", self.start_cdek, "Big.TButton", padx=(10, 0))
+        self.button(row, "Не уехало вчера…", self.pick_left, "Big.TButton", padx=(10, 0))
+        self.left_files, self.left_day = [], None
+        self.left_status = ttk.Label(c1, text="", style="Info.TLabel")
+        self.left_status.pack(anchor="w", pady=(8, 0))
         self.folder_link(c1, "Сборка")
         self.mo_status = ttk.Label(c1, text="", style="Info.TLabel")
         self.mo_status.pack(anchor="w", pady=(10, 0))
@@ -4554,6 +4671,36 @@ class App(tk.Tk):
         self.log("")
         self.log(f"=== {text} ===")
 
+    def pick_left(self):
+        """Файлы с тем, что не уехало вчера: эти отправления утренний отчёт не возьмёт (1.32)."""
+        if self.busy:
+            return
+        if self.left_files and messagebox.askyesno(
+                APP_NAME, "Уже выбрано:\n" + "\n".join(Path(p).name for p in self.left_files)
+                + "\n\nУбрать выбор? (Нет — выбрать другие файлы)"):
+            self.set_left([])
+            return
+        paths = filedialog.askopenfilenames(
+            title="Что не уехало вчера: PDF с ШК Ozon или отчёт Excel",
+            filetypes=[("ШК или отчёт", "*.pdf *.xlsx *.xlsm"), ("PDF", "*.pdf"), ("Excel", "*.xlsx *.xlsm")])
+        if paths:
+            self.set_left(list(paths))
+
+    def set_left(self, paths):
+        self.left_files, self.left_day = paths, (today_msk() if paths else None)
+        if not paths:
+            self.left_status.configure(text="")
+            self.log("Не уехало вчера: выбор убран")
+            return
+        postings, _, notes = left_numbers(paths)
+        self.log("Не уехало вчера — выбрано:")
+        for note in notes:
+            self.log(note)
+        color = C["ok"] if postings else C["err"]
+        self.left_status.configure(
+            text=f"Не уехало вчера: {plural(len(postings), 'отправление', 'отправления', 'отправлений')} — "
+                 f"в утренний отчёт не попадут. Убрать — нажми кнопку ещё раз.", foreground=color)
+
     def start_morning(self):
         if self.busy:
             return
@@ -4571,11 +4718,15 @@ class App(tk.Tk):
         self.headline(f"УТРЕННЯЯ СБОРКА · {d:%d.%m}")
         self.mo_status.configure(text="скачиваю…", foreground=C["muted"])
 
+        if self.left_files and self.left_day != d:
+            self.set_left([])  # выбрано в другой день — не применяем
+        left = list(self.left_files)
+
         def work():
             try:
                 files = morning(cabinets, token, template, "", out, days,
                                 log=lambda s: self.q.put(("log", s)),
-                                progress=lambda a, b: self.q.put(("progress", a, b)))
+                                progress=lambda a, b: self.q.put(("progress", a, b)), left=left)
                 files = self.place_reports(base, files, lambda s: self.q.put(("log", s)))
                 self.q.put(("call", lambda: self.after_morning(files)))
             except Exception as e:  # noqa: BLE001
