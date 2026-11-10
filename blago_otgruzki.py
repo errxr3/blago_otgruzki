@@ -70,7 +70,7 @@ from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.pdfgen import canvas
 
 APP_NAME = "BLAGO OTGRUZKI"
-APP_VERSION = "1.35"  # при каждом обновлении +0.1, запись в CHANGELOG.md
+APP_VERSION = "1.36"  # при каждом обновлении +0.1, запись в CHANGELOG.md
 API = "https://api-seller.ozon.ru"
 BATCH = 20                   # максимум отправлений в одном запросе этикеток
 READY = "awaiting_deliver"   # статус, в котором Ozon отдаёт этикетку
@@ -807,9 +807,10 @@ def stamp_times(pdf_bytes, nums, times, barcodes, footer="", found=None):
     return pages, stamped, matched
 
 
-def merge_folder(folder, output_path, font_size, top_margin, footer=""):
+def merge_folder(folder, output_path, font_size, top_margin, footer="", bad=None):
     """Подписывает артикул (имя файла) на каждой этикетке и склеивает все PDF
-    папки в одну ленту, сортировка Я->А. Возвращает (файлов, этикеток)."""
+    папки в одну ленту, сортировка Я->А. Возвращает (файлов, этикеток).
+    bad — сюда пишутся имена файлов, которые не прочитались: они пропускаются, лента собирается (1.36)."""
     folder, output_path = Path(folder), Path(output_path)
     files = sorted((p for p in folder.glob("*.pdf")), key=lambda p: p.name.lower(), reverse=True)
     if not files:
@@ -819,9 +820,20 @@ def merge_folder(folder, output_path, font_size, top_margin, footer=""):
 
     writer = PdfWriter()
     strip_width_pt = STRIP_WIDTH_MM * MM
+    merged = 0
     for f in files:
         label = label_from_filename(f.name)
-        for src in PdfReader(str(f)).pages:
+        try:
+            sources = list(PdfReader(str(f)).pages)
+        except PermissionError:
+            raise
+        except Exception:  # noqa: BLE001 — битый или не-PDF файл: один файл не должен ронять всю ленту
+            if bad is None:
+                raise
+            bad.append(f.name)
+            continue
+        merged += 1
+        for src in sources:
             w, h = float(src.mediabox.width), float(src.mediabox.height)
             # pypdf 7: рисовать можно только на странице, уже прикреплённой к PdfWriter (1.34)
             if h > top_margin + 10:
@@ -837,9 +849,13 @@ def merge_folder(folder, output_path, font_size, top_margin, footer=""):
                 base = writer.add_page(make_strip_overlay(w + strip_width_pt, h, strip_width_pt, label, font_size))
                 base.merge_page(page)
     pages = len(writer.pages)
+    if not pages:
+        if output_path.exists():
+            output_path.unlink()
+        return 0, 0
     with open(output_path, "wb") as fh:
         writer.write(fh)
-    return len(files), pages
+    return merged, pages
 
 
 def merge_all(out, font_size, top_margin, log, footer=""):
@@ -848,11 +864,14 @@ def merge_all(out, font_size, top_margin, log, footer=""):
     out = Path(out)
     for prod in PRODUCTIONS:
         target = out / combined_name(prod)
+        bad = []
         try:
-            files, pages = merge_folder(out / prod, target, font_size, top_margin, footer)
+            files, pages = merge_folder(out / prod, target, font_size, top_margin, footer, bad=bad)
         except PermissionError:
             log(f"✖ {target.name}: файл открыт в другой программе — закрой его и нажми «Пересобрать ленты»")
             continue
+        for name in bad:
+            log(f"✖ {prod} / {name}: файл не читается (битый PDF) — в ленту не попал, скачай его ещё раз")
         if files:
             log(f"✔ {target.name}: {pages} этикеток, {files} артикулов")
         else:
@@ -1154,16 +1173,28 @@ def process(excel, sheet, cabinets, days, out, log, progress, download=True,
     barcodes = {n: info.get("barcodes", []) for cab in snap.values() for n, info in cab.items()}
     stamp = {"done": 0, "matched": 0}
     sticker = {}  # {отправление: коды «ii…» с наклейки} — их Ozon не отдаёт, берём из PDF (1.30)
+    short = []    # (файл, этикеток в файле, отправлений в запросе) — Ozon отдал не столько, сколько просили
 
     def add(title, parts):
-        w = writers.setdefault(title, [out / production_of(title_art[title]), PdfWriter(), 0])
+        """Кладёт скачанные пачки в файл артикула. Возвращает [(номер, ошибка)] — чей файл не прочитался.
+        Файл артикула заводится только когда есть хоть одна этикетка: пустых PDF в папке не бывает (1.36)."""
+        broken = []
         for nums, pdf in parts:
-            pages, done_, matched_ = stamp_times(pdf, nums, times, barcodes, found=sticker)
+            try:
+                pages, done_, matched_ = stamp_times(pdf, nums, times, barcodes, found=sticker)
+            except Exception as e:  # noqa: BLE001 — Ozon отдал битый файл: заказы уже собраны, падать нельзя
+                broken += [(n, f"файл этикеток от Ozon не читается ({e.__class__.__name__}) — скачай ещё раз")
+                           for n in nums]
+                continue
+            w = writers.setdefault(title, [out / production_of(title_art[title]), PdfWriter(), 0])
             stamp["done"] += done_
             stamp["matched"] += matched_
             for page in pages:
                 w[1].add_page(page)
-            w[2] += len(nums)
+            w[2] += len(pages)   # считаем этикетки в файле, а не отправления в запросе (1.36)
+            if len(pages) != len(nums):
+                short.append((title, len(pages), len(nums)))
+        return broken
 
     title_art, title_cab, titles, tasks = {}, {}, [], []
     for art in sorted(plan):
@@ -1182,7 +1213,7 @@ def process(excel, sheet, cabinets, days, out, log, progress, download=True,
             futs = [pool.submit(grab_labels, headers_for(cabinets[name]), nums) for _, name, nums in groups]
             for (title, name, nums), fut in zip(groups, futs):
                 good, bad = fut.result()
-                add(title, good)
+                bad = bad + add(title, good)
                 yield title, name, bad
                 done += len(nums)
                 progress(min(done, todo), todo)
@@ -1231,6 +1262,9 @@ def process(excel, sheet, cabinets, days, out, log, progress, download=True,
         name, shared = title_cab[title]
         log(f"{count:>4}  {title}   → {folder.name}" + (f"  [{name}]" if shared else ""))
 
+    for title, got, asked in short:
+        log(f"⚠ {title}: в файле Ozon этикеток {got}, а отправлений {asked} — пересчитай эту пачку "
+            f"и сверь с кабинетом")
     log(f"Время заказа подписано на {stamp['done']} из {total} ШК"
         + (f" (по штрихкоду сверено {stamp['matched']})" if stamp["matched"] else ""))
     if not times:
@@ -1460,6 +1494,17 @@ def sticker_text(st):
     return f"{st.get('partA', '')} {st.get('partB', '')}".strip()
 
 
+def sticker_readable(st):
+    """Картинка стикера WB открывается? Битую в PDF класть нельзя — на ней упала бы вся пачка (1.36)."""
+    import base64
+    from reportlab.lib.utils import ImageReader
+    try:
+        ImageReader(io.BytesIO(base64.b64decode(st["file"])))
+        return True
+    except Exception:  # noqa: BLE001 — любой сбой чтения картинки значит «стикер битый»
+        return False
+
+
 def stickers_pdf(stickers):
     """PDF 58×40 мм, один стикер на страницу, в переданном порядке."""
     import base64
@@ -1590,6 +1635,10 @@ def wb_save_supply(token, supply, ids, articles, out, day, log, collect=None):
         log(f"   {supply['name']} — пустая")
         return 0, []
     good, bad = wb_stickers(token, ids)
+    for i in [i for i, st in good.items() if not sticker_readable(st)]:
+        # задание уже в поставке — не падаем: остальные стикеры сохраняем, этот докачивается отдельно
+        del good[i]
+        bad.append((i, "WB отдал битую картинку стикера — нажми «Скачать ШК открытых поставок»"))
     rows = sorted(((articles.get(i, "?"), sticker_text(st), i) for i, st in good.items()),
                   key=lambda x: (pick_order(x[0]), x[1]))
     parsed = wb_parse_name(supply["name"])
