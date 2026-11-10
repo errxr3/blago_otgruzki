@@ -70,7 +70,7 @@ from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.pdfgen import canvas
 
 APP_NAME = "BLAGO OTGRUZKI"
-APP_VERSION = "1.34"  # при каждом обновлении +0.1, запись в CHANGELOG.md
+APP_VERSION = "1.35"  # при каждом обновлении +0.1, запись в CHANGELOG.md
 API = "https://api-seller.ozon.ru"
 BATCH = 20                   # максимум отправлений в одном запросе этикеток
 READY = "awaiting_deliver"   # статус, в котором Ozon отдаёт этикетку
@@ -957,15 +957,47 @@ def process(excel, sheet, cabinets, days, out, log, progress, download=True,
 
     # 2. Что с каждым отправлением делать
     entries, packing, failed, bulky = [], [], [], []  # entries: (номер, артикул, кабинет)
+    origin = {}  # номер отправления → исходное отправление из отчёта
+    # Уже собранный заказ Ozon делит на грузоместа с новыми номерами («-1» → «-1», «-3», «-5»).
+    # В отчёте только исходный номер: остальные грузоместа берём по номеру заказа (1.35),
+    # иначе после сбоя повторный запуск скачал бы одну этикетку из трёх.
+    ready_by_order = defaultdict(list)  # (кабинет, заказ) → собранные отправления
+    for cab, cab_snap in snap.items():
+        for n, info in cab_snap.items():
+            if info["status"] == READY:
+                ready_by_order[(cab, order_of(n))].append(n)
+    taken = set(postings)
+
+    def add_siblings(num, first, cab):
+        added = 0
+        for n in sorted(ready_by_order.get((cab, order_of(num)), [])):
+            if n in taken:
+                continue
+            taken.add(n)
+            info = snap[cab][n]
+            art = info["products"][0]["offer_id"] if info.get("products") else first
+            entries.append((n, art or first, cab))
+            origin[n] = num
+            added += 1
+        return added
+
+    siblings = 0
     for num, arts in postings.items():
         first = next(iter(arts))
         if num not in owner:
+            # исходного номера уже нет (Ozon перенумеровал при сборке) — ищем грузоместа заказа
+            cabs_with = [c for c in snap if (c, order_of(num)) in ready_by_order]
+            got = sum(add_siblings(num, first, c) for c in cabs_with[:1])
+            if got:
+                siblings += got
+                continue
             failed.append((first, num, "-", f"не найден ни в одном кабинете за {days} дн."))
             continue
         cab = owner[num]
         info = snap[cab][num]
         if info["status"] == READY:
             entries.append((num, first, cab))
+            siblings += add_siblings(num, first, cab)
             if units_of(info) > 1:
                 bulky.append((first, num, cab, units_of(info)))
         elif info["status"] == PACKING:
@@ -973,6 +1005,9 @@ def process(excel, sheet, cabinets, days, out, log, progress, download=True,
         else:
             st = STATUS_RU.get(info["status"], info["status"])
             failed.append((first, num, cab, f"статус «{st}» — этикетка доступна только в «ожидает отгрузки»"))
+    if siblings:
+        log(f"✔ Уже собранные заказы: добавлено ещё {plural(siblings, 'грузоместо', 'грузоместа', 'грузомест')} "
+            f"(новые номера Ozon после деления) — их этикетки тоже скачаются")
     to_ship = packing if autoship else []
     places = sum(units_of(snap[c][n]) for n, _, c in to_ship)
     if to_ship and download:
@@ -1050,7 +1085,6 @@ def process(excel, sheet, cabinets, days, out, log, progress, download=True,
 
     # 3. Сборка заказов «ожидают сборки»
     fresh = {}   # номер нового отправления -> (артикул, кабинет)
-    origin = {}  # номер нового отправления -> исходное отправление из отчёта
     if to_ship:
         if not confirm(f"Собрать {plural(len(to_ship), 'заказ', 'заказа', 'заказов')} "
                        f"({plural(places, 'грузоместо', 'грузоместа', 'грузомест')}) в кабинетах Ozon?\n\n"
