@@ -70,7 +70,7 @@ from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.pdfgen import canvas
 
 APP_NAME = "BLAGO OTGRUZKI"
-APP_VERSION = "1.33"  # при каждом обновлении +0.1, запись в CHANGELOG.md
+APP_VERSION = "1.34"  # при каждом обновлении +0.1, запись в CHANGELOG.md
 API = "https://api-seller.ozon.ru"
 BATCH = 20                   # максимум отправлений в одном запросе этикеток
 READY = "awaiting_deliver"   # статус, в котором Ozon отдаёт этикетку
@@ -780,7 +780,8 @@ def stamp_times(pdf_bytes, nums, times, barcodes, footer="", found=None):
     found — {отправление: [коды с наклейки]}: сюда пишутся коды «ii…» каждой страницы.
     Возвращает (страницы, сколько подписано, сколько сопоставлено по штрихкоду).
     """
-    pages = list(PdfReader(io.BytesIO(pdf_bytes)).pages)
+    # Страницы сразу в свой PdfWriter: pypdf 7 не даёт рисовать поверх страниц читателя (1.34)
+    pages = list(PdfWriter(clone_from=PdfReader(io.BytesIO(pdf_bytes))).pages)
     by_order = len(pages) == len(nums)
     stamped = matched = 0
     for i, page in enumerate(pages):
@@ -820,18 +821,21 @@ def merge_folder(folder, output_path, font_size, top_margin, footer=""):
     strip_width_pt = STRIP_WIDTH_MM * MM
     for f in files:
         label = label_from_filename(f.name)
-        for page in PdfReader(str(f)).pages:
-            w, h = float(page.mediabox.width), float(page.mediabox.height)
-            if footer:
-                page.merge_page(make_footer_overlay(w, h, footer, ""))
+        for src in PdfReader(str(f)).pages:
+            w, h = float(src.mediabox.width), float(src.mediabox.height)
+            # pypdf 7: рисовать можно только на странице, уже прикреплённой к PdfWriter (1.34)
             if h > top_margin + 10:
+                page = writer.add_page(src)
+                if footer:
+                    page.merge_page(make_footer_overlay(w, h, footer, ""))
                 page.merge_page(make_top_overlay(w, h, label, top_margin, font_size))
-                writer.add_page(page)
             else:
-                overlay = make_strip_overlay(w + strip_width_pt, h, strip_width_pt, label, font_size)
+                page = PdfWriter().add_page(src)  # черновик: сдвигаем вправо под полосу артикула
+                if footer:
+                    page.merge_page(make_footer_overlay(w, h, footer, ""))
                 page.add_transformation(Transformation().translate(strip_width_pt, 0))
-                overlay.merge_page(page)
-                writer.add_page(page)
+                base = writer.add_page(make_strip_overlay(w + strip_width_pt, h, strip_width_pt, label, font_size))
+                base.merge_page(page)
     pages = len(writer.pages)
     with open(output_path, "wb") as fh:
         writer.write(fh)
