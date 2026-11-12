@@ -70,7 +70,7 @@ from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.pdfgen import canvas
 
 APP_NAME = "BLAGO OTGRUZKI"
-APP_VERSION = "1.41"  # при каждом обновлении +0.1, запись в CHANGELOG.md
+APP_VERSION = "1.42"  # при каждом обновлении +0.1, запись в CHANGELOG.md
 API = "https://api-seller.ozon.ru"
 BATCH = 20                   # максимум отправлений в одном запросе этикеток
 READY = "awaiting_deliver"   # статус, в котором Ozon отдаёт этикетку
@@ -3427,12 +3427,31 @@ def sklad_decide(market, channel, truck, postings, times, colored, log, confirm,
 
 # Палитра — «slate dark» для рабочих панелей (UI/UX Pro Max: Financial/Operations dashboard),
 # фирменный золотой акцент BLAGO оставлен. Контраст основного и серого текста — не ниже 4.5:1.
-C = {
-    "side": "#0B1120", "bg": "#0F172A", "card": "#151F33", "field": "#0B1220", "line": "#24314A",
-    "text": "#F1F5F9", "muted": "#94A3B8", "dim": "#64748B", "accent": "#F2B53B", "accent_hi": "#FFC85C",
-    "on_accent": "#1A1405", "btn": "#23304A", "btn_hi": "#2E3D5C", "nav_hi": "#141D30",
-    "ok": "#22C55E", "err": "#F87171", "warn": "#FB923C",
+# Вид как у сайта склада (1.42): светлая тема по умолчанию, индиго-акцент; тёмная — в «Настройках».
+# nav_hi — фон выбранного раздела слева, note — «●» строки журнала (жёлтые артикулы, вопросы).
+C_LIGHT = {
+    "side": "#FFFFFF", "bg": "#F4F6FB", "card": "#FFFFFF", "field": "#FFFFFF", "line": "#E1E5EF",
+    "text": "#1B2037", "muted": "#6B7285", "dim": "#9AA1B2", "accent": "#4C5FD5", "accent_hi": "#3D4FC2",
+    "on_accent": "#FFFFFF", "btn": "#EEF0F6", "btn_hi": "#E2E6F3", "nav_hi": "#EEF0FD",
+    "ok": "#15803D", "err": "#C62828", "warn": "#B45309", "note": "#9A6700",
 }
+C_DARK = {
+    "side": "#121728", "bg": "#0E1220", "card": "#161B2C", "field": "#11162A", "line": "#252C42",
+    "text": "#E8EBF5", "muted": "#98A1B8", "dim": "#6B7490", "accent": "#7C8CFF", "accent_hi": "#95A2FF",
+    "on_accent": "#0E1220", "btn": "#222A42", "btn_hi": "#2C3552", "nav_hi": "#232A4D",
+    "ok": "#22C55E", "err": "#F87171", "warn": "#FB923C", "note": "#FBBF24",
+}
+UI_CONFIG = BASE_DIR / "ui.json"   # тема окна — у каждого компьютера своя
+
+
+def ui_theme():
+    try:
+        return "dark" if json.loads(UI_CONFIG.read_text(encoding="utf-8")).get("theme") == "dark" else "light"
+    except (OSError, ValueError, AttributeError):
+        return "light"
+
+
+C = dict(C_DARK if ui_theme() == "dark" else C_LIGHT)
 PAGES = ("Сборка", "Ozon", "Wildberries", "СДЭК", "Настройки")
 FONT = "Segoe UI"
 MONTHS = ("Январь", "Февраль", "Март", "Апрель", "Май", "Июнь",
@@ -3707,13 +3726,18 @@ class App(tk.Tk):
         self.show_keys = tk.BooleanVar(value=False)
 
         # --- боковая панель: логотип, разделы, дата
-        side = tk.Frame(self, bg=C["side"], width=210)
+        side = tk.Frame(self, bg=C["side"], width=220)
         side.pack(side="left", fill="y")
         side.pack_propagate(False)
+        tk.Frame(self, bg=C["line"], width=1).pack(side="left", fill="y")   # граница меню, как на сайте
         logo = tk.Frame(side, bg=C["side"])
-        logo.pack(fill="x", padx=24, pady=(26, 30))
-        tk.Label(logo, text="BLAGO", bg=C["side"], fg=C["accent"], font=(FONT, 20, "bold")).pack(anchor="w")
-        tk.Label(logo, text="OTGRUZKI", bg=C["side"], fg=C["text"], font=(FONT, 13, "bold")).pack(anchor="w")
+        logo.pack(fill="x", padx=18, pady=(22, 24))
+        tk.Label(logo, text="B", bg=C["accent"], fg=C["on_accent"], font=(FONT, 14, "bold"),
+                 width=2, pady=2).pack(side="left")
+        names = tk.Frame(logo, bg=C["side"])
+        names.pack(side="left", padx=(10, 0))
+        tk.Label(names, text="BLAGO", bg=C["side"], fg=C["text"], font=(FONT, 14, "bold")).pack(anchor="w")
+        tk.Label(names, text="OTGRUZKI", bg=C["side"], fg=C["muted"], font=(FONT, 9, "bold")).pack(anchor="w")
         self.nav = {}
         for name in PAGES:
             self.nav[name] = self.nav_item(side, name)
@@ -3783,7 +3807,7 @@ class App(tk.Tk):
         self.log_box.pack(fill="both", expand=True)
         for tag, color, bold in (("ok", C["ok"], False), ("err", C["err"], False), ("head", C["accent"], True),
                                  ("warn", C["warn"], True), ("warnbody", C["warn"], False),
-                                 ("yellow", C["accent"], False), ("big", C["ok"], True),
+                                 ("yellow", C["note"], False), ("big", C["ok"], True),
                                  ("muted", C["dim"], False)):
             self.log_box.tag_configure(tag, foreground=color,
                                        font=("Consolas", 11 if tag == "big" else 10, "bold" if bold else ""))
@@ -3801,6 +3825,7 @@ class App(tk.Tk):
         self.protocol("WM_DELETE_WINDOW", self.on_close)
         self.after(50, self.dark_titlebar)
         self.after(100, self.poll)
+        self.after(100, self.ease_bar)
         self.after(500, self.refresh_sklad_line)
 
     def refresh_sklad_line(self):
@@ -3839,11 +3864,11 @@ class App(tk.Tk):
     # ------------------------------------------------------------ навигация
     def nav_item(self, parent, name):
         row = tk.Frame(parent, bg=C["side"], cursor="hand2")
-        row.pack(fill="x")
-        bar = tk.Frame(row, bg=C["side"], width=4)
+        row.pack(fill="x", padx=12, pady=1)
+        bar = tk.Frame(row, bg=C["side"], width=3)
         bar.pack(side="left", fill="y")
         lbl = tk.Label(row, text=name, bg=C["side"], fg=C["muted"], font=(FONT, 11, "bold"),
-                       anchor="w", padx=20, pady=11, cursor="hand2")
+                       anchor="w", padx=14, pady=10, cursor="hand2")
         lbl.pack(side="left", fill="x", expand=True)
         for w in (row, lbl):
             w.bind("<Button-1>", lambda e, n=name: self.show_page(n))
@@ -3858,7 +3883,7 @@ class App(tk.Tk):
         for w in (row, lbl):
             w.configure(bg=bg)
         bar.configure(bg=C["accent"] if on else bg)
-        lbl.configure(fg=C["text"] if on or hover else C["muted"])
+        lbl.configure(fg=C["accent"] if on else C["text"] if hover else C["muted"])
 
     def show_page(self, name):
         self.current_page = name
@@ -3956,7 +3981,7 @@ class App(tk.Tk):
         st.map("TNotebook.Tab", background=[("selected", C["accent"]), ("active", C["btn_hi"])],
                padding=[("selected", (18, 8))], expand=[("selected", (0, 0, 0, 0))],
                foreground=[("selected", C["on_accent"]), ("active", C["text"])])
-        st.configure("Horizontal.TProgressbar", background=C["accent"], troughcolor=C["field"],
+        st.configure("Horizontal.TProgressbar", background=C["accent"], troughcolor=C["btn"],
                      bordercolor=C["card"], lightcolor=C["accent"], darkcolor=C["accent"], thickness=4)
         # Ползунок — одна гладкая полоса: без стрелок, без рисок и объёмных краёв
         st.layout("Vertical.TScrollbar", [("Vertical.Scrollbar.trough", {"sticky": "ns", "children": [
@@ -4013,8 +4038,8 @@ class App(tk.Tk):
             var.set("  ›  ".join(p.parts[-2:]) + "     открыть ↗")
 
     def dark_titlebar(self):
-        """Тёмный заголовок окна в Windows 10/11."""
-        if sys.platform != "win32":
+        """Тёмный заголовок окна в Windows 10/11 — только в тёмной теме."""
+        if sys.platform != "win32" or ui_theme() != "dark":
             return
         try:
             import ctypes
@@ -4313,6 +4338,17 @@ class App(tk.Tk):
         self.bind_all("<MouseWheel>", wheel, add="+")
         return inner
 
+    def set_theme(self, key):
+        """Тема окна: запоминается на этом компьютере, меняется после перезапуска программы."""
+        try:
+            UI_CONFIG.write_text(json.dumps({"theme": key}), encoding="utf-8")
+        except OSError as e:
+            self.theme_note.configure(text=f"Не сохранилось: {e}", foreground=C["err"])
+            return
+        same = key == ui_theme() and key == ("dark" if C["bg"] == C_DARK["bg"] else "light")
+        self.theme_note.configure(text="" if same else "Тема поменяется после перезапуска программы",
+                                  foreground=C["accent"])
+
     def build_settings(self, tab):
         top = ttk.Frame(tab, style="Bg.TFrame")
         top.pack(fill="x", pady=(0, 4))
@@ -4320,6 +4356,15 @@ class App(tk.Tk):
         self.save_status = tk.Label(top, text=f"Настройки и ключи хранятся в папке программы: {BASE_DIR}",
                                     bg=C["bg"], fg=C["muted"], font=(FONT, 9), anchor="w")
         self.save_status.pack(side="left", padx=(12, 0))
+        look = self.card(tab, "Вид окна")
+        lrow = ttk.Frame(look, style="Card.TFrame")
+        lrow.pack(fill="x")
+        now = ui_theme()
+        for key, title in (("light", "Светлая тема"), ("dark", "Тёмная тема")):
+            self.button(lrow, ("✓ " if key == now else "") + title, lambda k=key: self.set_theme(k),
+                        "Accent.TButton" if key == now else "TButton", padx=(0, 8))
+        self.theme_note = ttk.Label(lrow, text="", style="Info.TLabel")
+        self.theme_note.pack(side="left", padx=(8, 0))
         c1 = self.card(tab, "Кабинеты Ozon", side=lambda h: ttk.Checkbutton(
             h, text="показать ключи", variable=self.show_keys, command=self.toggle_keys).pack(side="right"))
         self.cab_box = ttk.Frame(c1, style="Card.TFrame")
@@ -4910,6 +4955,7 @@ class App(tk.Tk):
 
     def headline(self, text):
         self.bar["value"] = 0
+        self._bar_total = self._bar_target = None
         self.log("")
         self.log(f"=== {text} ===")
 
@@ -5181,8 +5227,9 @@ class App(tk.Tk):
                                   fg=C["accent"] if busy else C["ok"])
         if busy:
             # пока не пришёл первый шаг — бегущая полоса, чтобы было видно, что программа живая
+            self._bar_total = self._bar_target = None
             self.bar.configure(mode="indeterminate", value=0)
-            self.bar.start(15)
+            self.bar.start(20)
             self.bar.pack(fill="x", padx=18, pady=(10, 0), before=self._log_frame)
         else:
             self.bar.stop()
@@ -5198,31 +5245,76 @@ class App(tk.Tk):
         self.log_box.delete("1.0", "end")
         self.log_box.configure(state="disabled")
 
-    def log(self, text):
+    LOG_LIMIT = 6000          # строк в журнале: старые уходят, чтобы окно не тяжелело к вечеру
+    POLL_BUDGET = 0.025       # сколько секунд за раз окно разбирает очередь (дальше — отрисовка)
+
+    @staticmethod
+    def log_tag(text):
         s = text.lstrip()
         tag = ("big" if s.startswith(("✔ ВСЕГО ШК", "✔ СКАЧАНО ШК", "✔ ГОТОВО")) else
                "ok" if s.startswith("✔") else "err" if s.startswith("✖") else
                "head" if s.startswith("===") else "warn" if s.startswith("⚠") else
                "warnbody" if s.startswith("│") else "yellow" if s.startswith("●") else
                "muted" if s.startswith("…") else "")
-        if tag == "head":
-            text = s.strip("= ").strip()
-        self.log_box.configure(state="normal")
-        self.log_box.insert("end", text + "\n", tag)
-        self.log_box.see("end")
-        self.log_box.configure(state="disabled")
+        return (s.strip("= ").strip() if tag == "head" else text), tag
+
+    def log(self, text):
+        self.log_lines([text])
+
+    def log_lines(self, texts):
+        """Строки в журнал одной вставкой: сотни строк подряд не замораживают окно (1.42)."""
+        if not texts:
+            return
+        parts = []
+        for text in texts:
+            line, tag = self.log_tag(text)
+            parts += [line + "\n", tag]
+        box = self.log_box
+        at_end = box.yview()[1] >= 0.999
+        box.configure(state="normal")
+        box.insert("end", *parts)
+        extra = int(box.index("end-1c").split(".")[0]) - self.LOG_LIMIT
+        if extra > 0:
+            box.delete("1.0", f"{extra + 1}.0")
+        if at_end:
+            box.see("end")   # листаем вниз, только если пользователь не отмотал журнал вверх
+        box.configure(state="disabled")
+
+    def set_progress(self, done, total):
+        """Цель полосы; сама полоса доезжает до неё плавно (ease_bar)."""
+        if str(self.bar.cget("mode")) == "indeterminate":
+            self.bar.stop()
+            self.bar.configure(mode="determinate", value=0)
+        total = max(total, 1)
+        if total != getattr(self, "_bar_total", None) or done < getattr(self, "_bar_target", 0):
+            # новый этап (другое «из скольких») — полоса начинает с его доли, без рывка назад и вперёд
+            self.bar.configure(maximum=total, value=min(done, total))
+        self._bar_total, self._bar_target = total, min(done, total)
+
+    def ease_bar(self):
+        if str(self.bar.cget("mode")) == "determinate" and getattr(self, "_bar_total", None):
+            value = float(self.bar.cget("value"))
+            target = self._bar_target
+            if abs(target - value) > 0.01:
+                step = max((target - value) * 0.25, self._bar_total / 400)
+                self.bar.configure(value=min(target, value + step))
+        self.after(30, self.ease_bar)
 
     def poll(self):
+        start, lines, more = time.monotonic(), [], False
         try:
             while True:
+                if time.monotonic() - start > self.POLL_BUDGET:
+                    more = True    # остальное — в следующий раз, окно успеет перерисоваться
+                    break
                 m = self.q.get_nowait()
                 if m[0] == "log":
-                    self.log(m[1])
-                elif m[0] == "progress":
-                    if str(self.bar.cget("mode")) == "indeterminate":
-                        self.bar.stop()
-                        self.bar.configure(mode="determinate")
-                    self.bar["maximum"], self.bar["value"] = max(m[2], 1), m[1]
+                    lines.append(m[1])
+                    continue
+                self.log_lines(lines)   # перед любым другим событием журнал должен быть дописан
+                lines = []
+                if m[0] == "progress":
+                    self.set_progress(m[1], m[2])
                 elif m[0] == "status":
                     m[1].configure(text=m[2], foreground=m[3])
                 elif m[0] == "ask":
@@ -5234,7 +5326,8 @@ class App(tk.Tk):
                     self.set_busy(False)
         except queue.Empty:
             pass
-        self.after(100, self.poll)
+        self.log_lines(lines)
+        self.after(15 if more else 60, self.poll)
 
 
 if __name__ == "__main__":

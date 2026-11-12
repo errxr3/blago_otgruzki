@@ -29,7 +29,7 @@ def isolated(monkeypatch, tmp_path):
     state.mkdir()
     for name, file in (("STICKERS_FILE", "stickers.json"), ("SKLAD_PENDING", "sklad_pending.json"),
                        ("SKLAD_MORNING", "sklad_morning.json"), ("SKLAD_CONFIG", "sklad.json"),
-                       ("CONFIG", "cabinets.json"), ("WB_CONFIG", "wb.json")):
+                       ("CONFIG", "cabinets.json"), ("WB_CONFIG", "wb.json"), ("UI_CONFIG", "ui.json")):
         monkeypatch.setattr(b, name, state / file)
     monkeypatch.setattr(b, "LABEL_TASK_WAIT", 1)
     with responses.RequestsMock(assert_all_requests_are_fired=False) as mock:
