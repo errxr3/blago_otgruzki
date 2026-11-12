@@ -88,3 +88,53 @@ def test_warehouse_gets_one_label_line_per_mirror(tmp_path, log, monkeypatch):
 def test_sborka_total_counts_quantity(tmp_path):
     path = cdek_file(tmp_path / "сдэк.xlsx", ROWS, "кол-во")
     assert b.read_totals(path) == {"Zerkalo_60x160": 3, "Zerkalo_50x130": 1, "Ambient 80 krug": 1}
+
+
+# ---------------------------------------------------------------- сверка количества с СДЭК (1.41)
+
+def cdek_entity(places, amounts, status="CREATED"):
+    return {"entity": {"statuses": [{"code": status, "date_time": "2026-11-12T08:00:00+0300"}],
+                       "packages": [{"items": [{"amount": a} for a in amounts[i:i + 1]]} for i in range(places)]}}
+
+
+@pytest.fixture
+def cdek_api(isolated, monkeypatch):
+    import json
+
+    import responses
+    monkeypatch.setattr(b, "cdek_token", lambda: "test-token")
+    answers = {}
+
+    def handle(request):
+        track = request.url.split("cdek_number=")[1]
+        return 200, {}, json.dumps(answers[track])
+
+    isolated.add_callback(responses.GET, re.compile(r"https://api\.cdek\.ru/v2/orders.*"), callback=handle)
+    return answers
+
+
+def test_quantity_matches_cdek(cdek_api, log):
+    cdek_api["10000000001"] = cdek_entity(1, [3])          # одно место, в нём 3 товара
+    cdek_api["10000000002"] = cdek_entity(1, [1])
+    orders = [{"task": "1", "article": "Z", "track": "10000000001", "qty": 3},
+              {"task": "2", "article": "Z", "track": "10000000002", "qty": 1}]
+    assert b.cdek_check(orders, log) == 0
+
+
+def test_quantity_differs_from_cdek(cdek_api, log):
+    cdek_api["10000000001"] = cdek_entity(3, [1, 1, 1])    # три места по одному
+    orders = [{"task": "1", "article": "Zerkalo_60x160", "track": "10000000001", "qty": 2}]
+    assert b.cdek_check(orders, log) == 1
+    assert "10000000001 (Zerkalo_60x160): в таблице 2 шт., а в СДЭК 3 (мест 3, товаров 3)" in log.text()
+
+
+def test_places_used_when_no_goods(cdek_api, log):
+    cdek_api["10000000001"] = cdek_entity(2, [])
+    orders = [{"task": "1", "article": "Z", "track": "10000000001", "qty": 1}]
+    assert b.cdek_check(orders, log) == 1
+    assert "в таблице 1 шт., а в СДЭК 2 (мест 2, товаров 0)" in log.text()
+
+
+def test_no_amounts_in_cdek_no_warning(cdek_api, log):
+    cdek_api["10000000001"] = {"entity": {"statuses": [{"code": "CREATED"}]}}
+    assert b.cdek_check([{"task": "1", "article": "Z", "track": "10000000001", "qty": 3}], log) == 0

@@ -70,7 +70,7 @@ from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.pdfgen import canvas
 
 APP_NAME = "BLAGO OTGRUZKI"
-APP_VERSION = "1.40"  # при каждом обновлении +0.1, запись в CHANGELOG.md
+APP_VERSION = "1.41"  # при каждом обновлении +0.1, запись в CHANGELOG.md
 API = "https://api-seller.ozon.ru"
 BATCH = 20                   # максимум отправлений в одном запросе этикеток
 READY = "awaiting_deliver"   # статус, в котором Ozon отдаёт этикетку
@@ -2608,19 +2608,39 @@ def cdek_check(orders, log):
         ent = (r.json() or {}).get("entity") or {}
         sts = ent.get("statuses") or []
         last = max(sts, key=lambda x: x.get("date_time") or "") if sts else {}
-        return o, last.get("code") or "", ""
+        return o, last.get("code") or "", cdek_amounts(ent)
 
     bad = 0
     with ThreadPoolExecutor(max_workers=WORKERS) as pool:
-        for o, code, err in pool.map(one, orders):
-            if err:
+        for o, code, extra in pool.map(one, orders):
+            if not isinstance(extra, tuple):   # строка — ошибка запроса
                 bad += 1
-                log(f"✖ {o['track']} ({o['article']}): {err}")
-            elif code and code != "CREATED":
+                log(f"✖ {o['track']} ({o['article']}): {extra}")
+                continue
+            if code and code != "CREATED":
                 bad += 1
                 log(f"⚠ {o['track']} ({o['article']}): в СДЭК статус «{CDEK_STATUS_RU.get(code, code)}», "
                     f"а не «Создан»")
+            places, goods = extra
+            in_cdek = goods or places   # сколько зеркал по СДЭК: товаров, а нет — мест
+            if in_cdek and in_cdek != o.get("qty", 1):
+                bad += 1
+                log(f"⚠ {o['track']} ({o['article']}): в таблице {o.get('qty', 1)} шт., а в СДЭК {in_cdek} "
+                    f"(мест {places}, товаров {goods}) — проверь количество в таблице")
     return bad
+
+
+def cdek_amounts(entity):
+    """Сколько мест и сколько товаров (штук) в заказе СДЭК: (мест, товаров). Нет данных — 0 (1.41)."""
+    packages = entity.get("packages") or []
+    goods = 0
+    for package in packages:
+        for item in package.get("items") or []:
+            try:
+                goods += int(float(item.get("amount") or 0))
+            except (TypeError, ValueError):
+                pass
+    return len(packages), goods
 
 
 def cdek_pages(pdfs):
