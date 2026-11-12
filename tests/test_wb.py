@@ -359,3 +359,9 @@ def test_leftover_painted_red_is_left_alone(wb, tmp_path, log, progress):
                     red={"Ambient warm 80 krug multi"})
     b.process_wb([str(rep)], TOKEN, str(tmp_path / "o"), log, progress, mode="run", today=TODAY)
     assert [(s["name"], s["orders"]) for s in wb.supplies] == [("Поставка от 09.11.2026 МГТ учительская", ["401"])]
+
+
+def test_wb_check_progress_steps(shop, log):
+    steps = []
+    run(shop, log, lambda done, total: steps.append((done, total)), mode="check")
+    assert steps == [(0, 4), (1, 4), (2, 4), (3, 4), (4, 4)]

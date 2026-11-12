@@ -70,7 +70,7 @@ from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.pdfgen import canvas
 
 APP_NAME = "BLAGO OTGRUZKI"
-APP_VERSION = "1.43"  # при каждом обновлении +0.1, запись в CHANGELOG.md
+APP_VERSION = "1.44"  # при каждом обновлении +0.1, запись в CHANGELOG.md
 API = "https://api-seller.ozon.ru"
 BATCH = 20                   # максимум отправлений в одном запросе этикеток
 READY = "awaiting_deliver"   # статус, в котором Ozon отдаёт этикетку
@@ -952,8 +952,12 @@ def process(excel, sheet, cabinets, days, out, log, progress, download=True,
 
     # 1. В каком кабинете каждое отправление
     snap, owner = {}, {}  # кабинет -> его заказы;  номер -> кабинет
+    steps = len(cabinets) + 1   # полоса при проверке: кабинеты по мере ответа Ozon, потом итог (1.44)
+    progress(0, steps)
     with ThreadPoolExecutor(max_workers=max(1, len(cabinets))) as pool:
         lists = {name: pool.submit(list_postings, headers_for(cfg), days) for name, cfg in cabinets.items()}
+        for k, _ in enumerate(as_completed(lists.values()), 1):
+            progress(k, steps)
     broken = []
     for name in cabinets:  # разбираем в порядке кабинетов в окне
         try:
@@ -1046,6 +1050,7 @@ def process(excel, sheet, cabinets, days, out, log, progress, download=True,
         log("")
 
     if not download:
+        progress(steps, steps)
         # Итог проверки: считаем и «ожидают отгрузки», и «ожидают сборки».
         # В кабинетах при этом ничего не меняется.
         pack_places = sum(units_of(snap[c][n]) for n, _, c in packing)
@@ -1717,11 +1722,14 @@ def process_wb(files, token, out, log, progress, mode="check", confirm=lambda te
 
     # 1. Новые задания WB: нужны время заказа (для жёлтых) и габарит
     log("… получаю задания WB")
+    progress(0, 4)   # полоса по шагам: задания, отчёты, статусы, поставки (1.44)
     new = wb_new_orders(token)
+    progress(1, 4)
     times = {i: wb_time(o.get("createdAt")) for i, o in new.items() if o.get("createdAt")}
 
     # 2. Отчёты — по строке на файл, жёлтые — по строке на артикул
     reports = wb_read_reports(files, times)
+    progress(2, 4)
     postings, red, yellow, colored = {}, [], [], set()
     for path, desc, rpt in reports:
         log(f"{Path(path).stem}: едут {len(rpt.postings)}"
@@ -1748,6 +1756,7 @@ def process_wb(files, token, out, log, progress, mode="check", confirm=lambda te
     # Не уехало вчера: задание уже во вчерашней неотгруженной поставке — его ШК скачается заново (1.37)
     # Ищем всегда, а не только по отчёту: отчёт мог быть сделан до того, как вчерашнее туда попадало (1.39)
     left = wb_leftovers(token, day)
+    progress(3, 4)
     carry = defaultdict(list)   # id поставки -> задания из отчёта, которые в ней лежат
     carry_sup = {}
     painted = {n for _, n in red} | {n for _, n, _ in yellow}   # покрашено «не едет» — не трогаем
@@ -1863,6 +1872,7 @@ def process_wb(files, token, out, log, progress, mode="check", confirm=lambda te
                 for art, num in items[:10]:
                     log(f"│     {num}  {art}")
     if mode != "run":
+        progress(4, 4)
         log(f"✔ ВСЕГО ШК БУДЕТ СКАЧАНО: {total}")
         return
     if not plan:
@@ -5248,11 +5258,12 @@ class App(tk.Tk):
         self.state_pill.configure(text="●  работаю…" if busy else "●  готова к работе",
                                   fg=C["accent"] if busy else C["ok"])
         if busy:
-            # пока не пришёл первый шаг — бегущая полоса, чтобы было видно, что программа живая
+            # Бегущая туда-сюда полоса дёргалась, пока программа считает (1.44): теперь полоса
+            # появляется с первым настоящим шагом и только заполняется. До него — «● работаю…»
             self._bar_total = self._bar_target = None
-            self.bar.configure(mode="indeterminate", value=0)
-            self.bar.start(20)
-            self.bar.pack(fill="x", padx=18, pady=(10, 0), before=self._log_frame)
+            self.bar.stop()
+            self.bar.configure(mode="determinate", value=0)
+            self.bar.pack_forget()
         else:
             self.bar.stop()
             self.bar.pack_forget()
@@ -5303,10 +5314,9 @@ class App(tk.Tk):
         box.configure(state="disabled")
 
     def set_progress(self, done, total):
-        """Цель полосы; сама полоса доезжает до неё плавно (ease_bar)."""
-        if str(self.bar.cget("mode")) == "indeterminate":
-            self.bar.stop()
-            self.bar.configure(mode="determinate", value=0)
+        """Цель полосы; сама полоса доезжает до неё плавно (ease_bar). Видна с первого шага."""
+        if self.busy and not self.bar.winfo_ismapped():
+            self.bar.pack(fill="x", padx=18, pady=(10, 0), before=self._log_frame)
         total = max(total, 1)
         if total != getattr(self, "_bar_total", None) or done < getattr(self, "_bar_target", 0):
             # новый этап (другое «из скольких») — полоса начинает с его доли, без рывка назад и вперёд

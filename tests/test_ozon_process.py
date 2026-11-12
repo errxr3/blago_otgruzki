@@ -328,3 +328,11 @@ def test_fewer_label_pages_than_postings_is_counted_honestly(ozon, tmp_path, log
     text = log.text()
     assert "Скачано этикеток: 2" in text
     assert "Zerkalo_50x130" in text and "этикеток 2, а отправлений 3" in text
+
+
+def test_check_progress_only_fills_forward(day, log):
+    """«Проверить»: полоса идёт по шагам кабинетов вперёд и доходит до конца (1.44)."""
+    steps = []
+    run(day, log, lambda done, total: steps.append((done, total)), download=False)
+    assert steps[0] == (0, 4) and steps[-1] == (4, 4)
+    assert all(t == 4 for _, t in steps) and [d for d, _ in steps] == sorted(d for d, _ in steps)
