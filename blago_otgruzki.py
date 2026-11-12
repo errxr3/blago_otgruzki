@@ -70,7 +70,7 @@ from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.pdfgen import canvas
 
 APP_NAME = "BLAGO OTGRUZKI"
-APP_VERSION = "1.36"  # при каждом обновлении +0.1, запись в CHANGELOG.md
+APP_VERSION = "1.37"  # при каждом обновлении +0.1, запись в CHANGELOG.md
 API = "https://api-seller.ozon.ru"
 BATCH = 20                   # максимум отправлений в одном запросе этикеток
 READY = "awaiting_deliver"   # статус, в котором Ozon отдаёт этикетку
@@ -1663,6 +1663,26 @@ def wb_save_supply(token, supply, ids, articles, out, day, log, collect=None):
     return len(rows), bad
 
 
+def wb_leftovers(token, day):
+    """Не уехавшее вчера: задания из неотгруженных поставок программы за прошлые дни.
+
+    Возвращает {id задания: (задание WB, поставка)}. Задание — из списка заданий за 30 дней
+    (там артикул, склад, габарит); если WB его не отдал — только номер и артикул «?» (1.37).
+    """
+    old = [s for s in wb_open_supplies(token)
+           if (p := wb_parse_name(s.get("name"))) and p[0] < day]
+    if not old:
+        return {}
+    ids = {s["id"]: wb_supply_orders(token, s["id"]) for s in old}
+    every = {i for v in ids.values() for i in v}
+    known = wb_orders(token, 30) if every else {}
+    result = {}
+    for s in old:
+        for i in ids[s["id"]]:
+            result[i] = (known.get(i) or {"id": int(i), "article": "?"}, s)
+    return result
+
+
 def wb_articles(token, ids, known):
     """Артикулы заданий: сначала из уже полученных, остальное — из списка заданий за 30, затем 90 дней."""
     arts = {i: known[i]["article"] for i in ids if i in known}
@@ -1720,9 +1740,18 @@ def process_wb(files, token, out, log, progress, mode="check", confirm=lambda te
     failed = []                 # (артикул, id, причина)
     not_new = [n for n in postings if n not in new]
     status = wb_statuses(token, not_new) if not_new else {}
+    # Не уехало вчера: задание уже во вчерашней неотгруженной поставке — его ШК скачается заново (1.37)
+    left = wb_leftovers(token, day) if not_new else {}
+    carry = defaultdict(list)   # id поставки -> задания из отчёта, которые в ней лежат
+    carry_sup = {}
     for num, arts in postings.items():
         art = next(iter(arts))
         o = new.get(num)
+        if o is None and num in left:
+            sup = left[num][1]
+            carry[sup["id"]].append(num)
+            carry_sup[sup["id"]] = sup
+            continue
         if o is None:
             st = status.get(num)
             if not st:
@@ -1809,7 +1838,10 @@ def process_wb(files, token, out, log, progress, mode="check", confirm=lambda te
     for (cargo, prod, _, _), name, target, ids in plan:
         where = f" (в «{target['name']}»)" if target and target.get("name") != name else ""
         log(f"{'→' if mode != 'run' else '•'} {name} — {plural(len(ids), 'задание', 'задания', 'заданий')}{where}")
-    total = sum(len(ids) for *_, ids in plan)
+    for sid, ids in carry.items():
+        log(f"{'→' if mode != 'run' else '•'} {carry_sup[sid]['name']} — не уехало вчера "
+            f"{plural(len(ids), 'задание', 'задания', 'заданий')}, ШК скачается заново")
+    total = sum(len(ids) for *_, ids in plan) + sum(len(ids) for ids in carry.values())
     if failed:
         by_why = defaultdict(list)
         for art, num, why in failed:
@@ -1822,12 +1854,13 @@ def process_wb(files, token, out, log, progress, mode="check", confirm=lambda te
     if mode != "run":
         log(f"✔ ВСЕГО ШК БУДЕТ СКАЧАНО: {total}")
         return
-    if not plan:
+    if not plan and not carry:
         return
 
     # 5. Создание поставок и добавление заданий
     news = [name for _, name, target, _ in plan if target is None]
-    if not confirm(f"Добавить {plural(total, 'задание', 'задания', 'заданий')} в поставки WB"
+    added = sum(len(ids) for *_, ids in plan)
+    if plan and not confirm(f"Добавить {plural(added, 'задание', 'задания', 'заданий')} в поставки WB"
                    + (f" (новых поставок: {len(news)})" if news else "") + "?\n\n"
                    "Задания перейдут в статус «На сборке». Вернуть их в «Новые» потом нельзя."):
         log("Отменено — в WB ничего не изменено.")
@@ -1848,6 +1881,8 @@ def process_wb(files, token, out, log, progress, mode="check", confirm=lambda te
         touched.append(target)
         done += len(ids)
         progress(done, total)
+    # вчерашние поставки с не уехавшим: стикеры качаются заново (вчерашние ШК выкинули)
+    touched += [carry_sup[sid] for sid in carry if sid not in {t["id"] for t in touched}]
 
     # 6. Стикеры и листы подбора
     sticker_bad = _wb_download(token, touched, known_arts, out, day, log, progress)
@@ -2281,15 +2316,30 @@ def morning(cabinets, token, template, cdek, out, days, log, progress, today=Non
             log(f"✖ WB: {e}")
             sources.append(("WB", None, str(e)))
             new = None
+        left = {}
+        if new is not None:
+            try:  # не уехавшее вчера (лежит в неотгруженной поставке): снова в отчёт и «Сборку» (1.37)
+                left = wb_leftovers(token, day)
+            except (RuntimeError, requests.RequestException) as e:
+                log(f"⚠ WB: не получилось проверить вчерашние поставки — {e}")
         if new is not None:
             mgt, sgt, later = [], [], defaultdict(int)
-            for o in sorted(new.values(), key=lambda o: o.get("createdAt") or ""):
+            carried = defaultdict(int)
+            orders = [(o, sup) for o, sup in left.values()] + [(o, None) for o in new.values()]
+            for o, sup in sorted(orders, key=lambda x: (x[1] is None, x[0].get("createdAt") or "")):
                 wh = names.get(o.get("warehouseId")) or ""
                 row = [int(o["id"]), o.get("article", ""), wh or str(o.get("warehouseId") or "")]
                 # как в ручном отчёте: СГТ — это склад продавца «… СГТ» (фильтр «Склад продавца»);
-                # если WB не отдал название склада — по габариту задания
-                is_sgt = is_kgt(wh) if wh else o.get("cargoType") == 2
-                if is_sgt:
+                # если WB не отдал название склада — по габариту задания (у вчерашнего — по имени поставки)
+                parsed = wb_parse_name(sup["name"]) if sup else None
+                is_sgt = is_kgt(wh) if wh else (parsed[1] == "СГТ" if parsed else o.get("cargoType") == 2)
+                if sup is not None:
+                    carried[sup["name"]] += 1
+                    if is_sgt:   # вчерашнее едет сегодня: дата — сегодня, чтобы прошло фильтр сводной
+                        sgt.append(row + [f"{day:%d.%m.%Y}", 1])
+                    else:
+                        mgt.append(row + ["-", 1])
+                elif is_sgt:
                     d = o.get("sellerDate") or ""
                     try:
                         due = datetime.strptime(d, "%d.%m.%Y").date()
@@ -2313,6 +2363,9 @@ def morning(cabinets, token, template, cdek, out, days, log, progress, today=Non
                 data[key] = write_report(path, "Сборочные задания", hdr, rows, 4, "Сумма по полю к")
                 files[key] = path
             shk["wb"], shk["sgt"] = len(mgt), len(sgt)
+            for name, n in sorted(carried.items()):
+                log(f"● Не уехало вчера: «{name}» — {plural(n, 'задание', 'задания', 'заданий')} "
+                    f"снова в отчёте и «Сборке»")
             late = sum(1 for r in sgt if r[3] != f"{day:%d.%m.%Y}")
             log(f"✔ {'ВБ':<5} {plural(len(mgt), 'задание', 'задания', 'заданий')}")
             log(f"✔ {'СГТ':<5} {plural(len(sgt), 'задание', 'задания', 'заданий')}"

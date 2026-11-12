@@ -266,3 +266,64 @@ def test_timeout_on_wb_is_a_requests_error(wb, log, progress, tmp_path):
     rep = wb_report(tmp_path / "t.xlsx", [(1, "Zerkalo_50x130", MGT_WH, "-", 1)])
     with pytest.raises(requests.RequestException):
         b.process_wb([str(rep)], TOKEN, str(tmp_path / "o"), log, progress, mode="check", today=TODAY)
+
+
+# ---------------------------------------------------------------- не уехало вчера (1.37)
+
+def leftover(wb):
+    """Вчерашняя «МГТ учительская» не уехала: в ней одно задание, его ШК выкинули."""
+    wb.history["401"] = {"id": 401, "article": "Ambient warm 80 krug multi", "cargoType": 1, "warehouseId": 1,
+                         "createdAt": "2026-11-09T08:00:00Z"}
+    wb.status["401"] = ("confirm", "waiting")
+    wb.supply("WB-GI-OLD", "Поставка от 09.11.2026 МГТ учительская", orders=[401])
+
+
+def test_morning_puts_yesterdays_leftover_into_report_and_sborka(wb, tmp_path, log, progress, monkeypatch):
+    leftover(wb)
+    wb.order(501, "Zerkalo_50x130")
+    monkeypatch.setattr(b, "wb_warehouses", lambda token: {1: MGT_WH, 2: SGT_WH})
+    out = tmp_path / "Сборка"
+    files = b.morning({}, TOKEN, None, None, out, 14, log, progress, today=TODAY)
+    ws = openpyxl.load_workbook(files["wb"]).active
+    ids = [r[0] for r in ws.iter_rows(min_row=2, max_col=1, values_only=True) if r[0]]
+    assert ids == [401, 501]                       # вчерашнее — первым
+    assert "Не уехало вчера: «Поставка от 09.11.2026 МГТ учительская» — 1 задание" in log.text()
+    assert b.read_totals(files["wb"])["Ambient warm 80 krug multi"] == 1   # попадёт в «Сборку»
+    assert changed(wb) == []
+
+
+def test_leftover_in_report_is_not_failed_and_counted(wb, tmp_path, log, progress):
+    leftover(wb)
+    wb.order(501, "Zerkalo_50x130")
+    rep = wb_report(tmp_path / "ВБ.xlsx", [(401, "Ambient warm 80 krug multi", MGT_WH, "-", 1),
+                                           (501, "Zerkalo_50x130", MGT_WH, "-", 1)])
+    b.process_wb([str(rep)], TOKEN, str(tmp_path / "o"), log, progress, mode="check", today=TODAY)
+    text = log.text()
+    assert "Не поедут" not in text
+    assert "Поставка от 09.11.2026 МГТ учительская — не уехало вчера 1 задание, ШК скачается заново" in text
+    assert "ВСЕГО ШК БУДЕТ СКАЧАНО: 2" in text
+    assert changed(wb) == []
+
+
+def test_leftover_sticker_downloaded_again_in_run(wb, tmp_path, log, progress):
+    leftover(wb)
+    wb.order(501, "Zerkalo_50x130")
+    rep = wb_report(tmp_path / "ВБ.xlsx", [(401, "Ambient warm 80 krug multi", MGT_WH, "-", 1),
+                                           (501, "Zerkalo_50x130", MGT_WH, "-", 1)])
+    out = tmp_path / "o"
+    b.process_wb([str(rep)], TOKEN, str(out), log, progress, mode="run", today=TODAY)
+    assert (out / b.UCHITELSKAYA / "ШК Поставка от 09.11.2026 МГТ учительская.pdf").exists()
+    assert (out / b.KOMINTERNA / "ШК Поставка от 10.11.2026 МГТ коминтерна.pdf").exists()
+    assert "СКАЧАНО ШК: 2" in log.text()
+
+
+def test_only_leftovers_no_new_still_downloads(wb, tmp_path, log, progress):
+    leftover(wb)
+    rep = wb_report(tmp_path / "ВБ.xlsx", [(401, "Ambient warm 80 krug multi", MGT_WH, "-", 1)])
+    out = tmp_path / "o"
+    asked = []
+    b.process_wb([str(rep)], TOKEN, str(out), log, progress, mode="run", today=TODAY,
+                 confirm=lambda text: asked.append(text) or True)
+    assert not any("Добавить" in q for q in asked)          # добавлять нечего — не спрашиваем
+    assert (out / b.UCHITELSKAYA / "ШК Поставка от 09.11.2026 МГТ учительская.pdf").exists()
+    assert changed(wb) == []
