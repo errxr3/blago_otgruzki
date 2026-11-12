@@ -70,7 +70,7 @@ from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.pdfgen import canvas
 
 APP_NAME = "BLAGO OTGRUZKI"
-APP_VERSION = "1.39"  # при каждом обновлении +0.1, запись в CHANGELOG.md
+APP_VERSION = "1.40"  # при каждом обновлении +0.1, запись в CHANGELOG.md
 API = "https://api-seller.ozon.ru"
 BATCH = 20                   # максимум отправлений в одном запросе этикеток
 READY = "awaiting_deliver"   # статус, в котором Ozon отдаёт этикетку
@@ -171,7 +171,7 @@ class Report:
 
 COL_NUM = ("Номер отправления", "№ задания")
 COL_ART = ("Артикул", "Артикул продавца")
-COL_QTY = ("Количество", "к")
+COL_QTY = ("Количество", "к", "Кол-во", "кол-во")
 COL_TIME = ("Принят в обработку",)
 
 
@@ -2485,6 +2485,8 @@ CDEK_API = "https://api.cdek.ru/v2"
 CDEK = {"account": "", "secure": ""}
 COL_TASK = ("№ задания", "Номер задания", "Номер отправления ИМ")
 COL_TRACK = ("трэк", "трек", "Трэк", "Трек", "Номер заказа", "Номер заказа СДЭК")
+# Сколько зеркал на одной накладной (1.40): одна накладная — несколько одинаковых зеркал
+COL_CDEK_QTY = ("Количество", "количество", "Кол-во", "кол-во", "Кол во", "кол во", "Кол", "кол", "шт", "к")
 ACT_MONTHS = ("Января", "Февраля", "Марта", "Апреля", "Мая", "Июня", "Июля", "Августа", "Сентября",
               "Октября", "Ноября", "Декабря")
 
@@ -2499,7 +2501,8 @@ def _num(value):
 
 
 def read_cdek_orders(path):
-    """Заказы СДЭК из файла: [{task, article, track}] в порядке файла. Нет колонки «трэк» — пусто."""
+    """Заказы СДЭК из файла: [{task, article, track, qty}] в порядке файла. Нет колонки «трэк» — пусто.
+    qty — сколько зеркал на этой накладной (колонка «Количество» / «кол-во»; нет колонки — 1)."""
     wb = openpyxl.load_workbook(path, data_only=True, read_only=True)
     try:
         rows = wb.worksheets[0].iter_rows(values_only=True)
@@ -2509,6 +2512,7 @@ def read_cdek_orders(path):
             return []
         i_art = _find_col(header, COL_ART)
         i_task = _find_col(header, COL_TASK, required=False)
+        i_qty = _find_col(header, COL_CDEK_QTY, required=False)
         out = []
         for r in rows:
             art = str(r[i_art]).strip() if i_art < len(r) and r[i_art] is not None else ""
@@ -2516,10 +2520,20 @@ def read_cdek_orders(path):
             if not art or not track:
                 continue
             task = _num(r[i_task]) if i_task is not None and i_task < len(r) else ""
-            out.append({"task": task, "article": art, "track": track})
+            try:
+                qty = max(1, int(float(r[i_qty]))) if i_qty is not None and i_qty < len(r) and r[i_qty] else 1
+            except (TypeError, ValueError):
+                qty = 1
+            out.append({"task": task, "article": art, "track": track, "qty": qty})
         return out
+
     finally:
         wb.close()
+
+
+def pieces(orders):
+    """Сколько зеркал в заказах СДЭК (на одной накладной их может быть несколько)."""
+    return sum(o.get("qty", 1) for o in orders)
 
 
 def cdek_order(orders):
@@ -2631,21 +2645,21 @@ def write_cdek_sheet(path, orders):
     wb = openpyxl.Workbook()
     ws = wb.active
     ws.title = "Сборочные задания"
-    ws.append(["№ задания", "Артикул продавца", "трэк"])
+    ws.append(["№ задания", "Артикул продавца", "трэк", "Кол-во"])
     for o in orders:
-        ws.append([int(o["task"]) if o["task"].isdigit() else o["task"], o["article"], o["track"]])
+        ws.append([int(o["task"]) if o["task"].isdigit() else o["task"], o["article"], o["track"], o.get("qty", 1)])
     counts = defaultdict(int)
     for o in orders:
-        counts[o["article"]] += 1
-    ws["E1"], ws["F1"] = "Артикул", "Количество"
+        counts[o["article"]] += o.get("qty", 1)
+    ws["F1"], ws["G1"] = "Артикул", "Количество"
     for i, (art, n) in enumerate(sorted(counts.items(), key=lambda x: x[0].casefold(), reverse=True), start=2):
-        ws.cell(row=i, column=5, value=art)
-        ws.cell(row=i, column=6, value=n)
-    ws.cell(row=len(counts) + 2, column=5, value="Итого")
-    ws.cell(row=len(counts) + 2, column=6, value=len(orders))
-    for cell in (*ws[1], ws.cell(row=len(counts) + 2, column=5), ws.cell(row=len(counts) + 2, column=6)):
+        ws.cell(row=i, column=6, value=art)
+        ws.cell(row=i, column=7, value=n)
+    ws.cell(row=len(counts) + 2, column=6, value="Итого")
+    ws.cell(row=len(counts) + 2, column=7, value=pieces(orders))
+    for cell in (*ws[1], ws.cell(row=len(counts) + 2, column=6), ws.cell(row=len(counts) + 2, column=7)):
         cell.font = openpyxl.styles.Font(bold=True)
-    for col, width in (("A", 14), ("B", 32), ("C", 14), ("E", 32), ("F", 12)):
+    for col, width in (("A", 14), ("B", 32), ("C", 14), ("D", 8), ("F", 32), ("G", 12)):
         ws.column_dimensions[col].width = width
     wb.save(path)
 
@@ -2870,17 +2884,23 @@ def _set_text(xml, value):
     return re.sub(_WT, put, xml)
 
 
-def _set_numbers(xml, value):
-    """«Принято: 16 накладная; мест: 16.» — числа (жирные, крупные) меняются, слова остаются."""
+def _set_numbers(xml, value, *more):
+    """«Принято: 16 накладная; мест: 16.» — числа (жирные, крупные) меняются, слова остаются.
+    Первое число — value, следующие — more по порядку (нет — то же value): накладных и мест (1.40)."""
     import re
-    state = {"prev_digit": False}
+    values = [value, *more]
+    state = {"prev_digit": False, "n": 0}
 
     def put(m):
         digits = m.group(2).strip().isdigit()
         if not digits:
             state["prev_digit"] = False
             return m.group(0)
-        text = "" if state["prev_digit"] else str(value)
+        if state["prev_digit"]:
+            text = ""
+        else:
+            text = str(values[min(state["n"], len(values) - 1)])
+            state["n"] += 1
         state["prev_digit"] = True
         return m.group(1) + text + m.group(3)
     return re.sub(_WT, put, xml)
@@ -2908,7 +2928,7 @@ def write_cdek_act(path, orders, day):
     def row(n, o):
         cells = re.findall(r"<w:tc>.*?</w:tc>", tmpl, flags=re.S)
         out = tmpl
-        for cell, value in zip(cells, (n, o["track"], o["task"], 1)):
+        for cell, value in zip(cells, (n, o["track"], o["task"], o.get("qty", 1))):
             out = out.replace(cell, _set_text(cell, value), 1)
         return out
     body = "".join(row(n, o) for n, o in enumerate(orders, start=1))
@@ -2927,7 +2947,7 @@ def write_cdek_act(path, orders, day):
         if "«" in text and "г." in text:
             return _set_text(p, f"от «{day.day}» {ACT_MONTHS[day.month - 1]} {day.year} г.")
         if text.strip().startswith("Принято"):
-            return _set_numbers(p, len(orders))
+            return _set_numbers(p, len(orders), pieces(orders))   # накладных, мест (зеркал)
         return p
     x = re.sub(r"<w:p[ >].*?</w:p>", lambda m: fix_para(m.group(0)), x, flags=re.S)
     parts["word/document.xml"] = x.encode("utf-8")
@@ -3019,16 +3039,20 @@ def make_cdek(orders, out, log, today=None):
         folder.mkdir(parents=True, exist_ok=True)
         write_cdek_sheet(folder / f"СДЭК сборка {day:%d.%m}.xlsx", group)
         write_cdek_act(folder / f"СДЭК акт {day:%d.%m}.docx", group, day)
-        line = f"✔ {prod}: {len(group)} заказов — лист сборки и акт"
+        line = (f"✔ {prod}: {len(group)} заказов, {pieces(group)} шт. — лист сборки и акт"
+                if pieces(group) != len(group) else f"✔ {prod}: {len(group)} заказов — лист сборки и акт")
         if pages:
             writer, got = PdfWriter(), 0
             for o in group:
                 found = pages.get(o["track"]) or []
                 if not found:
                     missing.append(o)
-                for page in found:
-                    writer.add_page(page)
-                got += bool(found)
+                    continue
+                # ШК на каждое зеркало: СДЭК дал по месту — берём их; мест меньше, чем зеркал, — повторяем
+                need = max(o.get("qty", 1), len(found))
+                for k in range(need):
+                    writer.add_page(found[k % len(found)])
+                got += need
             if got:
                 with open(folder / f"СДЭК ШК {day:%d.%m}.pdf", "wb") as f:
                     writer.write(f)
@@ -3040,15 +3064,15 @@ def make_cdek(orders, out, log, today=None):
     elif not cdek_on():
         log("⚠ ШК СДЭК не сделаны: впиши ключи в «Настройки → СДЭК»")
     if sklad_on():
-        lines = [{"market": "cdek", "channel": "СДЭК", "posting": o["track"], "article": o["article"], "qty": 1,
-                  "production": production_of(o["article"])} for o in orders]
+        lines = [{"market": "cdek", "channel": "СДЭК", "posting": o["track"], "article": o["article"],
+                  "qty": o.get("qty", 1), "production": production_of(o["article"])} for o in orders]
         morning_hold(day, lines, ["cdek"], [("СДЭК", len(lines), "")], log, title="СДЭК")
         # Партия: грузчик пикает штрихкод СДЭК ([CDK]номер) и нашу этикетку — склад сверяет артикул
         sklad_send_batch(day, "cdek", "СДЭК", "", "СДЭК", [
             {"posting": o["track"], "origin": o["task"] or o["track"], "article": o["article"],
              "production": production_of(o["article"]),
              "codes": [f"[CDK]{o['track']}", o["track"]] + ([f"[ITM]{itm[o['track']]}"] if o["track"] in itm else [])}
-            for o in orders], log)
+            for o in orders for _ in range(o.get("qty", 1))], log)   # одна строка на зеркало
     return out
 
 
@@ -4167,23 +4191,25 @@ class App(tk.Tk):
                     if mine:
                         arts = defaultdict(int)
                         for o in mine:
-                            arts[o["article"]] += 1
-                        log(f"✔ {prod}: едут {len(mine)}")
+                            arts[o["article"]] += o.get("qty", 1)
+                        many = pieces(mine) != len(mine)
+                        log(f"✔ {prod}: едут {pieces(mine)} шт." + (f" ({len(mine)} заказов)" if many else ""))
                         for art, n in sorted(arts.items(), key=lambda x: x[0].casefold(), reverse=True):
                             log(f"│   {art} — {n}")
                 if stopped:
                     log(f"⛔ Не едут (покраска): {len(stopped)}")
                 if not cdek_on():
                     log("⚠ Ключей СДЭК нет — заказы в СДЭК не проверены и ШК не скачаются")
-                    text, color = f"Едут {len(orders)}, не едут {len(stopped)} · без проверки в СДЭК", C["warn"]
+                    text, color = f"Едут {pieces(orders)} шт., не едут {len(stopped)} · без проверки в СДЭК", C["warn"]
                 else:
-                    log(f"… проверяю в СДЭК {len(orders)} заказов")
+                    log(f"… проверяю в СДЭК {len(orders)} заказов ({pieces(orders)} шт.)")
                     bad = cdek_check(orders, log)
                     if bad:
                         text, color = f"⚠ Едут {len(orders)}, в СДЭК проблем: {bad} — смотри журнал", C["err"]
                     else:
                         log(f"✔ В СДЭК все {len(orders)} заказов найдены и «Созданы»")
-                        text, color = f"✔ Едут {len(orders)}, не едут {len(stopped)} · в СДЭК всё в порядке", C["ok"]
+                        text, color = (f"✔ Едут {pieces(orders)} шт., не едут {len(stopped)} · в СДЭК всё в порядке",
+                                       C["ok"])
                 self.q.put(("status", self.cdek_done, text, color))
             except (RuntimeError, requests.RequestException) as e:
                 log(f"✖ СДЭК: {e}")
