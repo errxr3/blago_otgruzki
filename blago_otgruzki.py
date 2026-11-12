@@ -70,7 +70,7 @@ from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.pdfgen import canvas
 
 APP_NAME = "BLAGO OTGRUZKI"
-APP_VERSION = "1.42"  # при каждом обновлении +0.1, запись в CHANGELOG.md
+APP_VERSION = "1.43"  # при каждом обновлении +0.1, запись в CHANGELOG.md
 API = "https://api-seller.ozon.ru"
 BATCH = 20                   # максимум отправлений в одном запросе этикеток
 READY = "awaiting_deliver"   # статус, в котором Ozon отдаёт этикетку
@@ -3685,12 +3685,34 @@ def today_msk():
     return datetime.now(MSK).date()
 
 
+def enable_dpi_awareness():
+    """Windows: программа сама рисует себя в полном разрешении экрана (1.43).
+
+    Без этого на мониторе 2K/4K с масштабом 125–150 % Windows растягивает окно как картинку — оно мыльное.
+    """
+    if sys.platform != "win32":
+        return
+    import ctypes
+    try:
+        ctypes.windll.shcore.SetProcessDpiAwareness(1)   # чётко на основном мониторе (Windows 8.1+)
+    except (AttributeError, OSError):
+        try:
+            ctypes.windll.user32.SetProcessDPIAware()      # Windows 7
+        except (AttributeError, OSError):
+            pass
+
+
 class App(tk.Tk):
     def __init__(self):
+        enable_dpi_awareness()   # до создания окна, иначе Windows уже решила растягивать
         super().__init__()
         self.title(APP_NAME)
-        self.geometry("1060x920")
-        self.minsize(960, 760)
+        # Масштаб экрана: 1.0 — 100 %, 1.5 — 150 %. Шрифты Tk растут сами, размеры окна в точках — по нему
+        self.ui = min(max(self.winfo_fpixels("1i") / 96, 1.0), 3.0)
+        sw, sh = self.winfo_screenwidth(), self.winfo_screenheight()
+        w, h = min(int(1060 * self.ui), sw - 40), min(int(920 * self.ui), sh - 80)
+        self.geometry(f"{w}x{h}")
+        self.minsize(min(int(960 * self.ui), w), min(int(760 * self.ui), h))
         self.configure(bg=C["bg"])
         self.q = queue.Queue()
         self.busy = False
@@ -3726,7 +3748,7 @@ class App(tk.Tk):
         self.show_keys = tk.BooleanVar(value=False)
 
         # --- боковая панель: логотип, разделы, дата
-        side = tk.Frame(self, bg=C["side"], width=220)
+        side = tk.Frame(self, bg=C["side"], width=int(220 * self.ui))
         side.pack(side="left", fill="y")
         side.pack_propagate(False)
         tk.Frame(self, bg=C["line"], width=1).pack(side="left", fill="y")   # граница меню, как на сайте
