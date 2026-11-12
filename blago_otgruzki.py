@@ -70,7 +70,7 @@ from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.pdfgen import canvas
 
 APP_NAME = "BLAGO OTGRUZKI"
-APP_VERSION = "1.37"  # при каждом обновлении +0.1, запись в CHANGELOG.md
+APP_VERSION = "1.38"  # при каждом обновлении +0.1, запись в CHANGELOG.md
 API = "https://api-seller.ozon.ru"
 BATCH = 20                   # максимум отправлений в одном запросе этикеток
 READY = "awaiting_deliver"   # статус, в котором Ozon отдаёт этикетку
@@ -1447,6 +1447,11 @@ def wb_create_supply(token, name):
     return r.json()["id"]
 
 
+def wb_delete_supply(token, supply_id):
+    """Удалить поставку. WB удаляет только пустую поставку, не переданную в доставку."""
+    wb_ok(wb_call("DELETE", f"/api/v3/supplies/{supply_id}", token), 200, 204)
+
+
 def wb_add_orders(token, supply_id, ids):
     """Добавляет задания в поставку по 100. Возвращает [(id, ошибка)] для не добавленных."""
     bad = []
@@ -1785,7 +1790,9 @@ def process_wb(files, token, out, log, progress, mode="check", confirm=lambda te
             if not groups[key]:
                 del groups[key]
 
-    # 4. Поставки: сегодняшние с таким именем берём как есть, вчерашние неотгруженные — спрашиваем
+    # 4. Поставки на сегодня. Не уехавшее вчера переносится в сегодняшнюю поставку своего вида —
+    #    производство по артикулу (Zerkalo, Alum — коминтерна, остальное — учительская), даже если
+    #    вчера оно лежало не в той; пустая вчерашняя поставка удаляется (1.38)
     open_sup = wb_open_supplies(token)
     by_kind = defaultdict(list)
     for s in open_sup:
@@ -1795,53 +1802,47 @@ def process_wb(files, token, out, log, progress, mode="check", confirm=lambda te
     multi_wh = defaultdict(set)
     for cargo, prod, wh, b2b in groups:
         multi_wh[(cargo, prod, b2b)].add(wh)
+    moves = defaultdict(list)   # (габарит, производство, юрлицо) -> [(id, вчерашняя поставка)]
+    for sid, ids in carry.items():
+        old = carry_sup[sid]
+        parsed = wb_parse_name(old["name"])
+        for i in ids:
+            moves[(parsed[1], production_of(next(iter(postings[i]))), parsed[3])].append((i, old))
+    for kind in moves:   # вид, которого сегодня нет среди новых заданий, — всё равно своя поставка
+        if not any(k[0] == kind[0] and k[1] == kind[1] and k[3] == kind[2] for k in groups):
+            groups[(kind[0], kind[1], None, kind[2])] = []
 
-    plan = []  # (ключ группы, имя, поставка | None, [id])
+    plan = []  # (ключ группы, имя, поставка | None, [id], [(id, откуда) — перенос вчерашнего])
     known_arts = dict(new)
+    given = set()
     for key in sorted(groups, key=lambda k: (k[3], k[0], PRODUCTIONS.index(k[1]) if k[1] in PRODUCTIONS else 9)):
         cargo, prod, wh, b2b = key
         kind = (cargo, prod, b2b)
-        ids = groups[key]
         name = wb_supply_name(day, cargo, prod, b2b)
         if len(multi_wh[kind]) > 1:
             name += f" склад {wh}"
         same = [s for d, s in by_kind.get(kind, []) if d == day and s.get("name") == name]
-        older = sorted(((d, s) for d, s in by_kind.get(kind, []) if d < day),
-                       key=lambda x: x[0], reverse=True)
-        target = same[0] if same else None
-        if target is None and len(multi_wh[kind]) == 1:
-            for d, s in older:
-                inside = wb_supply_orders(token, s["id"])
-                arts = wb_articles(token, inside, known_arts)
-                cnt = defaultdict(int)
-                for i in inside:
-                    cnt[arts.get(i, "?")] += 1
-                log("")
-                log(f"⚠ Не отгружена вчерашняя «{s['name']}» — в ней {len(inside)} шт.:")
-                for a, n in sorted(cnt.items()):
-                    log(f"│     {a} — {n}")
-                if mode != "run":
-                    target = None
-                    break
-                lines = "\n".join(f"   {a} — {n}" for a, n in sorted(cnt.items())) or "   (пустая)"
-                if confirm(f"Есть неотгруженная поставка:\n«{s['name']}»\n\nВ ней уже лежит:\n{lines}\n\n"
-                           f"Проверь, что эти зеркала есть.\n\n"
-                           f"Добавить в неё сегодняшние {len(ids)} заданий ({name[len('Поставка от 00.00.0000 '):]})?\n\n"
-                           f"Да — добавить в эту поставку\nНет — создать новую «{name}»"):
-                    target = s
-                    log("│ → сегодняшние задания добавятся в неё")
-                    break
-                log("│ → будет новая поставка за сегодня")
-        plan.append((key, name, target, ids))
+        move = moves.get(kind, []) if kind not in given else []
+        given.add(kind)
+        plan.append((key, name, same[0] if same else None, groups[key], move))
 
     log("")
-    for (cargo, prod, _, _), name, target, ids in plan:
-        where = f" (в «{target['name']}»)" if target and target.get("name") != name else ""
-        log(f"{'→' if mode != 'run' else '•'} {name} — {plural(len(ids), 'задание', 'задания', 'заданий')}{where}")
-    for sid, ids in carry.items():
-        log(f"{'→' if mode != 'run' else '•'} {carry_sup[sid]['name']} — не уехало вчера "
-            f"{plural(len(ids), 'задание', 'задания', 'заданий')}, ШК скачается заново")
-    total = sum(len(ids) for *_, ids in plan) + sum(len(ids) for ids in carry.values())
+    for (cargo, prod, _, _), name, target, ids, move in plan:
+        line = f"{'→' if mode != 'run' else '•'} {name} — {plural(len(ids), 'задание', 'задания', 'заданий')}"
+        if move:
+            line += f" + не уехало вчера {len(move)}"
+        log(line)
+    for old in {o["id"]: o for _, m in moves.items() for _, o in m}.values():
+        inside = [i for k, m in moves.items() for i, o in m if o["id"] == old["id"]]
+        log(f"⚠ Не отгружена «{old['name']}» — {plural(len(inside), 'задание', 'задания', 'заданий')} "
+            f"перенесутся в сегодняшние поставки:")
+        for kind, m in moves.items():
+            for i, o in m:
+                if o["id"] == old["id"]:
+                    target = wb_supply_name(day, *kind)
+                    moved = "" if o["name"].endswith(target[len("Поставка от 00.00.0000"):]) else "  ← другое производство"
+                    log(f"│     {i}  {next(iter(postings[i]))}  →  {target}{moved}")
+    total = sum(len(ids) + len(move) for *_, ids, move in plan)
     if failed:
         by_why = defaultdict(list)
         for art, num, why in failed:
@@ -1854,23 +1855,37 @@ def process_wb(files, token, out, log, progress, mode="check", confirm=lambda te
     if mode != "run":
         log(f"✔ ВСЕГО ШК БУДЕТ СКАЧАНО: {total}")
         return
-    if not plan and not carry:
+    if not plan:
         return
 
-    # 5. Создание поставок и добавление заданий
-    news = [name for _, name, target, _ in plan if target is None]
-    added = sum(len(ids) for *_, ids in plan)
-    if plan and not confirm(f"Добавить {plural(added, 'задание', 'задания', 'заданий')} в поставки WB"
-                   + (f" (новых поставок: {len(news)})" if news else "") + "?\n\n"
-                   "Задания перейдут в статус «На сборке». Вернуть их в «Новые» потом нельзя."):
+    # 5. Создание поставок, добавление сегодняшних заданий и перенос вчерашних
+    move_all = sum(len(move) for *_, move in plan)
+    do_move = True
+    if move_all:
+        lines = "\n".join(f"   {i}  {next(iter(postings[i]))} → {name[len('Поставка от '):]}"
+                          for _, name, _, _, move in plan for i, _ in move)
+        do_move = confirm(f"Не уехало вчера: {plural(move_all, 'задание', 'задания', 'заданий')}.\n\n{lines}\n\n"
+                          f"Да — перенести в сегодняшние поставки (вчерашняя, если опустеет, удалится)\n"
+                          f"Нет — оставить во вчерашних (их ШК тоже скачаются, сдать в WB нужно все поставки)")
+        log("→ вчерашние задания переносятся в сегодняшние поставки" if do_move
+            else "→ вчерашние задания остаются во вчерашних поставках")
+    news = [name for _, name, target, ids, move in plan if target is None and (ids or (move and do_move))]
+    added = sum(len(ids) for *_, ids, _ in plan)
+    if added and not confirm(f"Добавить {plural(added, 'задание', 'задания', 'заданий')} в поставки WB"
+                             + (f" (новых поставок: {len(news)})" if news else "") + "?\n\n"
+                             "Задания перейдут в статус «На сборке». Вернуть их в «Новые» потом нельзя."):
         log("Отменено — в WB ничего не изменено.")
         return
-    touched, done = [], 0
-    for (cargo, prod, _, _), name, target, ids in plan:
+    touched, done, olds = [], 0, {}
+    for (cargo, prod, _, _), name, target, ids, move in plan:
+        move_ids = [i for i, _ in move] if do_move else []
+        olds.update((o["id"], o) for _, o in move)
+        if not ids and not move_ids:
+            continue
         try:
             if target is None:
                 target = {"id": wb_create_supply(token, name), "name": name}
-            bad = wb_add_orders(token, target["id"], ids)
+            bad = wb_add_orders(token, target["id"], ids) if ids else []
         except (RuntimeError, requests.RequestException) as e:
             log(f"✖ {name}: {e}")
             failed += [(next(iter(postings[i])), i, f"не добавлено: {e}") for i in ids]
@@ -1878,11 +1893,34 @@ def process_wb(files, token, out, log, progress, mode="check", confirm=lambda te
         failed += [(next(iter(postings[i])), i, f"не добавлено: {err}") for i, err in bad]
         for i, err in bad:
             log(f"✖ Не добавлено {i}  {next(iter(postings[i]))} — {err}")
+        if move_ids:
+            try:
+                not_moved = wb_add_orders(token, target["id"], move_ids)
+            except (RuntimeError, requests.RequestException) as e:
+                not_moved = [(i, str(e)) for i in move_ids]
+            for i, err in not_moved:
+                log(f"⚠ Не перенесено {i}  {next(iter(postings[i]))} — {err}. Осталось во вчерашней поставке")
+            if len(not_moved) < len(move_ids):
+                log(f"✔ Перенесено в «{name}»: {len(move_ids) - len(not_moved)}")
         touched.append(target)
-        done += len(ids)
+        done += len(ids) + len(move_ids)
         progress(done, total)
-    # вчерашние поставки с не уехавшим: стикеры качаются заново (вчерашние ШК выкинули)
-    touched += [carry_sup[sid] for sid in carry if sid not in {t["id"] for t in touched}]
+    # вчерашние поставки: опустели — удаляем; не опустели — их стикеры тоже качаем (ШК выкинули)
+    for old in olds.values():
+        try:
+            left_inside = wb_supply_orders(token, old["id"])
+        except (RuntimeError, requests.RequestException) as e:
+            log(f"⚠ «{old['name']}»: не проверить, что внутри — {e}")
+            left_inside = ["?"]
+        if left_inside:
+            if old["id"] not in {t["id"] for t in touched}:
+                touched.append(old)
+            continue
+        try:
+            wb_delete_supply(token, old["id"])
+            log(f"✔ Пустая «{old['name']}» удалена")
+        except (RuntimeError, requests.RequestException) as e:
+            log(f"⚠ Пустую «{old['name']}» удалить не получилось — {e}. Удали в кабинете WB")
 
     # 6. Стикеры и листы подбора
     sticker_bad = _wb_download(token, touched, known_arts, out, day, log, progress)

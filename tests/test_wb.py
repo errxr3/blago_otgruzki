@@ -128,45 +128,6 @@ def test_new_orders_later_same_day_go_into_todays_supply(shop, log, progress, tm
     assert sorted(mgt["orders"]) == ["501", "505", "507"]
 
 
-def yesterday(wb):
-    wb.history["401"] = {"id": 401, "article": "Zerkalo_60x160"}
-    wb.history["402"] = {"id": 402, "article": "Zerkalo_60x160"}
-    wb.history["403"] = {"id": 403, "article": "Alum rama 170x70"}
-    wb.supply("WB-GI-OLD", "Поставка от 09.11.2026 МГТ коминтерна", orders=[401, 402, 403])
-
-
-def test_yesterdays_open_supply_warns_with_articles_in_check(shop, log, progress):
-    wb = shop[0]
-    yesterday(wb)
-    run(shop, log, progress, mode="check")
-    text = log.text()
-    assert "Не отгружена вчерашняя «Поставка от 09.11.2026 МГТ коминтерна» — в ней 3 шт." in text
-    assert "Zerkalo_60x160 — 2" in text and "Alum rama 170x70 — 1" in text
-    assert changed(wb) == []
-
-
-def test_yesterdays_supply_question_yes_adds_there(shop, log, progress):
-    wb = shop[0]
-    yesterday(wb)
-    asked = []
-    run(shop, log, progress, confirm=lambda text: asked.append(text) or True)
-    question = next(q for q in asked if "неотгруженная поставка" in q)
-    assert "Поставка от 09.11.2026 МГТ коминтерна" in question
-    assert "Zerkalo_60x160 — 2" in question and "Добавить в неё сегодняшние 2 заданий" in question
-    old = next(s for s in wb.supplies if s["id"] == "WB-GI-OLD")
-    assert sorted(old["orders"]) == ["401", "402", "403", "501", "505"]
-    assert "Поставка от 10.11.2026 МГТ коминтерна" not in [s["name"] for s in wb.supplies]
-
-
-def test_yesterdays_supply_question_no_makes_new(shop, log, progress):
-    wb = shop[0]
-    yesterday(wb)
-    run(shop, log, progress, confirm=lambda text: "неотгруженная поставка" not in text)
-    old = next(s for s in wb.supplies if s["id"] == "WB-GI-OLD")
-    assert old["orders"] == ["401", "402", "403"]
-    assert "Поставка от 10.11.2026 МГТ коминтерна" in [s["name"] for s in wb.supplies]
-
-
 def test_final_no_changes_nothing(shop, log, progress):
     wb = shop[0]
     run(shop, log, progress, confirm=lambda text: False)
@@ -300,30 +261,78 @@ def test_leftover_in_report_is_not_failed_and_counted(wb, tmp_path, log, progres
     b.process_wb([str(rep)], TOKEN, str(tmp_path / "o"), log, progress, mode="check", today=TODAY)
     text = log.text()
     assert "Не поедут" not in text
-    assert "Поставка от 09.11.2026 МГТ учительская — не уехало вчера 1 задание, ШК скачается заново" in text
+    assert "Поставка от 10.11.2026 МГТ учительская — 0 заданий + не уехало вчера 1" in text
+    assert "401  Ambient warm 80 krug multi  →  Поставка от 10.11.2026 МГТ учительская" in text
     assert "ВСЕГО ШК БУДЕТ СКАЧАНО: 2" in text
     assert changed(wb) == []
 
 
-def test_leftover_sticker_downloaded_again_in_run(wb, tmp_path, log, progress):
+def test_leftover_moved_to_todays_supply_and_old_deleted(wb, tmp_path, log, progress):
+    leftover(wb)
+    wb.order(501, "Zerkalo_50x130")
+    wb.order(502, "Ambient 80 krug")
+    rep = wb_report(tmp_path / "ВБ.xlsx", [(401, "Ambient warm 80 krug multi", MGT_WH, "-", 1),
+                                           (501, "Zerkalo_50x130", MGT_WH, "-", 1),
+                                           (502, "Ambient 80 krug", MGT_WH, "-", 1)])
+    out = tmp_path / "o"
+    asked = []
+    b.process_wb([str(rep)], TOKEN, str(out), log, progress, mode="run", today=TODAY,
+                 confirm=lambda text: asked.append(text) or True)
+    assert any("Не уехало вчера: 1 задание" in q and "401" in q for q in asked)
+    by_name = {s["name"]: sorted(s["orders"]) for s in wb.supplies}
+    assert by_name == {"Поставка от 10.11.2026 МГТ коминтерна": ["501"],
+                       "Поставка от 10.11.2026 МГТ учительская": ["401", "502"]}   # вчерашняя удалена
+    assert "Пустая «Поставка от 09.11.2026 МГТ учительская» удалена" in log.text()
+    pdf = PdfReader(str(out / b.UCHITELSKAYA / "ШК Поставка от 10.11.2026 МГТ учительская.pdf"))
+    assert len(pdf.pages) == 2
+    assert "СКАЧАНО ШК: 3" in log.text()
+
+
+def test_leftover_goes_by_article_not_by_old_supply(wb, tmp_path, log, progress):
+    """Вчера Zerkalo по ошибке лежало в «учительская» — переносится в «коминтерна»."""
+    wb.history["402"] = {"id": 402, "article": "Zerkalo_60x160", "cargoType": 1, "warehouseId": 1}
+    wb.status["402"] = ("confirm", "waiting")
+    wb.supply("WB-GI-OLD", "Поставка от 09.11.2026 МГТ учительская", orders=[402])
+    rep = wb_report(tmp_path / "ВБ.xlsx", [(402, "Zerkalo_60x160", MGT_WH, "-", 1)])
+    b.process_wb([str(rep)], TOKEN, str(tmp_path / "c"), log, progress, mode="check", today=TODAY)
+    assert "402  Zerkalo_60x160  →  Поставка от 10.11.2026 МГТ коминтерна  ← другое производство" in log.text()
+    b.process_wb([str(rep)], TOKEN, str(tmp_path / "o"), log, progress, mode="run", today=TODAY)
+    assert [(s["name"], s["orders"]) for s in wb.supplies] == [("Поставка от 10.11.2026 МГТ коминтерна", ["402"])]
+
+
+def test_leftover_answer_no_keeps_old_supply_and_downloads_it(wb, tmp_path, log, progress):
     leftover(wb)
     wb.order(501, "Zerkalo_50x130")
     rep = wb_report(tmp_path / "ВБ.xlsx", [(401, "Ambient warm 80 krug multi", MGT_WH, "-", 1),
                                            (501, "Zerkalo_50x130", MGT_WH, "-", 1)])
     out = tmp_path / "o"
-    b.process_wb([str(rep)], TOKEN, str(out), log, progress, mode="run", today=TODAY)
+    b.process_wb([str(rep)], TOKEN, str(out), log, progress, mode="run", today=TODAY,
+                 confirm=lambda text: "Не уехало вчера" not in text)
+    names = sorted(s["name"] for s in wb.supplies)
+    assert names == ["Поставка от 09.11.2026 МГТ учительская", "Поставка от 10.11.2026 МГТ коминтерна"]
     assert (out / b.UCHITELSKAYA / "ШК Поставка от 09.11.2026 МГТ учительская.pdf").exists()
-    assert (out / b.KOMINTERNA / "ШК Поставка от 10.11.2026 МГТ коминтерна.pdf").exists()
     assert "СКАЧАНО ШК: 2" in log.text()
 
 
-def test_only_leftovers_no_new_still_downloads(wb, tmp_path, log, progress):
+def test_move_refused_by_wb_keeps_old_and_downloads(wb, tmp_path, log, progress):
+    leftover(wb)
+    wb.no_move.add("401")
+    rep = wb_report(tmp_path / "ВБ.xlsx", [(401, "Ambient warm 80 krug multi", MGT_WH, "-", 1)])
+    out = tmp_path / "o"
+    b.process_wb([str(rep)], TOKEN, str(out), log, progress, mode="run", today=TODAY)
+    text = log.text()
+    assert "Не перенесено 401" in text and "Осталось во вчерашней поставке" in text
+    assert any(s["name"] == "Поставка от 09.11.2026 МГТ учительская" for s in wb.supplies)
+    assert (out / b.UCHITELSKAYA / "ШК Поставка от 09.11.2026 МГТ учительская.pdf").exists()
+
+
+def test_only_leftovers_no_new_moves_without_adding_question(wb, tmp_path, log, progress):
     leftover(wb)
     rep = wb_report(tmp_path / "ВБ.xlsx", [(401, "Ambient warm 80 krug multi", MGT_WH, "-", 1)])
     out = tmp_path / "o"
     asked = []
     b.process_wb([str(rep)], TOKEN, str(out), log, progress, mode="run", today=TODAY,
                  confirm=lambda text: asked.append(text) or True)
-    assert not any("Добавить" in q for q in asked)          # добавлять нечего — не спрашиваем
-    assert (out / b.UCHITELSKAYA / "ШК Поставка от 09.11.2026 МГТ учительская.pdf").exists()
-    assert changed(wb) == []
+    assert not any(q.startswith("Добавить") for q in asked)   # новых нет — не спрашиваем про добавление
+    assert [(s["name"], s["orders"]) for s in wb.supplies] == [("Поставка от 10.11.2026 МГТ учительская", ["401"])]
+    assert (out / b.UCHITELSKAYA / "ШК Поставка от 10.11.2026 МГТ учительская.pdf").exists()

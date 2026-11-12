@@ -218,6 +218,7 @@ class FakeWB:
         self.fail = {}       # (метод, путь) -> (код, тело) | исключение | список ответов по очереди
         self.bad_sticker = set()   # id с битой картинкой
         self.history = {}    # id -> задание (для поиска артикула старых заданий)
+        self.no_move = set()  # id, которые WB не даёт перенести в другую поставку
         base = r"https://marketplace-api\.wildberries\.ru"
         for method in (responses.GET, responses.POST, responses.PATCH, responses.PUT, responses.DELETE):
             mock.add_callback(method, re.compile(base + r"/.*"), callback=self._handle)
@@ -265,10 +266,23 @@ class FakeWB:
             for i in body["orders"]:
                 order = self.new.pop(str(i), None)
                 if order is None:
-                    return 409, {}, json.dumps({"message": "задание не новое"})
+                    # перенос из другой незакрытой поставки
+                    source = next((s for s in self.supplies if str(i) in s["orders"] and not s["done"]), None)
+                    if source is None or str(i) in self.no_move:
+                        return 409, {}, json.dumps({"message": "задание нельзя перенести"})
+                    source["orders"].remove(str(i))
+                    target["orders"].append(str(i))
+                    continue
                 self.history[str(i)] = order
                 self.status[str(i)] = ("confirm", "waiting")
                 target["orders"].append(str(i))
+            return 204, {}, ""
+        m = re.fullmatch(r"/api/v3/supplies/([^/]+)", path)
+        if request.method == "DELETE" and m:
+            target = next(s for s in self.supplies if s["id"] == m.group(1))
+            if target["orders"]:
+                return 409, {}, json.dumps({"message": "поставка не пустая"})
+            self.supplies.remove(target)
             return 204, {}, ""
         m = re.fullmatch(r"/api/marketplace/v3/supplies/([^/]+)/order-ids", path)
         if request.method == "GET" and m:
