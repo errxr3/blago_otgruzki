@@ -336,3 +336,26 @@ def test_only_leftovers_no_new_moves_without_adding_question(wb, tmp_path, log, 
     assert not any(q.startswith("Добавить") for q in asked)   # новых нет — не спрашиваем про добавление
     assert [(s["name"], s["orders"]) for s in wb.supplies] == [("Поставка от 10.11.2026 МГТ учительская", ["401"])]
     assert (out / b.UCHITELSKAYA / "ШК Поставка от 10.11.2026 МГТ учительская.pdf").exists()
+
+
+def test_leftover_not_in_report_is_shown_and_moved(wb, tmp_path, log, progress):
+    """Отчёт сделан старой версией: вчерашнего в нём нет — всё равно видно и переносится (1.39)."""
+    leftover(wb)
+    wb.order(501, "Zerkalo_50x130")
+    rep = wb_report(tmp_path / "ВБ.xlsx", [(501, "Zerkalo_50x130", MGT_WH, "-", 1)])
+    b.process_wb([str(rep)], TOKEN, str(tmp_path / "c"), log, progress, mode="check", today=TODAY)
+    text = log.text()
+    assert "Не уехало вчера, а в отчёте нет: 1 задание" in text
+    assert "401  Ambient warm 80 krug multi  (было в «Поставка от 09.11.2026 МГТ учительская»)" in text
+    assert "Поставка от 10.11.2026 МГТ учительская — 0 заданий + не уехало вчера 1" in text
+    assert "ВСЕГО ШК БУДЕТ СКАЧАНО: 2" in text
+    b.process_wb([str(rep)], TOKEN, str(tmp_path / "o"), log, progress, mode="run", today=TODAY)
+    assert {s["name"]: s["orders"] for s in wb.supplies}["Поставка от 10.11.2026 МГТ учительская"] == ["401"]
+
+
+def test_leftover_painted_red_is_left_alone(wb, tmp_path, log, progress):
+    leftover(wb)
+    rep = wb_report(tmp_path / "ВБ.xlsx", [(401, "Ambient warm 80 krug multi", MGT_WH, "-", 1)],
+                    red={"Ambient warm 80 krug multi"})
+    b.process_wb([str(rep)], TOKEN, str(tmp_path / "o"), log, progress, mode="run", today=TODAY)
+    assert [(s["name"], s["orders"]) for s in wb.supplies] == [("Поставка от 09.11.2026 МГТ учительская", ["401"])]

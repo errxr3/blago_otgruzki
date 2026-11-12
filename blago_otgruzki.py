@@ -70,7 +70,7 @@ from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.pdfgen import canvas
 
 APP_NAME = "BLAGO OTGRUZKI"
-APP_VERSION = "1.38"  # при каждом обновлении +0.1, запись в CHANGELOG.md
+APP_VERSION = "1.39"  # при каждом обновлении +0.1, запись в CHANGELOG.md
 API = "https://api-seller.ozon.ru"
 BATCH = 20                   # максимум отправлений в одном запросе этикеток
 READY = "awaiting_deliver"   # статус, в котором Ozon отдаёт этикетку
@@ -1746,9 +1746,19 @@ def process_wb(files, token, out, log, progress, mode="check", confirm=lambda te
     not_new = [n for n in postings if n not in new]
     status = wb_statuses(token, not_new) if not_new else {}
     # Не уехало вчера: задание уже во вчерашней неотгруженной поставке — его ШК скачается заново (1.37)
-    left = wb_leftovers(token, day) if not_new else {}
+    # Ищем всегда, а не только по отчёту: отчёт мог быть сделан до того, как вчерашнее туда попадало (1.39)
+    left = wb_leftovers(token, day)
     carry = defaultdict(list)   # id поставки -> задания из отчёта, которые в ней лежат
     carry_sup = {}
+    painted = {n for _, n in red} | {n for _, n, _ in yellow}   # покрашено «не едет» — не трогаем
+    extra = [i for i in left if i not in postings and i not in painted]
+    for i in extra:
+        postings[i] = {str(left[i][0].get("article") or "?"): 1}
+    if extra:
+        log(f"● Не уехало вчера, а в отчёте нет: {plural(len(extra), 'задание', 'задания', 'заданий')} "
+            f"— добавлено (их тоже соберут и отгрузят)")
+        for i in extra:
+            log(f"│     {i}  {next(iter(postings[i]))}  (было в «{left[i][1]['name']}»)")
     for num, arts in postings.items():
         art = next(iter(arts))
         o = new.get(num)
