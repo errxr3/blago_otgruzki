@@ -72,7 +72,7 @@ from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.pdfgen import canvas
 
 APP_NAME = "BLAGO OTGRUZKI"
-APP_VERSION = "1.54"  # при каждом обновлении +0.1, запись в CHANGELOG.md
+APP_VERSION = "1.55"  # при каждом обновлении +0.1, запись в CHANGELOG.md
 API = "https://api-seller.ozon.ru"
 BATCH = 20                   # максимум отправлений в одном запросе этикеток
 READY = "awaiting_deliver"   # статус, в котором Ozon отдаёт этикетку
@@ -3773,16 +3773,27 @@ def enable_dpi_awareness():
 # Каждая кнопка и карточка — обычная надпись Tk с готовой картинкой (Pillow): Windows рисует её одним
 # копированием. Холсты (1.45–1.51) Windows прорисовывал по кусочку — окно появлялось с чёрными пятнами.
 
-FONT_CHOICES = ("Inter", "Segoe UI Variable Text", "Segoe UI")
-
-
 def pick_font(root):
-    """Шрифт как у сайта склада (Inter), если он есть на компьютере; иначе — системный Segoe UI."""
+    """Шрифт окна. На Windows — обычный Segoe UI (1.55): переменные шрифты («Segoe UI Variable», Inter 4)
+    окна Python рисуют через медленный путь Windows — вкладки открывались секунду-две.
+    На других системах — Inter, если есть (для снимков экрана), иначе что найдётся."""
+    if sys.platform == "win32":
+        return "Segoe UI"
     try:
         families = set(tkfont.families(root))
     except tk.TclError:
         return "Segoe UI"
-    return next((f for f in FONT_CHOICES if f in families), "Segoe UI")
+    return "Inter" if "Inter" in families else "Segoe UI"
+
+
+def ui_font(widget, size, bold=True):
+    """Общий шрифт кнопок: один на размер в окне, а не по шрифту на каждую кнопку."""
+    root = widget.winfo_toplevel()
+    fonts = root.__dict__.setdefault("_ui_fonts", {})
+    key = (FONT, size, bold)
+    if key not in fonts:
+        fonts[key] = tkfont.Font(root=root, family=FONT, size=size, weight="bold" if bold else "normal")
+    return fonts[key]
 
 
 def _bg_of(widget):
@@ -3966,6 +3977,7 @@ class RButton(tk.Label):
                  cursor="hand2", anchor="center", **_):
         self.outer = _bg_of(parent)
         self.ui = _ui_scale(parent)
+        self._parent = parent
         self.command, self._width, self.anchor = command, width, anchor
         self._state, self._hover, self._down = "normal", False, False
         self._text = textvariable.get() if textvariable is not None else text
@@ -3991,7 +4003,7 @@ class RButton(tk.Label):
         fill, hover, fg, size, px, py = BUTTON_KINDS.get(style, BUTTON_KINDS["TButton"])
         self.style = style
         self.colors = (C[fill], C[hover], C[fg])
-        self.font = tkfont.Font(family=FONT, size=size, weight="bold")
+        self.font = ui_font(self._parent, size)
         self.padx, self.pady = int(px * self.ui), int(py * self.ui)
         self.r = int((10 if style != "Chip" else 9) * self.ui)
 
@@ -4282,16 +4294,8 @@ class App(tk.Tk):
         self.show_page("Сборка")
         self.update_idletasks()
         self.dark_titlebar()
-        try:
-            self.attributes("-alpha", 0.0)   # Windows рисует окно невидимым, видно — уже готовое
-        except tk.TclError:
-            pass
+        # Прозрачность (-alpha) не трогаем: Windows после неё рисует окно «слоями» — медленно (1.55)
         self.deiconify()
-        self.update()
-        try:
-            self.attributes("-alpha", 1.0)
-        except tk.TclError:
-            pass
         try:   # заставка exe (пока он распаковывается) — убрать, окно готово
             import pyi_splash
             pyi_splash.close()
@@ -4380,17 +4384,32 @@ class App(tk.Tk):
         self.current_page = name
         if name == "СДЭК" and hasattr(self, "cdek_keys"):
             self.refresh_cdek()  # ключи могли появиться в «Настройках»
+        steps = []
+
+        def mark(what):
+            steps.append((what, time.perf_counter()))
+
         self.pages[name].tkraise()
+        mark("поднять")
         self._fit_page_box(name)
+        mark("высота")
         for n in PAGES:
             self.paint_nav(n)
+        mark("меню")
         self.page_title.configure(text=name)
         if measure:
-            # Дорисовать сразу и замерить: дольше 0.15 с — пишем в журнал, чтобы видеть тормоза компьютера
+            # Замер по шагам: где именно тормозит на этом компьютере (пишется в журнал, если дольше 0.15 с)
+            self.update_idletasks()
+            mark("раскладка")
             self.update()
+            mark("рисование")
             ms = int((time.perf_counter() - started) * 1000)
             if ms > 150:
-                self.log(f"(вкладка «{name}» рисовалась {ms} мс)")
+                parts, prev = [], started
+                for what, t in steps:
+                    parts.append(f"{what} {int((t - prev) * 1000)}")
+                    prev = t
+                self.log(f"(вкладка «{name}» {ms} мс: " + ", ".join(parts) + ")")
 
     def hand_cursor(self, widget):
         """Рука над всем, что нажимается."""
