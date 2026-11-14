@@ -72,7 +72,7 @@ from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.pdfgen import canvas
 
 APP_NAME = "BLAGO OTGRUZKI"
-APP_VERSION = "1.52"  # при каждом обновлении +0.1, запись в CHANGELOG.md
+APP_VERSION = "1.53"  # при каждом обновлении +0.1, запись в CHANGELOG.md
 API = "https://api-seller.ozon.ru"
 BATCH = 20                   # максимум отправлений в одном запросе этикеток
 READY = "awaiting_deliver"   # статус, в котором Ozon отдаёт этикетку
@@ -3499,11 +3499,28 @@ C_DARK = {
 UI_CONFIG = DATA_DIR / "ui.json"   # тема окна — у каждого компьютера своя
 
 
-def ui_theme():
+def ui_settings():
+    """Вид окна этого компьютера: {"theme": "light"/"dark", "round": True/False}."""
     try:
-        return "dark" if json.loads(UI_CONFIG.read_text(encoding="utf-8")).get("theme") == "dark" else "light"
-    except (OSError, ValueError, AttributeError):
-        return "light"
+        data = json.loads(UI_CONFIG.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def ui_save(**changes):
+    data = ui_settings()
+    data.update(changes)
+    UI_CONFIG.write_text(json.dumps(data), encoding="utf-8")
+
+
+def ui_theme():
+    return "dark" if ui_settings().get("theme") == "dark" else "light"
+
+
+def ui_round():
+    """Скругления кнопок и карточек (выключаются в «Настройки → Вид окна», если окно тормозит)."""
+    return ui_settings().get("round", True) is not False
 
 
 C = dict(C_DARK if ui_theme() == "dark" else C_LIGHT)
@@ -3814,6 +3831,8 @@ def round_photo(widget, w, h, r, fill, border, outer):
     """Картинка «скруглённый прямоугольник» w×h для Tk; одинаковые берутся из кэша окна.
     None — нет Pillow (тогда элементы просто прямоугольные)."""
     root = widget.winfo_toplevel()
+    if not getattr(root, "rounded", True):
+        return None
     cache = root.__dict__.setdefault("_round_photos", {})
     key = (w, h, r, fill, border, outer)
     if key in cache:
@@ -3857,7 +3876,13 @@ class RoundBox(tk.Frame):
         if stretch:
             self.pack_propagate(False)
         self._job, self._drawn = None, None
-        self.bind("<Configure>", self._later)
+        self.flat = not getattr(self.winfo_toplevel(), "rounded", True)
+        if self.flat:   # без скруглений: плоская карточка с рамкой в 1 точку, перерисовывать нечего
+            self._back.place_forget()
+            tk.Frame.configure(self, bg=fill, highlightthickness=1 if border else 0,
+                               highlightbackground=border or fill, highlightcolor=border or fill)
+        else:
+            self.bind("<Configure>", self._later)
 
     def _later(self, _event=None):
         if self._job is None:
@@ -3865,6 +3890,10 @@ class RoundBox(tk.Frame):
 
     def redraw(self):
         self._job = None
+        if self.flat:
+            tk.Frame.configure(self, highlightbackground=self.border or self.fill,
+                               highlightcolor=self.border or self.fill)
+            return
         w, h = self.winfo_width(), self.winfo_height()
         if w < 4 or h < 4:
             return
@@ -3875,8 +3904,6 @@ class RoundBox(tk.Frame):
         photo = round_photo(self, w, h, self.r, self.fill, self.border, self.outer)
         if photo is not None:
             self._back.configure(image=photo)
-        else:
-            self._back.configure(bg=self.border or self.fill)
 
     def set_fill(self, fill):
         if fill != self.fill:
@@ -3887,6 +3914,8 @@ class RoundBox(tk.Frame):
                     child.configure(bg=fill)
                 except tk.TclError:
                     pass
+            if self.flat:
+                tk.Frame.configure(self, bg=fill)
             self.redraw()
 
     def set_border(self, color):
@@ -3949,8 +3978,13 @@ class RButton(tk.Label):
         self._apply_style(style)
         super().__init__(parent, text=self._text, font=self.font, fg=self.colors[2], bg=self.outer, bd=0,
                          highlightthickness=0, padx=0, pady=0, compound="center", cursor=cursor)
-        self._redraw_now(self._want_width(), self._want_height())
-        self.bind("<Configure>", self._later)
+        self.flat = not getattr(self.winfo_toplevel(), "rounded", True)
+        if self.flat:   # без скруглений: обычная плоская надпись-кнопка
+            tk.Label.configure(self, padx=self.padx, pady=self.pady, anchor=anchor)
+            self._paint_flat()
+        else:
+            self._redraw_now(self._want_width(), self._want_height())
+            self.bind("<Configure>", self._later)
         self.bind("<Enter>", lambda e: self._set_hover(True))
         self.bind("<Leave>", lambda e: self._set_hover(False))
         self.bind("<ButtonPress-1>", self._press)
@@ -3983,8 +4017,15 @@ class RButton(tk.Label):
         if self._job is None:
             self._job = self.after_idle(self.redraw)
 
+    def _paint_flat(self):
+        fill, fg = self._paint()
+        tk.Label.configure(self, bg=fill, fg=fg, text=self._text)
+
     def redraw(self):
         self._job = None
+        if self.flat:
+            self._paint_flat()
+            return
         w = max(self.winfo_width(), self._want_width())
         h = max(self.winfo_height(), self._want_height())
         if not self.winfo_ismapped():
@@ -4108,7 +4149,8 @@ class App(tk.Tk):
         self.minsize(min(int(960 * self.ui), w), min(int(760 * self.ui), h))
         self.configure(bg=C["bg"])
         global FONT
-        FONT = pick_font(self)   # Inter, как на сайте склада, если установлен; иначе Segoe UI
+        FONT = pick_font(self)
+        self.rounded = ui_round()   # Inter, как на сайте склада, если установлен; иначе Segoe UI
         self.q = queue.Queue()
         self.busy = False
         self.buttons = []      # кнопки, которые гасятся, пока идёт работа
@@ -4339,13 +4381,7 @@ class App(tk.Tk):
         if name == getattr(self, "current_page", None):
             return
         started = time.perf_counter()
-        if self.winfo_ismapped():
-            # Вкладка открылась дольше 0.2 с — пишем в журнал, чтобы было видно, что тормозит на компьютере
-            def report():
-                ms = int((time.perf_counter() - started) * 1000)
-                if ms > 200:
-                    self.log(f"(вкладка «{name}» открылась за {ms} мс)")
-            self.after_idle(lambda: self.after(1, report))
+        measure = self.winfo_ismapped()
         self.current_page = name
         if name == "СДЭК" and hasattr(self, "cdek_keys"):
             self.refresh_cdek()  # ключи могли появиться в «Настройках»
@@ -4354,6 +4390,12 @@ class App(tk.Tk):
         for n in PAGES:
             self.paint_nav(n)
         self.page_title.configure(text=name)
+        if measure:
+            # Дорисовать сразу и замерить: дольше 0.15 с — пишем в журнал, чтобы видеть тормоза компьютера
+            self.update()
+            ms = int((time.perf_counter() - started) * 1000)
+            if ms > 150:
+                self.log(f"(вкладка «{name}» рисовалась {ms} мс)")
 
     def hand_cursor(self, widget):
         """Рука над всем, что нажимается."""
@@ -4803,12 +4845,22 @@ class App(tk.Tk):
     def set_theme(self, key):
         """Тема окна: запоминается на этом компьютере, меняется после перезапуска программы."""
         try:
-            UI_CONFIG.write_text(json.dumps({"theme": key}), encoding="utf-8")
+            ui_save(theme=key)
         except OSError as e:
             self.theme_note.configure(text=f"Не сохранилось: {e}", foreground=C["err"])
             return
         same = key == ui_theme() and key == ("dark" if C["bg"] == C_DARK["bg"] else "light")
         self.theme_note.configure(text="" if same else "Тема поменяется после перезапуска программы",
+                                  foreground=C["accent"])
+
+    def set_round(self, value):
+        """Скругления вкл/выкл: запоминается на этом компьютере, меняется после перезапуска."""
+        try:
+            ui_save(round=bool(value))
+        except OSError as e:
+            self.theme_note.configure(text=f"Не сохранилось: {e}", foreground=C["err"])
+            return
+        self.theme_note.configure(text="" if value == self.rounded else "Поменяется после перезапуска программы",
                                   foreground=C["accent"])
 
     def build_settings(self, tab):
@@ -4825,6 +4877,10 @@ class App(tk.Tk):
         for key, title in (("light", "Светлая тема"), ("dark", "Тёмная тема")):
             self.button(lrow, ("✓ " if key == now else "") + title, lambda k=key: self.set_theme(k),
                         "Accent.TButton" if key == now else "TButton", padx=(0, 8))
+        rnd = ui_round()
+        for value, title in ((True, "Скругления"), (False, "Без скруглений")):
+            self.button(lrow, ("✓ " if value == rnd else "") + title, lambda v=value: self.set_round(v),
+                        "Accent.TButton" if value == rnd else "TButton", padx=(8 if value else 0, 8))
         self.theme_note = ttk.Label(lrow, text="", style="Info.TLabel")
         self.theme_note.pack(side="left", padx=(8, 0))
         c1 = self.card(tab, "Кабинеты Ozon", side=lambda h: ttk.Checkbutton(
