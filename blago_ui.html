@@ -44,7 +44,6 @@ nav a {
 	color: var(--muted); font-weight: 650; text-decoration: none; cursor: pointer;
 }
 nav a svg { width: 20px; height: 20px; flex: none; }
-nav a svg.brand { width: 22px; height: 22px; margin: -1px; }
 
 nav a:hover { background: var(--hover); color: var(--text); }
 nav a.active { background: var(--accent-soft); color: var(--accent); }
@@ -366,11 +365,11 @@ const ICONS = {
 	"СДЭК": '<rect x="2.5" y="3.5" width="19" height="17" rx="4.5"/><text x="12" y="16" text-anchor="middle" font-size="11" font-weight="800" fill="currentColor" stroke="none" font-family="system-ui, Segoe UI, sans-serif">С</text>',
 	"Настройки": '<circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 0 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 0 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 0 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 0 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z"/>',
 };
-// Значки площадок — как их иконки: СДЭК зелёный со стрелкой, Ozon белый с кольцом, WB фиолетовый
+// Значки площадок — рисунок их иконок (кольцо Ozon, стрелка СДЭК, буквы WB), цвет — как у остальных иконок
 const BRANDS = {
-	"Ozon": '<svg class="brand" viewBox="0 0 24 24"><rect x="1" y="1" width="22" height="22" rx="6" fill="#fff" stroke="#d9deea"/><ellipse cx="12" cy="12" rx="6.2" ry="4.6" fill="none" stroke="#001a34" stroke-width="2.8"/></svg>',
-	"Wildberries": '<svg class="brand" viewBox="0 0 24 24"><defs><linearGradient id="wbg" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#cb11ab"/><stop offset="1" stop-color="#481173"/></linearGradient></defs><rect x="1" y="1" width="22" height="22" rx="6" fill="url(#wbg)"/><text x="12" y="15.6" text-anchor="middle" font-size="9.5" font-weight="800" fill="#fff" font-family="system-ui, Segoe UI, sans-serif">WB</text></svg>',
-	"СДЭК": '<svg class="brand" viewBox="0 0 24 24"><rect x="1" y="1" width="22" height="22" rx="6" fill="#1ab248"/><path d="M6.5 15.5 13.5 8.5M9 8h5.5v5.5" fill="none" stroke="#fff" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"/></svg>',
+	"Ozon": '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="2.5" y="2.5" width="19" height="19" rx="5"/><ellipse cx="12" cy="12" rx="5.2" ry="3.8" stroke-width="2.4"/></svg>',
+	"Wildberries": '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="2.5" y="2.5" width="19" height="19" rx="5"/><text x="12" y="15.3" text-anchor="middle" font-size="8.5" font-weight="800" fill="currentColor" stroke="none" font-family="system-ui, Segoe UI, sans-serif">WB</text></svg>',
+	"СДЭК": '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="2.5" y="2.5" width="19" height="19" rx="5"/><path d="M8 16 15 9M10 8.5h5.5V14" stroke-width="2.2"/></svg>',
 };
 const $ = id => document.getElementById(id);
 const LOG_LIMIT = 6000;
