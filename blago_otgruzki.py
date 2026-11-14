@@ -72,7 +72,7 @@ from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.pdfgen import canvas
 
 APP_NAME = "BLAGO OTGRUZKI"
-APP_VERSION = "1.53"  # при каждом обновлении +0.1, запись в CHANGELOG.md
+APP_VERSION = "1.54"  # при каждом обновлении +0.1, запись в CHANGELOG.md
 API = "https://api-seller.ozon.ru"
 BATCH = 20                   # максимум отправлений в одном запросе этикеток
 READY = "awaiting_deliver"   # статус, в котором Ozon отдаёт этикетку
@@ -3518,11 +3518,6 @@ def ui_theme():
     return "dark" if ui_settings().get("theme") == "dark" else "light"
 
 
-def ui_round():
-    """Скругления кнопок и карточек (выключаются в «Настройки → Вид окна», если окно тормозит)."""
-    return ui_settings().get("round", True) is not False
-
-
 C = dict(C_DARK if ui_theme() == "dark" else C_LIGHT)
 PAGES = ("Сборка", "Ozon", "Wildberries", "СДЭК", "Настройки")
 FONT = "Segoe UI"
@@ -4150,7 +4145,7 @@ class App(tk.Tk):
         self.configure(bg=C["bg"])
         global FONT
         FONT = pick_font(self)
-        self.rounded = ui_round()   # Inter, как на сайте склада, если установлен; иначе Segoe UI
+        self.rounded = True   # Inter, как на сайте склада, если установлен; иначе Segoe UI
         self.q = queue.Queue()
         self.busy = False
         self.buttons = []      # кнопки, которые гасятся, пока идёт работа
@@ -4853,16 +4848,6 @@ class App(tk.Tk):
         self.theme_note.configure(text="" if same else "Тема поменяется после перезапуска программы",
                                   foreground=C["accent"])
 
-    def set_round(self, value):
-        """Скругления вкл/выкл: запоминается на этом компьютере, меняется после перезапуска."""
-        try:
-            ui_save(round=bool(value))
-        except OSError as e:
-            self.theme_note.configure(text=f"Не сохранилось: {e}", foreground=C["err"])
-            return
-        self.theme_note.configure(text="" if value == self.rounded else "Поменяется после перезапуска программы",
-                                  foreground=C["accent"])
-
     def build_settings(self, tab):
         top = ttk.Frame(tab, style="Bg.TFrame")
         top.pack(fill="x", pady=(0, 4))
@@ -4877,10 +4862,6 @@ class App(tk.Tk):
         for key, title in (("light", "Светлая тема"), ("dark", "Тёмная тема")):
             self.button(lrow, ("✓ " if key == now else "") + title, lambda k=key: self.set_theme(k),
                         "Accent.TButton" if key == now else "TButton", padx=(0, 8))
-        rnd = ui_round()
-        for value, title in ((True, "Скругления"), (False, "Без скруглений")):
-            self.button(lrow, ("✓ " if value == rnd else "") + title, lambda v=value: self.set_round(v),
-                        "Accent.TButton" if value == rnd else "TButton", padx=(8 if value else 0, 8))
         self.theme_note = ttk.Label(lrow, text="", style="Info.TLabel")
         self.theme_note.pack(side="left", padx=(8, 0))
         c1 = self.card(tab, "Кабинеты Ozon", side=lambda h: ttk.Checkbutton(
