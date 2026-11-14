@@ -46,6 +46,7 @@ BLAGO OTGRUZKI — этикетки Ozon FBS и поставки Wildberries FBS
 Ключи кабинетов сохраняются в cabinets.json, токен WB — в wb.json
 рядом с программой. Эти файлы никому не пересылать.
 """
+import base64
 import io
 import json
 import os
@@ -61,6 +62,7 @@ from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
+from tkinter import font as tkfont
 
 import openpyxl
 import requests
@@ -70,7 +72,7 @@ from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.pdfgen import canvas
 
 APP_NAME = "BLAGO OTGRUZKI"
-APP_VERSION = "1.44"  # при каждом обновлении +0.1, запись в CHANGELOG.md
+APP_VERSION = "1.45"  # при каждом обновлении +0.1, запись в CHANGELOG.md
 API = "https://api-seller.ozon.ru"
 BATCH = 20                   # максимум отправлений в одном запросе этикеток
 READY = "awaiting_deliver"   # статус, в котором Ozon отдаёт этикетку
@@ -3712,6 +3714,276 @@ def enable_dpi_awareness():
             pass
 
 
+# ================================================================ скруглённые кнопки, карточки, поля (1.45)
+# Рисуются на холсте Tk: углы — сглаженные картинки (Pillow), середина — прямоугольники.
+# Стилевые картинки ttk не используются: на них окно подвисало (1.43).
+
+FONT_CHOICES = ("Inter", "Segoe UI Variable Text", "Segoe UI")
+
+
+def pick_font(root):
+    """Шрифт как у сайта склада (Inter), если он есть на компьютере; иначе — системный Segoe UI."""
+    try:
+        families = set(tkfont.families(root))
+    except tk.TclError:
+        return "Segoe UI"
+    return next((f for f in FONT_CHOICES if f in families), "Segoe UI")
+
+
+def _bg_of(widget):
+    """Фон родителя: у tk — bg, у ttk — из стиля."""
+    try:
+        return widget.cget("bg")
+    except tk.TclError:
+        style = ttk.Style(widget)
+        name = str(widget.cget("style") or widget.winfo_class())
+        return style.lookup(name, "background") or style.lookup(widget.winfo_class(), "background") or C["bg"]
+
+
+def _corner_images(widget, r, fill, border, outer):
+    """Четыре угла скругления r×r: сглаженные, с рамкой border (или без). None — нет Pillow."""
+    root = widget.winfo_toplevel()
+    cache = root.__dict__.setdefault("_round_corners", {})
+    key = (r, fill, border, outer)
+    if key in cache:
+        return cache[key]
+    try:
+        from PIL import Image, ImageDraw
+    except ImportError:
+        cache[key] = None
+        return None
+    s = 4
+    big = Image.new("RGB", (2 * r * s, 2 * r * s), outer)
+    draw = ImageDraw.Draw(big)
+    edge = 2 * r * s - 1
+    if border:
+        draw.ellipse((0, 0, edge, edge), fill=border)
+        draw.ellipse((s, s, edge - s, edge - s), fill=fill)
+    else:
+        draw.ellipse((0, 0, edge, edge), fill=fill)
+    img = big.resize((2 * r, 2 * r), Image.LANCZOS)
+    parts = []
+    for box in ((0, 0, r, r), (r, 0, 2 * r, r), (0, r, r, 2 * r), (r, r, 2 * r, 2 * r)):
+        buf = io.BytesIO()
+        img.crop(box).save(buf, "PNG")
+        parts.append(tk.PhotoImage(master=root, data=base64.b64encode(buf.getvalue())))
+    cache[key] = parts
+    return parts
+
+
+def draw_round(cv, w, h, r, fill, border, outer, tag="shape"):
+    """Скруглённый прямоугольник во весь холст."""
+    cv.delete(tag)
+    if w < 2 or h < 2:
+        return
+    r = max(2, min(int(r), w // 2, h // 2))
+    corners = _corner_images(cv, r, fill, border, outer)
+    if corners is None:   # без Pillow — просто прямоугольник
+        cv.create_rectangle(0, 0, w - 1, h - 1, fill=fill, outline=border or fill, tags=tag)
+        cv.tag_lower(tag)
+        return
+    cv.create_rectangle(r, 0, w - r, h, fill=fill, width=0, tags=tag)
+    cv.create_rectangle(0, r, w, h - r, fill=fill, width=0, tags=tag)
+    if border:
+        for x1, y1, x2, y2 in ((r, 0, w - r, 0), (r, h - 1, w - r, h - 1), (0, r, 0, h - r), (w - 1, r, w - 1, h - r)):
+            cv.create_line(x1, y1, x2, y2, fill=border, tags=tag)
+    for img, (x, y) in zip(corners, ((0, 0), (w - r, 0), (0, h - r), (w - r, h - r))):
+        cv.create_image(x, y, image=img, anchor="nw", tags=tag)
+    cv.tag_lower(tag)
+
+
+def _ui_scale(widget):
+    return getattr(widget.winfo_toplevel(), "ui", 1.0)
+
+
+class RoundBox(tk.Canvas):
+    """Скруглённая карточка. Содержимое кладут в .inner — оно уложено внутрь с отступом pad,
+    поэтому карточка сама принимает размер содержимого. stretch — содержимое тянется по высоте."""
+
+    def __init__(self, parent, fill, border=None, radius=14, pad=5, stretch=False, height=1):
+        self.outer = _bg_of(parent)
+        super().__init__(parent, bg=self.outer, highlightthickness=0, bd=0, width=1, height=height)
+        ui = _ui_scale(parent)
+        self.fill, self.border, self.r = fill, border, int(radius * ui)
+        self.pad = max(1, int(pad * ui))
+        self.inner = tk.Frame(self, bg=fill)
+        self.inner.pack(fill="both", expand=True, padx=self.pad, pady=self.pad)
+        if stretch:
+            self.pack_propagate(False)
+        self.bind("<Configure>", lambda e: self.redraw(e.width, e.height))
+
+    def redraw(self, w=None, h=None):
+        w = w or self.winfo_width()
+        h = h or self.winfo_height()
+        draw_round(self, w, h, self.r, self.fill, self.border, self.outer)
+
+    def set_border(self, color):
+        if color != self.border:
+            self.border = color
+            self.redraw()
+
+
+class REntry(RoundBox):
+    """Поле ввода со скруглением; рамка синеет, когда в поле курсор."""
+
+    def __init__(self, parent, textvariable=None, show="", width=20, **_):
+        super().__init__(parent, fill=C["field"], border=C["line"], radius=9, pad=3)
+        ui = _ui_scale(parent)
+        self.entry = tk.Entry(self.inner, textvariable=textvariable, show=show or "", width=width, bd=0,
+                              relief="flat", highlightthickness=0, bg=C["field"], fg=C["text"],
+                              insertbackground=C["text"], selectbackground=C["accent"],
+                              selectforeground=C["on_accent"], font=(FONT, 10))
+        self.entry.pack(fill="x", padx=int(8 * ui), pady=int(5 * ui))
+        self.entry.bind("<FocusIn>", lambda e: self.set_border(C["accent"]), add="+")
+        self.entry.bind("<FocusOut>", lambda e: self.set_border(C["line"]), add="+")
+        for w in (self, self.inner):
+            w.bind("<Button-1>", lambda e: self.entry.focus_set(), add="+")
+
+    def configure(self, cnf=None, **kw):
+        kw.update(cnf or {})
+        entry_kw = {k: kw.pop(k) for k in ("show", "state", "textvariable") if k in kw}
+        if entry_kw:
+            self.entry.configure(**entry_kw)
+        return tk.Canvas.configure(self, **kw) if kw else None
+
+    config = configure
+
+    def get(self):
+        return self.entry.get()
+
+
+# Вид кнопок: фон, фон под мышью, текст, жирность, отступы (x, y)
+BUTTON_KINDS = {
+    "TButton": ("btn", "btn_hi", "text", 10, 14, 8),
+    "Big.TButton": ("btn", "btn_hi", "text", 10, 18, 10),
+    "Accent.TButton": ("accent", "accent_hi", "on_accent", 11, 22, 10),
+    "Nav": ("side", "nav_hi", "muted", 11, 14, 9),
+    "Chip": ("btn", "btn_hi", "text", 10, 16, 7),
+}
+
+
+class RButton(tk.Canvas):
+    """Скруглённая кнопка. Понимает text, textvariable, command, state, как ttk.Button."""
+
+    def __init__(self, parent, text="", command=None, style="TButton", textvariable=None, width=None,
+                 cursor="hand2", anchor="center", **_):
+        self.outer = _bg_of(parent)
+        self.ui = _ui_scale(parent)
+        self.command, self.anchor, self._width = command, anchor, width
+        self._state, self._hover, self._down = "normal", False, False
+        self._text = textvariable.get() if textvariable is not None else text
+        self._apply_style(style)
+        super().__init__(parent, bg=self.outer, highlightthickness=0, bd=0, cursor=cursor,
+                         width=self._want_width(), height=self._want_height())
+        self.bind("<Configure>", lambda e: self.redraw(e.width, e.height))
+        self.bind("<Enter>", lambda e: self._set_hover(True))
+        self.bind("<Leave>", lambda e: self._set_hover(False))
+        self.bind("<ButtonPress-1>", self._press)
+        self.bind("<ButtonRelease-1>", self._release)
+        if textvariable is not None:
+            textvariable.trace_add("write", lambda *_: self.configure(text=textvariable.get()))
+
+    def _apply_style(self, style):
+        fill, hover, fg, size, px, py = BUTTON_KINDS.get(style, BUTTON_KINDS["TButton"])
+        self.style = style
+        self.colors = (C[fill], C[hover], C[fg])
+        self.font = tkfont.Font(family=FONT, size=size, weight="bold")
+        self.padx, self.pady = int(px * self.ui), int(py * self.ui)
+        self.r = int((10 if style != "Chip" else 9) * self.ui)
+
+    def _want_width(self):
+        if self._width:
+            return self.font.measure("0") * self._width + 2 * self.padx
+        return self.font.measure(self._text) + 2 * self.padx
+
+    def _want_height(self):
+        return self.font.metrics("linespace") + 2 * self.pady
+
+    def set_colors(self, fill, hover, fg):
+        self.colors = (fill, hover, fg)
+        self.redraw()
+
+    def redraw(self, w=None, h=None):
+        w = w or self.winfo_width()
+        h = h or self.winfo_height()
+        if w <= 1:
+            w, h = int(float(self.cget("width"))), int(float(self.cget("height")))
+        if self._state == "disabled":
+            fill, fg = (C["btn"] if self.style not in ("Nav",) else self.colors[0]), C["dim"]
+        else:
+            fill = self.colors[1] if self._hover else self.colors[0]
+            fg = self.colors[2]
+        draw_round(self, w, h, self.r, fill, None, self.outer)
+        self.delete("label")
+        x = self.padx if self.anchor == "w" else w / 2
+        self.create_text(x, h / 2, text=self._text, font=self.font, fill=fg, anchor=self.anchor, tags="label")
+
+    def _set_hover(self, on):
+        self._hover = on
+        self.redraw()
+
+    def _press(self, _event):
+        self._down = True
+
+    def _release(self, event):
+        inside = 0 <= event.x < self.winfo_width() and 0 <= event.y < self.winfo_height()
+        if self._down and inside and self._state != "disabled" and self.command:
+            self.command()
+        self._down = False
+
+    def configure(self, cnf=None, **kw):
+        kw.update(cnf or {})
+        if not kw:
+            return tk.Canvas.configure(self)
+        redraw = False
+        if "style" in kw:
+            self._apply_style(kw.pop("style"))
+            redraw = True
+        if "text" in kw:
+            self._text = str(kw.pop("text"))
+            redraw = True
+        if "state" in kw:
+            self._state = str(kw.pop("state"))
+            tk.Canvas.configure(self, cursor="arrow" if self._state == "disabled" else "hand2")
+            redraw = True
+        if "command" in kw:
+            self.command = kw.pop("command")
+        if redraw:
+            kw.setdefault("width", self._want_width())
+            kw.setdefault("height", self._want_height())
+        if kw:
+            tk.Canvas.configure(self, **kw)
+        if redraw:
+            self.redraw()
+        return None
+
+    config = configure
+
+    def cget(self, key):
+        if key == "text":
+            return self._text
+        if key == "state":
+            return self._state
+        if key == "command":
+            return self.command
+        return tk.Canvas.cget(self, key)
+
+    __getitem__ = cget
+
+    def state(self, spec=None):
+        """Как у ttk: b.state(["disabled"]) / b.state(["!disabled"])."""
+        for s in spec or ():
+            self.configure(state="normal" if s == "!disabled" else "disabled" if s == "disabled" else self._state)
+        return (self._state,) if self._state == "disabled" else ()
+
+    def instate(self, spec):
+        return all((s == "disabled") == (self._state == "disabled") for s in spec)
+
+    def invoke(self):
+        if self._state != "disabled" and self.command:
+            self.command()
+
+
 class App(tk.Tk):
     def __init__(self):
         enable_dpi_awareness()   # до создания окна, иначе Windows уже решила растягивать
@@ -3724,6 +3996,8 @@ class App(tk.Tk):
         self.geometry(f"{w}x{h}")
         self.minsize(min(int(960 * self.ui), w), min(int(760 * self.ui), h))
         self.configure(bg=C["bg"])
+        global FONT
+        FONT = pick_font(self)   # Inter, как на сайте склада, если установлен; иначе Segoe UI
         self.q = queue.Queue()
         self.busy = False
         self.buttons = []      # кнопки, которые гасятся, пока идёт работа
@@ -3762,14 +4036,12 @@ class App(tk.Tk):
         side.pack(side="left", fill="y")
         side.pack_propagate(False)
         tk.Frame(self, bg=C["line"], width=1).pack(side="left", fill="y")   # граница меню, как на сайте
+        # Логотип: «BLAGO» и синим «отгрузки», без значка
         logo = tk.Frame(side, bg=C["side"])
-        logo.pack(fill="x", padx=18, pady=(22, 24))
-        tk.Label(logo, text="B", bg=C["accent"], fg=C["on_accent"], font=(FONT, 14, "bold"),
-                 width=2, pady=2).pack(side="left")
-        names = tk.Frame(logo, bg=C["side"])
-        names.pack(side="left", padx=(10, 0))
-        tk.Label(names, text="BLAGO", bg=C["side"], fg=C["text"], font=(FONT, 14, "bold")).pack(anchor="w")
-        tk.Label(names, text="OTGRUZKI", bg=C["side"], fg=C["muted"], font=(FONT, 9, "bold")).pack(anchor="w")
+        logo.pack(fill="x", padx=24, pady=(26, 22))
+        tk.Label(logo, text="BLAGO", bg=C["side"], fg=C["text"], font=(FONT, 15, "bold")).pack(side="left")
+        tk.Label(logo, text="отгрузки", bg=C["side"], fg=C["accent"], font=(FONT, 10, "bold")
+                 ).pack(side="left", padx=(8, 0), pady=(4, 0))
         self.nav = {}
         for name in PAGES:
             self.nav[name] = self.nav_item(side, name)
@@ -3790,7 +4062,7 @@ class App(tk.Tk):
         self.page_title = ttk.Label(top, text="", style="Page.TLabel")
         self.page_title.pack(side="left")
         # главная папка дня — видна всегда и меняется в один клик
-        ttk.Button(top, text="Сменить папку…", command=self.pick_root, cursor="hand2").pack(side="right")
+        RButton(top, text="Сменить папку…", command=self.pick_root).pack(side="right")
         self.root_label = ttk.Button(top, text="", style="BgPath.TButton", cursor="hand2",
                                      command=lambda: self.open_out(self.root_dir.get() or self.default_root()))
         self.root_label.pack(side="right", padx=(0, 10))
@@ -3799,11 +4071,10 @@ class App(tk.Tk):
         srow.pack(fill="x", pady=(0, 10))
         self.sklad_line = tk.Label(srow, text="", bg=C["bg"], fg=C["muted"], font=(FONT, 10, "bold"), anchor="w")
         self.sklad_line.pack(side="left")
-        self.sklad_resend = ttk.Button(srow, text="Отправить неотправленное", command=self.flush_sklad,
-                                       cursor="hand2")
+        self.sklad_resend = RButton(srow, text="Отправить неотправленное", command=self.flush_sklad)
         # Заказы дня уходят на склад только после проверки — этой кнопкой
-        self.sklad_send = ttk.Button(srow, text="Отправить на склад", style="Accent.TButton",
-                                     command=self.send_morning, cursor="hand2")
+        self.sklad_send = RButton(srow, text="Отправить на склад", style="Accent.TButton",
+                                  command=self.send_morning)
         self.page_box = ttk.Frame(main, style="Bg.TFrame")
         self.page_box.pack(fill="x")
         self.pages = {name: ttk.Frame(self.page_box, style="Bg.TFrame") for name in PAGES}
@@ -3813,12 +4084,12 @@ class App(tk.Tk):
         self.build_cdek(self.pages["СДЭК"])
         self.build_settings(self.scroll_page(self.pages["Настройки"]))
 
-        jb = tk.Frame(main, bg=C["line"])
+        jb = RoundBox(main, fill=C["card"], border=C["line"], radius=16, pad=5, stretch=True,
+                      height=int(200 * self.ui))
         jb.pack(fill="both", expand=True, pady=(14, 0))
-        jcard = tk.Frame(jb, bg=C["card"])
-        jcard.pack(fill="both", expand=True, padx=1, pady=1)
+        jcard = jb.inner
         jh = tk.Frame(jcard, bg=C["card"])
-        jh.pack(fill="x", padx=18, pady=(12, 0))
+        jh.pack(fill="x", padx=14, pady=(8, 0))
         tk.Label(jh, text="Журнал", bg=C["card"], fg=C["text"], font=(FONT, 12, "bold")).pack(side="left")
         self.state_pill = tk.Label(jh, text="●  готова к работе", bg=C["card"], fg=C["ok"], font=(FONT, 9, "bold"))
         self.state_pill.pack(side="left", padx=(14, 0))
@@ -3831,7 +4102,7 @@ class App(tk.Tk):
         self.log_box = tk.Text(box, height=10, wrap="word", state="disabled", bd=0, relief="flat",
                                bg=C["card"], fg=C["text"], insertbackground=C["text"],
                                selectbackground=C["accent"], selectforeground=C["on_accent"],
-                               padx=10, pady=6, font=("Consolas", 10), highlightthickness=0,
+                               padx=10, pady=6, font=(FONT, 10), highlightthickness=0,
                                spacing1=2, spacing3=2)
         sb = ttk.Scrollbar(box, command=self.log_box.yview)
         self.log_box.configure(yscrollcommand=sb.set)
@@ -3842,7 +4113,7 @@ class App(tk.Tk):
                                  ("yellow", C["note"], False), ("big", C["ok"], True),
                                  ("muted", C["dim"], False)):
             self.log_box.tag_configure(tag, foreground=color,
-                                       font=("Consolas", 11 if tag == "big" else 10, "bold" if bold else ""))
+                                       font=(FONT, 11 if tag == "big" else 10, "bold" if bold else ""))
 
         self.setup_clipboard()
         self.load_settings()
@@ -3895,27 +4166,17 @@ class App(tk.Tk):
 
     # ------------------------------------------------------------ навигация
     def nav_item(self, parent, name):
-        row = tk.Frame(parent, bg=C["side"], cursor="hand2")
-        row.pack(fill="x", padx=12, pady=1)
-        bar = tk.Frame(row, bg=C["side"], width=3)
-        bar.pack(side="left", fill="y")
-        lbl = tk.Label(row, text=name, bg=C["side"], fg=C["muted"], font=(FONT, 11, "bold"),
-                       anchor="w", padx=14, pady=10, cursor="hand2")
-        lbl.pack(side="left", fill="x", expand=True)
-        for w in (row, lbl):
-            w.bind("<Button-1>", lambda e, n=name: self.show_page(n))
-            w.bind("<Enter>", lambda e, n=name: self.paint_nav(n, hover=True))
-            w.bind("<Leave>", lambda e, n=name: self.paint_nav(n))
-        return row, bar, lbl
+        """Пункт меню слева — скруглённая плашка, как на сайте склада."""
+        item = RButton(parent, text=name, style="Nav", anchor="w", command=lambda n=name: self.show_page(n))
+        item.pack(fill="x", padx=14, pady=2)
+        return item
 
     def paint_nav(self, name, hover=False):
-        row, bar, lbl = self.nav[name]
         on = name == getattr(self, "current_page", None)
-        bg = C["nav_hi"] if on or hover else C["side"]
-        for w in (row, lbl):
-            w.configure(bg=bg)
-        bar.configure(bg=C["accent"] if on else bg)
-        lbl.configure(fg=C["accent"] if on else C["text"] if hover else C["muted"])
+        if on:
+            self.nav[name].set_colors(C["nav_hi"], C["nav_hi"], C["accent"])
+        else:
+            self.nav[name].set_colors(C["side"], C["nav_hi"], C["muted"])
 
     def show_page(self, name):
         self.current_page = name
@@ -4027,14 +4288,14 @@ class App(tk.Tk):
 
     def card(self, parent, title, side=None, grid=None):
         """Тёмная карточка с заголовком. side — виджет-функция для правой части заголовка."""
-        border = tk.Frame(parent, bg=C["line"])
+        border = RoundBox(parent, fill=C["card"], border=C["line"], radius=16, pad=5)
         if grid:
-            border.grid(row=grid[0], column=grid[1], sticky="nsew", pady=5,
-                        padx=(0, 6) if grid[1] == 0 else (6, 0))
+            border.grid(row=grid[0], column=grid[1], sticky="nsew", pady=6,
+                        padx=(0, 7) if grid[1] == 0 else (7, 0))
         else:
-            border.pack(fill="x", pady=5)
-        body = ttk.Frame(border, style="Card.TFrame", padding=(18, 12, 18, 16))
-        body.pack(fill="both", expand=True, padx=1, pady=1)
+            border.pack(fill="x", pady=6)
+        body = ttk.Frame(border.inner, style="Card.TFrame", padding=(15, 9, 15, 13))
+        body.pack(fill="both", expand=True)
         head = ttk.Frame(body, style="Card.TFrame")
         head.pack(fill="x", pady=(0, 10))
         ttk.Label(head, text=title, style="Title.TLabel").pack(side="left")
@@ -4043,7 +4304,7 @@ class App(tk.Tk):
         return body
 
     def button(self, parent, text, command, style="TButton", **pack):
-        b = ttk.Button(parent, text=text, command=command, style=style, cursor="hand2")
+        b = RButton(parent, text=text, command=command, style=style)
         b.pack(side="left", **pack)
         self.buttons.append(b)
         return b
@@ -4104,11 +4365,8 @@ class App(tk.Tk):
         for i, name in enumerate(WAVES):
             if i and "кгт" in name.lower() and "кгт" not in WAVES[i - 1].lower():
                 tk.Frame(chips, bg=C["line"], width=1, height=26).pack(side="left", padx=10)
-            b = tk.Radiobutton(chips, text=name, value=name, variable=self.wave, indicatoron=0,
-                               command=self.refresh_wave_chips, bd=0, relief="flat", cursor="hand2",
-                               font=(FONT, 10, "bold"), padx=16, pady=7, highlightthickness=0,
-                               bg=C["btn"], fg=C["text"], activebackground=C["btn_hi"],
-                               activeforeground=C["text"], selectcolor=C["accent"])
+            b = RButton(chips, text=name, style="Chip",
+                        command=lambda n=name: (self.wave.set(n), self.refresh_wave_chips()))
             b.pack(side="left", padx=(0, 6))
             self.wave_chips[name] = b
         row2 = ttk.Frame(c2, style="Card.TFrame")
@@ -4124,9 +4382,8 @@ class App(tk.Tk):
     def refresh_wave_chips(self):
         for name, b in self.wave_chips.items():
             on = name == self.wave.get()
-            b.configure(bg=C["accent"] if on else C["btn"], fg=C["on_accent"] if on else C["text"],
-                        activebackground=C["accent_hi"] if on else C["btn_hi"],
-                        activeforeground=C["on_accent"] if on else C["text"])
+            b.set_colors(C["accent"] if on else C["btn"], C["accent_hi"] if on else C["btn_hi"],
+                         C["on_accent"] if on else C["text"])
         self.refresh_links()
 
     # ------------------------------------------------------------ вкладка Ozon
@@ -4136,7 +4393,7 @@ class App(tk.Tk):
         row.pack(fill="x")
         self.excel_name = ttk.Label(row, text="не выбран", style="File.TLabel")
         self.excel_name.pack(side="left")
-        ttk.Button(row, text="Выбрать файл…", command=self.pick_excel).pack(side="right")
+        RButton(row, text="Выбрать файл…", command=self.pick_excel).pack(side="right")
         self.sheet_box = ttk.Frame(row, style="Card.TFrame")
         ttk.Label(self.sheet_box, text="лист", style="Field.TLabel").pack(side="left", padx=(0, 6))
         self.sheet_cb = ttk.Combobox(self.sheet_box, textvariable=self.sheet, state="readonly", width=14)
@@ -4165,9 +4422,9 @@ class App(tk.Tk):
         self.folder_link(c2, self.ozon_sub)
 
     def ozon_sub(self):
-        """Папка этикеток Ozon: утренние — «Озон», дальше «Озон 2», «Озон 3», «КГТ 2»…"""
+        """Папка этикеток Ozon по подписи: «Озон утро», «Озон 1», «Озон 2», «КГТ 2»… — у каждой своя."""
         name = " ".join(self.footer.get().split())
-        return "Озон" if not name or name.lower() in ("озон утро", "озон 1") else name
+        return name or "Озон утро"
 
     # ------------------------------------------------------------ вкладка Wildberries
     def build_wb(self, tab):
@@ -4176,8 +4433,8 @@ class App(tk.Tk):
         row.pack(fill="x")
         self.wb_files_label = ttk.Label(row, text="не выбраны", style="File.TLabel")
         self.wb_files_label.pack(side="left")
-        ttk.Button(row, text="Очистить", command=self.clear_wb).pack(side="right")
-        ttk.Button(row, text="Добавить файл…", command=self.pick_wb).pack(side="right", padx=(0, 8))
+        RButton(row, text="Очистить", command=self.clear_wb).pack(side="right")
+        RButton(row, text="Добавить файл…", command=self.pick_wb).pack(side="right", padx=(0, 8))
         self.wb_info = ttk.Label(c1, text="Отчёты подставляются сами после «Сборки».", style="Info.TLabel",
                                  justify="left")
         self.wb_info.pack(anchor="w", pady=(8, 0))
@@ -4199,7 +4456,7 @@ class App(tk.Tk):
         row.pack(fill="x")
         self.cdek_file_label = ttk.Label(row, text="не выбран", style="File.TLabel")
         self.cdek_file_label.pack(side="left")
-        ttk.Button(row, text="Выбрать файл…", command=self.pick_cdek_file).pack(side="right")
+        RButton(row, text="Выбрать файл…", command=self.pick_cdek_file).pack(side="right")
         self.cdek_info = ttk.Label(c1, text="Файл из «макса»: № задания, Артикул продавца, трэк. Покраска — "
                                             "как в отчётах Ozon: красный не едет, жёлтый — сколько указано рядом.",
                                    style="Info.TLabel", justify="left", wraplength=720)
@@ -4407,7 +4664,7 @@ class App(tk.Tk):
         b1 = ttk.Frame(c1, style="Card.TFrame")
         b1.pack(fill="x", pady=(8, 0))
         self.btn_test = self.button(b1, "Проверить ключи", self.test_keys)
-        ttk.Button(b1, text="+ кабинет", command=self.add_cabinet).pack(side="left", padx=(8, 0))
+        RButton(b1, text="+ кабинет", command=self.add_cabinet).pack(side="left", padx=(8, 0))
 
         pair = ttk.Frame(tab, style="Bg.TFrame")
         pair.pack(fill="x")
@@ -4419,7 +4676,7 @@ class App(tk.Tk):
         g.pack(fill="x")
         g.columnconfigure(1, weight=1)
         ttk.Label(g, text="Токен", style="Field.TLabel").grid(row=0, column=0, sticky="w", padx=(0, 10))
-        self.wb_token_entry = ttk.Entry(g, textvariable=self.wb_token, show="•")
+        self.wb_token_entry = REntry(g, textvariable=self.wb_token, show="•")
         self.wb_token_entry.grid(row=0, column=1, sticky="ew")
         b2 = ttk.Frame(c2, style="Card.TFrame")
         b2.pack(fill="x", pady=(8, 0))
@@ -4438,17 +4695,17 @@ class App(tk.Tk):
         for r, (label, var, pick) in enumerate((("Шаблон сборки", self.template, self.pick_template),
                                                 ("Куда сохранять", self.root_dir, self.pick_root))):
             ttk.Label(g3, text=label, style="Field.TLabel").grid(row=r, column=0, sticky="w", padx=(0, 10), pady=3)
-            ttk.Entry(g3, textvariable=var).grid(row=r, column=1, sticky="ew")
-            ttk.Button(g3, text="…", width=3, command=pick).grid(row=r, column=2, padx=(6, 0))
+            REntry(g3, textvariable=var).grid(row=r, column=1, sticky="ew")
+            RButton(g3, text="…", width=3, command=pick).grid(row=r, column=2, padx=(6, 0))
 
         c5 = self.card(tab, "Склад BLAGO")
         g5 = ttk.Frame(c5, style="Card.TFrame")
         g5.pack(fill="x")
         g5.columnconfigure(1, weight=1)
         ttk.Label(g5, text="Адрес склада", style="Field.TLabel").grid(row=0, column=0, sticky="w", padx=(0, 10), pady=3)
-        ttk.Entry(g5, textvariable=self.sklad_url).grid(row=0, column=1, sticky="ew")
+        REntry(g5, textvariable=self.sklad_url).grid(row=0, column=1, sticky="ew")
         ttk.Label(g5, text="Ключ", style="Field.TLabel").grid(row=1, column=0, sticky="w", padx=(0, 10), pady=3)
-        self.sklad_key_entry = ttk.Entry(g5, textvariable=self.sklad_key, show="•")
+        self.sklad_key_entry = REntry(g5, textvariable=self.sklad_key, show="•")
         self.sklad_key_entry.grid(row=1, column=1, sticky="ew")
         b5 = ttk.Frame(c5, style="Card.TFrame")
         b5.pack(fill="x", pady=(8, 0))
@@ -4464,9 +4721,9 @@ class App(tk.Tk):
         g6.pack(fill="x")
         g6.columnconfigure(1, weight=1)
         ttk.Label(g6, text="Account", style="Field.TLabel").grid(row=0, column=0, sticky="w", padx=(0, 10), pady=3)
-        ttk.Entry(g6, textvariable=self.cdek_account).grid(row=0, column=1, sticky="ew")
+        REntry(g6, textvariable=self.cdek_account).grid(row=0, column=1, sticky="ew")
         ttk.Label(g6, text="Secure", style="Field.TLabel").grid(row=1, column=0, sticky="w", padx=(0, 10), pady=3)
-        ttk.Entry(g6, textvariable=self.cdek_secure, show="•").grid(row=1, column=1, sticky="ew")
+        REntry(g6, textvariable=self.cdek_secure, show="•").grid(row=1, column=1, sticky="ew")
         b6 = ttk.Frame(c6, style="Card.TFrame")
         b6.pack(fill="x", pady=(8, 0))
         self.button(b6, "Проверить ключи", self.test_cdek)
@@ -4494,7 +4751,7 @@ class App(tk.Tk):
                                    (1, 0, ("Машины", self.pass_cars))):
             ttk.Label(g5, text=label, style="Field.TLabel").grid(row=r, column=c, sticky="w",
                                                                  padx=(0 if c == 0 else 18, 10), pady=3)
-            ttk.Entry(g5, textvariable=var).grid(row=r, column=c + 1, sticky="ew")
+            REntry(g5, textvariable=var).grid(row=r, column=c + 1, sticky="ew")
 
     # ------------------------------------------------------------ папки и настройки
     @staticmethod
@@ -4502,7 +4759,7 @@ class App(tk.Tk):
         desk = Path.home() / "Desktop"
         return desk if desk.exists() else BASE_DIR
 
-    DIR_ALIASES = {"озон": ("озон1", "озонутро"), "кгт1": ("кгт",), "вб": ("wb", "вб1")}
+    DIR_ALIASES = {"кгт1": ("кгт",), "вб": ("wb", "вб1")}
 
     @staticmethod
     def _dir_key(name):
@@ -4510,7 +4767,7 @@ class App(tk.Tk):
 
     def find_dir(self, base, sub):
         """Уже созданная папка с таким названием (без учёта регистра и пробелов: «озон2» = «Озон 2»;
-        «Озон 1» = «Озон», «КГТ» = «КГТ 1», «WB» = «ВБ») или None."""
+        «КГТ» = «КГТ 1», «WB» = «ВБ») или None. «Озон утро» и «Озон 1» — разные папки."""
         key = self._dir_key(sub)
         keys = {key, *self.DIR_ALIASES.get(key, ())}
         try:
@@ -4530,8 +4787,8 @@ class App(tk.Tk):
         return self.find_dir(base, sub) or base / sub
 
     def place_reports(self, base, files, log):
-        """Утренние отчёты Озон/КГТ/ВБ/СГТ — в папки «Озон», «КГТ 1», «ВБ», если такие папки уже созданы."""
-        for key, sub in (("ozon", "Озон"), ("kgt", "КГТ 1"), ("wb", "ВБ"), ("sgt", "ВБ")):
+        """Утренние отчёты Озон/КГТ/ВБ/СГТ — в папки «Озон утро», «КГТ 1», «ВБ», если такие папки уже созданы."""
+        for key, sub in (("ozon", "Озон утро"), ("kgt", "КГТ 1"), ("wb", "ВБ"), ("sgt", "ВБ")):
             src = files.get(key)
             dst_dir = self.find_dir(base, sub)
             if not src or not dst_dir or Path(src).parent == dst_dir:
@@ -4768,9 +5025,9 @@ class App(tk.Tk):
             self.show_keys = tk.BooleanVar(value=False)
         r = len(self.cab_rows) + 1
         v = (tk.StringVar(value=name or f"Озон {r}"), tk.StringVar(value=cid), tk.StringVar(value=key))
-        e_name = ttk.Entry(self.cab_box, textvariable=v[0], width=14)
-        e_cid = ttk.Entry(self.cab_box, textvariable=v[1], width=12)
-        e_key = ttk.Entry(self.cab_box, textvariable=v[2], show="" if self.show_keys.get() else "•")
+        e_name = REntry(self.cab_box, textvariable=v[0], width=14)
+        e_cid = REntry(self.cab_box, textvariable=v[1], width=12)
+        e_key = REntry(self.cab_box, textvariable=v[2], show="" if self.show_keys.get() else "•")
         status = ttk.Label(self.cab_box, text="", width=22, style="Status.TLabel")
         e_name.grid(row=r, column=0, padx=(0, 8), pady=3)
         e_cid.grid(row=r, column=1, padx=(0, 8))
