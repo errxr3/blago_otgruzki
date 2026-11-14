@@ -72,7 +72,7 @@ from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.pdfgen import canvas
 
 APP_NAME = "BLAGO OTGRUZKI"
-APP_VERSION = "1.55"  # при каждом обновлении +0.1, запись в CHANGELOG.md
+APP_VERSION = "1.56"  # при каждом обновлении +0.1, запись в CHANGELOG.md
 API = "https://api-seller.ozon.ru"
 BATCH = 20                   # максимум отправлений в одном запросе этикеток
 READY = "awaiting_deliver"   # статус, в котором Ozon отдаёт этикетку
@@ -4243,7 +4243,7 @@ class App(tk.Tk):
         self.page_box.columnconfigure(0, weight=1)
         self.pages = {name: ttk.Frame(self.page_box, style="Bg.TFrame") for name in PAGES}
         for name, frame in self.pages.items():
-            frame.grid(row=0, column=0, sticky="new")
+            frame.grid(row=0, column=0, sticky="nsew")   # каждая закрывает всю область, под ней не видно других
             frame.bind("<Configure>", lambda e, n=name: self._fit_page_box(n))
         self.build_sborka(self.pages["Сборка"])
         self.build_ozon(self.pages["Ozon"])
@@ -4369,12 +4369,12 @@ class App(tk.Tk):
         else:
             self.nav[name].set_colors(C["side"], C["nav_hover"], C["muted"])
 
-    def _fit_page_box(self, name):
-        """Высота области вкладок — по открытой вкладке (остальные лежат под ней)."""
-        if name == getattr(self, "current_page", None):
-            height = self.pages[name].winfo_reqheight()
-            if int(float(self.page_box.cget("height"))) != height:
-                self.page_box.configure(height=height)
+    def _fit_page_box(self, name=None):
+        """Высота области вкладок одна на все вкладки — по самой высокой (кроме «Настроек», они листаются).
+        При переключении вкладок журнал внизу не двигается и не перерисовывается (1.56)."""
+        height = max(f.winfo_reqheight() for n, f in self.pages.items() if n != "Настройки")
+        if int(float(self.page_box.cget("height"))) != height:
+            self.page_box.configure(height=height)
 
     def show_page(self, name):
         if name == getattr(self, "current_page", None):
@@ -4816,23 +4816,15 @@ class App(tk.Tk):
     # ------------------------------------------------------------ вкладка «Настройки»
     def scroll_page(self, page):
         """Страница с прокруткой: длинные настройки листаются колесом, журнал внизу остаётся виден."""
-        canvas = tk.Canvas(page, bg=C["bg"], highlightthickness=0, bd=0, height=300)
+        canvas = tk.Canvas(page, bg=C["bg"], highlightthickness=0, bd=0, height=1)
         bar = ttk.Scrollbar(page, orient="vertical", command=canvas.yview)
         inner = ttk.Frame(canvas, style="Bg.TFrame")
         win = canvas.create_window((0, 0), window=inner, anchor="nw")
         canvas.configure(yscrollcommand=bar.set)
-        canvas.pack(side="left", fill="x", expand=True)
+        canvas.pack(side="left", fill="both", expand=True)   # высота — вся область вкладок (1.56)
         bar.pack(side="right", fill="y", padx=(6, 0))
-        journal_min = 190  # столько оставляем журналу внизу окна
-
         def fit(_=None):
-            need = inner.winfo_reqheight()
-            top = self.page_box.winfo_rooty() - self.winfo_rooty()
-            room = max(220, self.winfo_height() - top - journal_min)
-            height = min(need, room)
-            if int(canvas.cget("height")) != height:
-                canvas.configure(height=height)
-            canvas.configure(scrollregion=(0, 0, 0, need))
+            canvas.configure(scrollregion=(0, 0, 0, inner.winfo_reqheight()))
 
         def wheel(e):
             if getattr(self, "current_page", "") != "Настройки":
