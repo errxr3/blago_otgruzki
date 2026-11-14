@@ -72,7 +72,7 @@ from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.pdfgen import canvas
 
 APP_NAME = "BLAGO OTGRUZKI"
-APP_VERSION = "1.47"  # при каждом обновлении +0.1, запись в CHANGELOG.md
+APP_VERSION = "1.48"  # при каждом обновлении +0.1, запись в CHANGELOG.md
 API = "https://api-seller.ozon.ru"
 BATCH = 20                   # максимум отправлений в одном запросе этикеток
 READY = "awaiting_deliver"   # статус, в котором Ozon отдаёт этикетку
@@ -3772,7 +3772,11 @@ def _corner_images(widget, r, fill, border, outer):
 
 
 def draw_round(cv, w, h, r, fill, border, outer, tag="shape"):
-    """Скруглённый прямоугольник во весь холст."""
+    """Скруглённый прямоугольник во весь холст. Тот же размер и цвета — ничего не делает."""
+    key = (w, h, r, fill, border, outer)
+    if getattr(cv, "_drawn", None) == key:
+        return
+    cv._drawn = key
     cv.delete(tag)
     if w < 2 or h < 2:
         return
@@ -3914,6 +3918,10 @@ class RButton(tk.Canvas):
             fill = self.colors[1] if self._hover else self.colors[0]
             fg = self.colors[2]
         draw_round(self, w, h, self.r, fill, None, self.outer)
+        label = (w, h, self._text, fg, self.anchor)
+        if getattr(self, "_label", None) == label:
+            return
+        self._label = label
         self.delete("label")
         x = self.padx if self.anchor == "w" else w / 2
         self.create_text(x, h / 2, text=self._text, font=self.font, fill=fg, anchor=self.anchor, tags="label")
@@ -4203,7 +4211,35 @@ class App(tk.Tk):
         else:
             self.nav[name].set_colors(C["side"], C["nav_hi"], C["muted"])
 
+    def frozen(self, change):
+        """Сделать change, пока Windows не рисует окно, и показать результат разом.
+        Без этого каждая карточка и кнопка (у Windows это отдельные окошки) прорисовывается по очереди."""
+        if sys.platform != "win32":
+            change()
+            return
+        try:
+            import ctypes
+            user32 = ctypes.windll.user32
+            hwnd = user32.GetParent(self.winfo_id()) or self.winfo_id()
+        except Exception:  # noqa: BLE001
+            change()
+            return
+        user32.SendMessageW(hwnd, 0x000B, 0, 0)        # WM_SETREDRAW: не рисовать
+        try:
+            change()
+            self.update_idletasks()
+        finally:
+            user32.SendMessageW(hwnd, 0x000B, 1, 0)    # WM_SETREDRAW: рисовать
+            # RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN | RDW_UPDATENOW | RDW_FRAME
+            user32.RedrawWindow(hwnd, None, None, 0x0001 | 0x0004 | 0x0080 | 0x0100 | 0x0400)
+
     def show_page(self, name):
+        if getattr(self, "current_page", None) != name and self.winfo_ismapped():
+            self.frozen(lambda: self._show_page(name))
+        else:
+            self._show_page(name)
+
+    def _show_page(self, name):
         self.current_page = name
         if name == "СДЭК" and hasattr(self, "cdek_keys"):
             self.refresh_cdek()  # ключи могли появиться в «Настройках»
@@ -4646,9 +4682,18 @@ class App(tk.Tk):
             if w is not None and str(w).startswith(str(canvas)):
                 canvas.yview_scroll(-1 if e.delta > 0 else 1, "units")
 
+        def on_window(e):
+            # Привязка к окну срабатывает и на каждый виджет внутри — пересчёт только для самого окна
+            if e.widget is self:
+                fit()
+
+        def on_canvas(e):
+            if int(canvas.itemcget(win, "width") or 0) != e.width:
+                canvas.itemconfigure(win, width=e.width)
+
         inner.bind("<Configure>", fit)
-        canvas.bind("<Configure>", lambda e: canvas.itemconfigure(win, width=e.width))
-        self.bind("<Configure>", fit, add="+")
+        canvas.bind("<Configure>", on_canvas)
+        self.bind("<Configure>", on_window, add="+")
         self.bind_all("<MouseWheel>", wheel, add="+")
         return inner
 
