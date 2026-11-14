@@ -26,9 +26,9 @@ BLAGO OTGRUZKI — этикетки Ozon FBS и поставки Wildberries FBS
 Установка (один раз):  pip install requests openpyxl pypdf reportlab
 Запуск:                python blago_otgruzki.py
 
-Сборка в .exe:
-    pip install pyinstaller
-    pyinstaller --onefile --windowed --name "BLAGO OTGRUZKI" blago_otgruzki.py
+Сборка в .exe (значок — синий «B», как у сайта склада): запустить «Собрать exe.bat» или
+    pip install pyinstaller pillow
+    pyinstaller --onefile --windowed --icon blago.ico --add-data "blago.ico;." --name "BLAGO OTGRUZKI" blago_otgruzki.py
 
 Вкладка Wildberries (кнопка «Создать поставки и скачать»):
   1. читает отчёт(ы) WB — «№ задания», «Артикул продавца»; склад и дату
@@ -72,7 +72,7 @@ from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.pdfgen import canvas
 
 APP_NAME = "BLAGO OTGRUZKI"
-APP_VERSION = "1.45"  # при каждом обновлении +0.1, запись в CHANGELOG.md
+APP_VERSION = "1.46"  # при каждом обновлении +0.1, запись в CHANGELOG.md
 API = "https://api-seller.ozon.ru"
 BATCH = 20                   # максимум отправлений в одном запросе этикеток
 READY = "awaiting_deliver"   # статус, в котором Ozon отдаёт этикетку
@@ -3989,6 +3989,7 @@ class App(tk.Tk):
         enable_dpi_awareness()   # до создания окна, иначе Windows уже решила растягивать
         super().__init__()
         self.title(APP_NAME)
+        self.set_icon()
         # Масштаб экрана: 1.0 — 100 %, 1.5 — 150 %. Шрифты Tk растут сами, размеры окна в точках — по нему
         self.ui = min(max(self.winfo_fpixels("1i") / 96, 1.0), 3.0)
         sw, sh = self.winfo_screenwidth(), self.winfo_screenheight()
@@ -4130,6 +4131,22 @@ class App(tk.Tk):
         self.after(100, self.poll)
         self.after(100, self.ease_bar)
         self.after(500, self.refresh_sklad_line)
+
+    def set_icon(self):
+        """Значок окна и панели задач — синий «B», как у сайта склада (файл blago.ico рядом или внутри exe)."""
+        here = Path(getattr(sys, "_MEIPASS", Path(__file__).parent))
+        for ico in (here / "blago.ico", BASE_DIR / "blago.ico"):
+            if ico.exists():
+                try:
+                    if sys.platform == "win32":
+                        self.iconbitmap(default=str(ico))
+                    else:
+                        from PIL import Image, ImageTk
+                        self._icon = ImageTk.PhotoImage(Image.open(ico).convert("RGBA").resize((64, 64)))
+                        self.iconphoto(True, self._icon)
+                except Exception:  # noqa: BLE001 — значок не главное
+                    pass
+                return
 
     def refresh_sklad_line(self):
         """Строка «Склад: …»: подключён ли, что ушло последним, что ждёт отправки."""
