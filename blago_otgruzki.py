@@ -72,7 +72,7 @@ from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.pdfgen import canvas
 
 APP_NAME = "BLAGO OTGRUZKI"
-APP_VERSION = "1.51"  # при каждом обновлении +0.1, запись в CHANGELOG.md
+APP_VERSION = "1.52"  # при каждом обновлении +0.1, запись в CHANGELOG.md
 API = "https://api-seller.ozon.ru"
 BATCH = 20                   # максимум отправлений в одном запросе этикеток
 READY = "awaiting_deliver"   # статус, в котором Ozon отдаёт этикетку
@@ -3757,9 +3757,9 @@ def enable_dpi_awareness():
             pass
 
 
-# ================================================================ скруглённые кнопки, карточки, поля (1.45)
-# Рисуются на холсте Tk: углы — сглаженные картинки (Pillow), середина — прямоугольники.
-# Стилевые картинки ttk не используются: на них окно подвисало (1.43).
+# ================================================================ скруглённые кнопки, карточки, поля (1.52)
+# Каждая кнопка и карточка — обычная надпись Tk с готовой картинкой (Pillow): Windows рисует её одним
+# копированием. Холсты (1.45–1.51) Windows прорисовывал по кусочку — окно появлялось с чёрными пятнами.
 
 FONT_CHOICES = ("Inter", "Segoe UI Variable Text", "Segoe UI")
 
@@ -3783,86 +3783,111 @@ def _bg_of(widget):
         return style.lookup(name, "background") or style.lookup(widget.winfo_class(), "background") or C["bg"]
 
 
-def _corner_images(widget, r, fill, border, outer):
-    """Четыре угла скругления r×r: сглаженные, с рамкой border (или без). None — нет Pillow."""
-    root = widget.winfo_toplevel()
-    cache = root.__dict__.setdefault("_round_corners", {})
+def _ui_scale(widget):
+    return getattr(widget.winfo_toplevel(), "ui", 1.0)
+
+
+def _corner_tile(r, fill, border, outer):
+    """Угол скругления r×r (левый верхний), сглаженный; кэш на всю программу."""
     key = (r, fill, border, outer)
+    tile = _CORNER_TILES.get(key)
+    if tile is None:
+        from PIL import Image, ImageDraw
+        s = 4
+        big = Image.new("RGB", (2 * r * s, 2 * r * s), outer)
+        draw = ImageDraw.Draw(big)
+        edge = 2 * r * s - 1
+        if border:
+            draw.ellipse((0, 0, edge, edge), fill=border)
+            draw.ellipse((s, s, edge - s, edge - s), fill=fill)
+        else:
+            draw.ellipse((0, 0, edge, edge), fill=fill)
+        tile = big.resize((2 * r, 2 * r), Image.LANCZOS).crop((0, 0, r, r))
+        _CORNER_TILES[key] = tile
+    return tile
+
+
+_CORNER_TILES = {}
+
+
+def round_photo(widget, w, h, r, fill, border, outer):
+    """Картинка «скруглённый прямоугольник» w×h для Tk; одинаковые берутся из кэша окна.
+    None — нет Pillow (тогда элементы просто прямоугольные)."""
+    root = widget.winfo_toplevel()
+    cache = root.__dict__.setdefault("_round_photos", {})
+    key = (w, h, r, fill, border, outer)
     if key in cache:
         return cache[key]
     try:
         from PIL import Image, ImageDraw
     except ImportError:
-        cache[key] = None
         return None
-    s = 4
-    big = Image.new("RGB", (2 * r * s, 2 * r * s), outer)
-    draw = ImageDraw.Draw(big)
-    edge = 2 * r * s - 1
-    if border:
-        draw.ellipse((0, 0, edge, edge), fill=border)
-        draw.ellipse((s, s, edge - s, edge - s), fill=fill)
-    else:
-        draw.ellipse((0, 0, edge, edge), fill=fill)
-    img = big.resize((2 * r, 2 * r), Image.LANCZOS)
-    parts = []
-    for box in ((0, 0, r, r), (r, 0, 2 * r, r), (0, r, r, 2 * r), (r, r, 2 * r, 2 * r)):
-        buf = io.BytesIO()
-        img.crop(box).save(buf, "PNG")
-        parts.append(tk.PhotoImage(master=root, data=base64.b64encode(buf.getvalue())))
-    cache[key] = parts
-    return parts
-
-
-def draw_round(cv, w, h, r, fill, border, outer, tag="shape"):
-    """Скруглённый прямоугольник во весь холст. Тот же размер и цвета — ничего не делает."""
-    key = (w, h, r, fill, border, outer)
-    if getattr(cv, "_drawn", None) == key:
-        return
-    cv._drawn = key
-    cv.delete(tag)
-    if w < 2 or h < 2:
-        return
     r = max(2, min(int(r), w // 2, h // 2))
-    corners = _corner_images(cv, r, fill, border, outer)
-    if corners is None:   # без Pillow — просто прямоугольник
-        cv.create_rectangle(0, 0, w - 1, h - 1, fill=fill, outline=border or fill, tags=tag)
-        cv.tag_lower(tag)
-        return
-    cv.create_rectangle(r, 0, w - r, h, fill=fill, width=0, tags=tag)
-    cv.create_rectangle(0, r, w, h - r, fill=fill, width=0, tags=tag)
+    img = Image.new("RGB", (w, h), fill)
     if border:
-        for x1, y1, x2, y2 in ((r, 0, w - r, 0), (r, h - 1, w - r, h - 1), (0, r, 0, h - r), (w - 1, r, w - 1, h - r)):
-            cv.create_line(x1, y1, x2, y2, fill=border, tags=tag)
-    for img, (x, y) in zip(corners, ((0, 0), (w - r, 0), (0, h - r), (w - r, h - r))):
-        cv.create_image(x, y, image=img, anchor="nw", tags=tag)
-    cv.tag_lower(tag)
+        ImageDraw.Draw(img).rectangle((0, 0, w - 1, h - 1), outline=border)
+    tile = _corner_tile(r, fill, border, outer)
+    img.paste(tile, (0, 0))
+    img.paste(tile.transpose(Image.FLIP_LEFT_RIGHT), (w - r, 0))
+    img.paste(tile.transpose(Image.FLIP_TOP_BOTTOM), (0, h - r))
+    img.paste(tile.transpose(Image.ROTATE_180), (w - r, h - r))
+    buf = io.BytesIO()
+    img.save(buf, "PNG", compress_level=1)
+    photo = tk.PhotoImage(master=root, data=base64.b64encode(buf.getvalue()))
+    if len(cache) > 400:   # окно тянули мышью — старые размеры больше не нужны
+        cache.clear()
+    cache[key] = photo
+    return photo
 
 
-def _ui_scale(widget):
-    return getattr(widget.winfo_toplevel(), "ui", 1.0)
-
-
-class RoundBox(tk.Canvas):
-    """Скруглённая карточка. Содержимое кладут в .inner — оно уложено внутрь с отступом pad,
-    поэтому карточка сама принимает размер содержимого. stretch — содержимое тянется по высоте."""
+class RoundBox(tk.Frame):
+    """Скруглённая карточка: фон — картинка во всю рамку, содержимое кладут в .inner (с отступом pad).
+    stretch — содержимое тянется по высоте рамки."""
 
     def __init__(self, parent, fill, border=None, radius=14, pad=5, stretch=False, height=1):
         self.outer = _bg_of(parent)
-        super().__init__(parent, bg=self.outer, highlightthickness=0, bd=0, width=1, height=height)
+        super().__init__(parent, bg=self.outer, height=height, width=1, bd=0, highlightthickness=0)
         ui = _ui_scale(parent)
         self.fill, self.border, self.r = fill, border, int(radius * ui)
         self.pad = max(1, int(pad * ui))
-        self.inner = tk.Frame(self, bg=fill)
+        self._back = tk.Label(self, bd=0, highlightthickness=0, padx=0, pady=0, bg=self.outer)
+        self._back.place(x=0, y=0, relwidth=1, relheight=1)
+        self.inner = tk.Frame(self, bg=fill, bd=0, highlightthickness=0)
         self.inner.pack(fill="both", expand=True, padx=self.pad, pady=self.pad)
         if stretch:
             self.pack_propagate(False)
-        self.bind("<Configure>", lambda e: self.redraw(e.width, e.height))
+        self._job, self._drawn = None, None
+        self.bind("<Configure>", self._later)
 
-    def redraw(self, w=None, h=None):
-        w = w or self.winfo_width()
-        h = h or self.winfo_height()
-        draw_round(self, w, h, self.r, self.fill, self.border, self.outer)
+    def _later(self, _event=None):
+        if self._job is None:
+            self._job = self.after_idle(self.redraw)
+
+    def redraw(self):
+        self._job = None
+        w, h = self.winfo_width(), self.winfo_height()
+        if w < 4 or h < 4:
+            return
+        key = (w, h, self.fill, self.border)
+        if key == self._drawn:
+            return
+        self._drawn = key
+        photo = round_photo(self, w, h, self.r, self.fill, self.border, self.outer)
+        if photo is not None:
+            self._back.configure(image=photo)
+        else:
+            self._back.configure(bg=self.border or self.fill)
+
+    def set_fill(self, fill):
+        if fill != self.fill:
+            self.fill = fill
+            self.inner.configure(bg=fill)
+            for child in self.inner.winfo_children():
+                try:
+                    child.configure(bg=fill)
+                except tk.TclError:
+                    pass
+            self.redraw()
 
     def set_border(self, color):
         if color != self.border:
@@ -3883,7 +3908,7 @@ class REntry(RoundBox):
         self.entry.pack(fill="x", padx=int(8 * ui), pady=int(5 * ui))
         self.entry.bind("<FocusIn>", lambda e: self.set_border(C["accent"]), add="+")
         self.entry.bind("<FocusOut>", lambda e: self.set_border(C["line"]), add="+")
-        for w in (self, self.inner):
+        for w in (self, self.inner, self._back):
             w.bind("<Button-1>", lambda e: self.entry.focus_set(), add="+")
 
     def configure(self, cnf=None, **kw):
@@ -3891,7 +3916,7 @@ class REntry(RoundBox):
         entry_kw = {k: kw.pop(k) for k in ("show", "state", "textvariable") if k in kw}
         if entry_kw:
             self.entry.configure(**entry_kw)
-        return tk.Canvas.configure(self, **kw) if kw else None
+        return tk.Frame.configure(self, **kw) if kw else None
 
     config = configure
 
@@ -3899,7 +3924,7 @@ class REntry(RoundBox):
         return self.entry.get()
 
 
-# Вид кнопок: фон, фон под мышью, текст, жирность, отступы (x, y)
+# Вид кнопок: фон, фон под мышью, текст, размер шрифта, отступы (x, y)
 BUTTON_KINDS = {
     "TButton": ("btn", "btn_hi", "text", 10, 14, 8),
     "Big.TButton": ("btn", "btn_hi", "text", 10, 18, 10),
@@ -3909,20 +3934,23 @@ BUTTON_KINDS = {
 }
 
 
-class RButton(tk.Canvas):
-    """Скруглённая кнопка. Понимает text, textvariable, command, state, как ttk.Button."""
+class RButton(tk.Label):
+    """Скруглённая кнопка: надпись Tk поверх готовой картинки-подложки.
+    Понимает text, textvariable, command, state, как ttk.Button. anchor="w" — текст слева (меню)."""
 
     def __init__(self, parent, text="", command=None, style="TButton", textvariable=None, width=None,
                  cursor="hand2", anchor="center", **_):
         self.outer = _bg_of(parent)
         self.ui = _ui_scale(parent)
-        self.command, self.anchor, self._width = command, anchor, width
+        self.command, self._width, self.anchor = command, width, anchor
         self._state, self._hover, self._down = "normal", False, False
         self._text = textvariable.get() if textvariable is not None else text
+        self._job, self._drawn = None, None
         self._apply_style(style)
-        super().__init__(parent, bg=self.outer, highlightthickness=0, bd=0, cursor=cursor,
-                         width=self._want_width(), height=self._want_height())
-        self.bind("<Configure>", lambda e: self.redraw(e.width, e.height))
+        super().__init__(parent, text=self._text, font=self.font, fg=self.colors[2], bg=self.outer, bd=0,
+                         highlightthickness=0, padx=0, pady=0, compound="center", cursor=cursor)
+        self._redraw_now(self._want_width(), self._want_height())
+        self.bind("<Configure>", self._later)
         self.bind("<Enter>", lambda e: self._set_hover(True))
         self.bind("<Leave>", lambda e: self._set_hover(False))
         self.bind("<ButtonPress-1>", self._press)
@@ -3946,38 +3974,70 @@ class RButton(tk.Canvas):
     def _want_height(self):
         return self.font.metrics("linespace") + 2 * self.pady
 
+    def _paint(self):
+        if self._state == "disabled":
+            return C["btn"] if self.style != "Nav" else self.colors[0], C["dim"]
+        return (self.colors[1] if self._hover else self.colors[0]), self.colors[2]
+
+    def _later(self, _event=None):
+        if self._job is None:
+            self._job = self.after_idle(self.redraw)
+
+    def redraw(self):
+        self._job = None
+        w = max(self.winfo_width(), self._want_width())
+        h = max(self.winfo_height(), self._want_height())
+        if not self.winfo_ismapped():
+            w, h = self._want_width(), self._want_height()
+        self._redraw_now(w, h)
+
+    def _redraw_now(self, w, h):
+        fill, fg = self._paint()
+        key = (w, h, fill, fg, self._text)
+        if key == self._drawn:
+            return
+        self._drawn = key
+        photo = round_photo(self, w, h, self.r, fill, None, self.outer)
+        if self.anchor == "w":   # меню слева: надпись отдельной меткой, прижата влево
+            tk.Label.configure(self, image=photo or "", text="", bg=self.outer if photo is not None else fill)
+            self._left_text(fill, fg)
+        else:
+            tk.Label.configure(self, image=photo or "", fg=fg, text=self._text,
+                               bg=self.outer if photo is not None else fill)
+
+    def _left_text(self, fill, fg):
+        """Меню слева: надпись — отдельная метка поверх подложки, прижата влево."""
+        if not hasattr(self, "_label"):
+            self._label = tk.Label(self, font=self.font, bd=0, highlightthickness=0, padx=0, pady=0,
+                                   cursor=self.cget("cursor"))
+            self._label.place(x=self.padx, rely=0.5, anchor="w")
+            for seq, fn in (("<Enter>", lambda e: self._set_hover(True)),
+                            ("<ButtonPress-1>", self._press), ("<ButtonRelease-1>", self._release_label)):
+                self._label.bind(seq, fn)
+        self._label.configure(text=self._text, bg=fill, fg=fg)
+
     def set_colors(self, fill, hover, fg):
         self.colors = (fill, hover, fg)
         self.redraw()
 
-    def redraw(self, w=None, h=None):
-        w = w or self.winfo_width()
-        h = h or self.winfo_height()
-        if w <= 1:
-            w, h = int(float(self.cget("width"))), int(float(self.cget("height")))
-        if self._state == "disabled":
-            fill, fg = (C["btn"] if self.style not in ("Nav",) else self.colors[0]), C["dim"]
-        else:
-            fill = self.colors[1] if self._hover else self.colors[0]
-            fg = self.colors[2]
-        draw_round(self, w, h, self.r, fill, None, self.outer)
-        label = (w, h, self._text, fg, self.anchor)
-        if getattr(self, "_label", None) == label:
-            return
-        self._label = label
-        self.delete("label")
-        x = self.padx if self.anchor == "w" else w / 2
-        self.create_text(x, h / 2, text=self._text, font=self.font, fill=fg, anchor=self.anchor, tags="label")
-
     def _set_hover(self, on):
-        self._hover = on
-        self.redraw()
+        if on != self._hover:
+            self._hover = on
+            self.redraw()
 
     def _press(self, _event):
         self._down = True
 
     def _release(self, event):
         inside = 0 <= event.x < self.winfo_width() and 0 <= event.y < self.winfo_height()
+        self._fire(inside)
+
+    def _release_label(self, event):
+        x = event.x_root - self.winfo_rootx()
+        y = event.y_root - self.winfo_rooty()
+        self._fire(0 <= x < self.winfo_width() and 0 <= y < self.winfo_height())
+
+    def _fire(self, inside):
         if self._down and inside and self._state != "disabled" and self.command:
             self.command()
         self._down = False
@@ -3985,25 +4045,23 @@ class RButton(tk.Canvas):
     def configure(self, cnf=None, **kw):
         kw.update(cnf or {})
         if not kw:
-            return tk.Canvas.configure(self)
+            return tk.Label.configure(self)
         redraw = False
         if "style" in kw:
             self._apply_style(kw.pop("style"))
+            tk.Label.configure(self, font=self.font)
             redraw = True
         if "text" in kw:
             self._text = str(kw.pop("text"))
             redraw = True
         if "state" in kw:
             self._state = str(kw.pop("state"))
-            tk.Canvas.configure(self, cursor="arrow" if self._state == "disabled" else "hand2")
+            tk.Label.configure(self, cursor="arrow" if self._state == "disabled" else "hand2")
             redraw = True
         if "command" in kw:
             self.command = kw.pop("command")
-        if redraw:
-            kw.setdefault("width", self._want_width())
-            kw.setdefault("height", self._want_height())
         if kw:
-            tk.Canvas.configure(self, **kw)
+            tk.Label.configure(self, **kw)
         if redraw:
             self.redraw()
         return None
@@ -4017,7 +4075,7 @@ class RButton(tk.Canvas):
             return self._state
         if key == "command":
             return self.command
-        return tk.Canvas.cget(self, key)
+        return tk.Label.cget(self, key)
 
     __getitem__ = cget
 
