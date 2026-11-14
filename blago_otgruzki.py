@@ -72,7 +72,7 @@ from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.pdfgen import canvas
 
 APP_NAME = "BLAGO OTGRUZKI"
-APP_VERSION = "1.48"  # при каждом обновлении +0.1, запись в CHANGELOG.md
+APP_VERSION = "1.49"  # при каждом обновлении +0.1, запись в CHANGELOG.md
 API = "https://api-seller.ozon.ru"
 BATCH = 20                   # максимум отправлений в одном запросе этикеток
 READY = "awaiting_deliver"   # статус, в котором Ozon отдаёт этикетку
@@ -4085,9 +4085,16 @@ class App(tk.Tk):
         # Заказы дня уходят на склад только после проверки — этой кнопкой
         self.sklad_send = RButton(srow, text="Отправить на склад", style="Accent.TButton",
                                   command=self.send_morning)
-        self.page_box = ttk.Frame(main, style="Bg.TFrame")
+        # Все вкладки строятся один раз и лежат стопкой в одной клетке; переключение — поднять нужную
+        # наверх (tkraise). Ничего не перестраивается и не перерисовывается заново — на Windows это и тормозило.
+        self.page_box = ttk.Frame(main, style="Bg.TFrame", height=1)
         self.page_box.pack(fill="x")
+        self.page_box.grid_propagate(False)
+        self.page_box.columnconfigure(0, weight=1)
         self.pages = {name: ttk.Frame(self.page_box, style="Bg.TFrame") for name in PAGES}
+        for name, frame in self.pages.items():
+            frame.grid(row=0, column=0, sticky="new")
+            frame.bind("<Configure>", lambda e, n=name: self._fit_page_box(n))
         self.build_sborka(self.pages["Сборка"])
         self.build_ozon(self.pages["Ozon"])
         self.build_wb(self.pages["Wildberries"])
@@ -4211,43 +4218,21 @@ class App(tk.Tk):
         else:
             self.nav[name].set_colors(C["side"], C["nav_hi"], C["muted"])
 
-    def frozen(self, change):
-        """Сделать change, пока Windows не рисует окно, и показать результат разом.
-        Без этого каждая карточка и кнопка (у Windows это отдельные окошки) прорисовывается по очереди."""
-        if sys.platform != "win32":
-            change()
-            return
-        try:
-            import ctypes
-            user32 = ctypes.windll.user32
-            hwnd = user32.GetParent(self.winfo_id()) or self.winfo_id()
-        except Exception:  # noqa: BLE001
-            change()
-            return
-        user32.SendMessageW(hwnd, 0x000B, 0, 0)        # WM_SETREDRAW: не рисовать
-        try:
-            change()
-            self.update_idletasks()
-        finally:
-            user32.SendMessageW(hwnd, 0x000B, 1, 0)    # WM_SETREDRAW: рисовать
-            # RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN | RDW_UPDATENOW | RDW_FRAME
-            user32.RedrawWindow(hwnd, None, None, 0x0001 | 0x0004 | 0x0080 | 0x0100 | 0x0400)
+    def _fit_page_box(self, name):
+        """Высота области вкладок — по открытой вкладке (остальные лежат под ней)."""
+        if name == getattr(self, "current_page", None):
+            height = self.pages[name].winfo_reqheight()
+            if int(float(self.page_box.cget("height"))) != height:
+                self.page_box.configure(height=height)
 
     def show_page(self, name):
-        if getattr(self, "current_page", None) != name and self.winfo_ismapped():
-            self.frozen(lambda: self._show_page(name))
-        else:
-            self._show_page(name)
-
-    def _show_page(self, name):
+        if name == getattr(self, "current_page", None):
+            return
         self.current_page = name
         if name == "СДЭК" and hasattr(self, "cdek_keys"):
             self.refresh_cdek()  # ключи могли появиться в «Настройках»
-        for n, frame in self.pages.items():
-            if n == name:
-                frame.pack(fill="x")
-            else:
-                frame.pack_forget()
+        self.pages[name].tkraise()
+        self._fit_page_box(name)
         for n in PAGES:
             self.paint_nav(n)
         self.page_title.configure(text=name)
@@ -5657,7 +5642,8 @@ class App(tk.Tk):
             if abs(target - value) > 0.01:
                 step = max((target - value) * 0.25, self._bar_total / 400)
                 self.bar.configure(value=min(target, value + step))
-        self.after(30, self.ease_bar)
+        # Пока ничего не идёт — заглядываем редко, чтобы не будить программу 33 раза в секунду
+        self.after(30 if self.busy else 250, self.ease_bar)
 
     def poll(self):
         start, lines, more = time.monotonic(), [], False
