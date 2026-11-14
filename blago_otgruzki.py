@@ -72,7 +72,7 @@ from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.pdfgen import canvas
 
 APP_NAME = "BLAGO OTGRUZKI"
-APP_VERSION = "1.56"  # при каждом обновлении +0.1, запись в CHANGELOG.md
+APP_VERSION = "1.57"  # при каждом обновлении +0.1, запись в CHANGELOG.md
 API = "https://api-seller.ozon.ru"
 BATCH = 20                   # максимум отправлений в одном запросе этикеток
 READY = "awaiting_deliver"   # статус, в котором Ozon отдаёт этикетку
@@ -3865,69 +3865,84 @@ def round_photo(widget, w, h, r, fill, border, outer):
     return photo
 
 
+def corner_photo(widget, r, fill, border, outer, which):
+    """Маленький уголок r×r (nw, ne, sw, se) для карточки; кэш окна."""
+    root = widget.winfo_toplevel()
+    cache = root.__dict__.setdefault("_corner_photos", {})
+    key = (r, fill, border, outer, which)
+    if key not in cache:
+        from PIL import Image
+        tile = _corner_tile(r, fill, border, outer)
+        tile = {"nw": tile, "ne": tile.transpose(Image.FLIP_LEFT_RIGHT),
+                "sw": tile.transpose(Image.FLIP_TOP_BOTTOM), "se": tile.transpose(Image.ROTATE_180)}[which]
+        buf = io.BytesIO()
+        tile.save(buf, "PNG")
+        cache[key] = tk.PhotoImage(master=root, data=base64.b64encode(buf.getvalue()))
+    return cache[key]
+
+
 class RoundBox(tk.Frame):
-    """Скруглённая карточка: фон — картинка во всю рамку, содержимое кладут в .inner (с отступом pad).
+    """Скруглённая карточка из кусочков (1.57): заливка — цвет самой рамки, по углам — маленькие картинки,
+    рамка — линии в 1 точку. При изменении размера ничего не перерисовывается: окно на весь экран
+    разворачивается сразу, а не собирается по карточке. Содержимое кладут в .inner (отступ pad).
     stretch — содержимое тянется по высоте рамки."""
 
     def __init__(self, parent, fill, border=None, radius=14, pad=5, stretch=False, height=1):
         self.outer = _bg_of(parent)
-        super().__init__(parent, bg=self.outer, height=height, width=1, bd=0, highlightthickness=0)
+        super().__init__(parent, bg=fill, height=height, width=1, bd=0, highlightthickness=0)
         ui = _ui_scale(parent)
-        self.fill, self.border, self.r = fill, border, int(radius * ui)
+        self.fill, self.border, self.r = fill, border, max(2, int(radius * ui))
         self.pad = max(1, int(pad * ui))
-        self._back = tk.Label(self, bd=0, highlightthickness=0, padx=0, pady=0, bg=self.outer)
-        self._back.place(x=0, y=0, relwidth=1, relheight=1)
+        r = self.r
+        self._corners = {}
+        for which, opts in (("nw", {"x": 0, "y": 0}), ("ne", {"relx": 1, "y": 0}),
+                            ("sw", {"x": 0, "rely": 1}), ("se", {"relx": 1, "rely": 1})):
+            lbl = tk.Label(self, bd=0, highlightthickness=0, padx=0, pady=0, bg=fill)
+            lbl.place(anchor=which, **opts)
+            self._corners[which] = lbl
+        self._lines = []
+        for opts in ({"x": r, "y": 0, "relwidth": 1, "width": -2 * r, "height": 1},
+                     {"x": r, "rely": 1, "y": -1, "relwidth": 1, "width": -2 * r, "height": 1},
+                     {"x": 0, "y": r, "width": 1, "relheight": 1, "height": -2 * r},
+                     {"relx": 1, "x": -1, "y": r, "width": 1, "relheight": 1, "height": -2 * r}):
+            line = tk.Frame(self, bd=0, highlightthickness=0, bg=border or fill)
+            line.place(**opts)
+            self._lines.append(line)
         self.inner = tk.Frame(self, bg=fill, bd=0, highlightthickness=0)
         self.inner.pack(fill="both", expand=True, padx=self.pad, pady=self.pad)
         if stretch:
             self.pack_propagate(False)
-        self._job, self._drawn = None, None
-        self.flat = not getattr(self.winfo_toplevel(), "rounded", True)
-        if self.flat:   # без скруглений: плоская карточка с рамкой в 1 точку, перерисовывать нечего
-            self._back.place_forget()
-            tk.Frame.configure(self, bg=fill, highlightthickness=1 if border else 0,
-                               highlightbackground=border or fill, highlightcolor=border or fill)
-        else:
-            self.bind("<Configure>", self._later)
+        self._paint()
 
-    def _later(self, _event=None):
-        if self._job is None:
-            self._job = self.after_idle(self.redraw)
+    def _paint(self):
+        try:
+            for which, lbl in self._corners.items():
+                lbl.configure(image=corner_photo(self, self.r, self.fill, self.border, self.outer, which))
+        except ImportError:   # нет Pillow — углы просто прямые
+            for lbl in self._corners.values():
+                lbl.place_forget()
+        for line in self._lines:
+            line.configure(bg=self.border or self.fill)
 
     def redraw(self):
-        self._job = None
-        if self.flat:
-            tk.Frame.configure(self, highlightbackground=self.border or self.fill,
-                               highlightcolor=self.border or self.fill)
-            return
-        w, h = self.winfo_width(), self.winfo_height()
-        if w < 4 or h < 4:
-            return
-        key = (w, h, self.fill, self.border)
-        if key == self._drawn:
-            return
-        self._drawn = key
-        photo = round_photo(self, w, h, self.r, self.fill, self.border, self.outer)
-        if photo is not None:
-            self._back.configure(image=photo)
+        self._paint()
 
     def set_fill(self, fill):
         if fill != self.fill:
             self.fill = fill
+            tk.Frame.configure(self, bg=fill)
             self.inner.configure(bg=fill)
             for child in self.inner.winfo_children():
                 try:
                     child.configure(bg=fill)
                 except tk.TclError:
                     pass
-            if self.flat:
-                tk.Frame.configure(self, bg=fill)
-            self.redraw()
+            self._paint()
 
     def set_border(self, color):
         if color != self.border:
             self.border = color
-            self.redraw()
+            self._paint()
 
 
 class REntry(RoundBox):
@@ -3943,7 +3958,7 @@ class REntry(RoundBox):
         self.entry.pack(fill="x", padx=int(8 * ui), pady=int(5 * ui))
         self.entry.bind("<FocusIn>", lambda e: self.set_border(C["accent"]), add="+")
         self.entry.bind("<FocusOut>", lambda e: self.set_border(C["line"]), add="+")
-        for w in (self, self.inner, self._back):
+        for w in (self, self.inner):
             w.bind("<Button-1>", lambda e: self.entry.focus_set(), add="+")
 
     def configure(self, cnf=None, **kw):
@@ -4373,6 +4388,10 @@ class App(tk.Tk):
         """Высота области вкладок одна на все вкладки — по самой высокой (кроме «Настроек», они листаются).
         При переключении вкладок журнал внизу не двигается и не перерисовывается (1.56)."""
         height = max(f.winfo_reqheight() for n, f in self.pages.items() if n != "Настройки")
+        if getattr(self, "current_page", None) == "Настройки":
+            # В «Настройках» журнал поменьше — настройкам больше места (1.57)
+            top = self.page_box.winfo_rooty() - self.winfo_rooty()
+            height = max(height, self.winfo_height() - top - int(150 * self.ui))
         if int(float(self.page_box.cget("height"))) != height:
             self.page_box.configure(height=height)
 
@@ -4837,6 +4856,7 @@ class App(tk.Tk):
             # Привязка к окну срабатывает и на каждый виджет внутри — пересчёт только для самого окна
             if e.widget is self:
                 fit()
+                self._fit_page_box()
 
         def on_canvas(e):
             if int(canvas.itemcget(win, "width") or 0) != e.width:
