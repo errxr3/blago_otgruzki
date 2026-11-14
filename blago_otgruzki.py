@@ -72,7 +72,7 @@ from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.pdfgen import canvas
 
 APP_NAME = "BLAGO OTGRUZKI"
-APP_VERSION = "1.49"  # при каждом обновлении +0.1, запись в CHANGELOG.md
+APP_VERSION = "1.50"  # при каждом обновлении +0.1, запись в CHANGELOG.md
 API = "https://api-seller.ozon.ru"
 BATCH = 20                   # максимум отправлений в одном запросе этикеток
 READY = "awaiting_deliver"   # статус, в котором Ozon отдаёт этикетку
@@ -3444,13 +3444,13 @@ def sklad_decide(market, channel, truck, postings, times, colored, log, confirm,
 C_LIGHT = {
     "side": "#FFFFFF", "bg": "#F4F6FB", "card": "#FFFFFF", "field": "#FFFFFF", "line": "#E1E5EF",
     "text": "#1B2037", "muted": "#6B7285", "dim": "#9AA1B2", "accent": "#4C5FD5", "accent_hi": "#3D4FC2",
-    "on_accent": "#FFFFFF", "btn": "#EEF0F6", "btn_hi": "#E2E6F3", "nav_hi": "#EEF0FD",
+    "on_accent": "#FFFFFF", "btn": "#EEF0F6", "btn_hi": "#E2E6F3", "nav_hi": "#EEF0FD", "nav_hover": "#F5F6FA",
     "ok": "#15803D", "err": "#C62828", "warn": "#B45309", "note": "#9A6700",
 }
 C_DARK = {
     "side": "#121728", "bg": "#0E1220", "card": "#161B2C", "field": "#11162A", "line": "#252C42",
     "text": "#E8EBF5", "muted": "#98A1B8", "dim": "#6B7490", "accent": "#7C8CFF", "accent_hi": "#95A2FF",
-    "on_accent": "#0E1220", "btn": "#222A42", "btn_hi": "#2C3552", "nav_hi": "#232A4D",
+    "on_accent": "#0E1220", "btn": "#222A42", "btn_hi": "#2C3552", "nav_hi": "#232A4D", "nav_hover": "#191F33",
     "ok": "#22C55E", "err": "#F87171", "warn": "#FB923C", "note": "#FBBF24",
 }
 UI_CONFIG = BASE_DIR / "ui.json"   # тема окна — у каждого компьютера своя
@@ -3861,7 +3861,7 @@ BUTTON_KINDS = {
     "TButton": ("btn", "btn_hi", "text", 10, 14, 8),
     "Big.TButton": ("btn", "btn_hi", "text", 10, 18, 10),
     "Accent.TButton": ("accent", "accent_hi", "on_accent", 11, 22, 10),
-    "Nav": ("side", "nav_hi", "muted", 11, 14, 9),
+    "Nav": ("side", "nav_hover", "muted", 11, 14, 9),
     "Chip": ("btn", "btn_hi", "text", 10, 16, 7),
 }
 
@@ -4143,14 +4143,23 @@ class App(tk.Tk):
         self.footer.trace_add("write", lambda *_: self.refresh_links())
         self.show_page("Сборка")
         self.update_idletasks()
+        self.dark_titlebar()
+        try:
+            self.attributes("-alpha", 0.0)   # Windows рисует окно невидимым, видно — уже готовое
+        except tk.TclError:
+            pass
         self.deiconify()
+        self.update()
+        try:
+            self.attributes("-alpha", 1.0)
+        except tk.TclError:
+            pass
         try:   # заставка exe (пока он распаковывается) — убрать, окно готово
             import pyi_splash
             pyi_splash.close()
         except ImportError:
             pass
         self.protocol("WM_DELETE_WINDOW", self.on_close)
-        self.after(50, self.dark_titlebar)
         self.after(100, self.poll)
         self.after(100, self.ease_bar)
         self.after(500, self.refresh_sklad_line)
@@ -4216,7 +4225,7 @@ class App(tk.Tk):
         if on:
             self.nav[name].set_colors(C["nav_hi"], C["nav_hi"], C["accent"])
         else:
-            self.nav[name].set_colors(C["side"], C["nav_hi"], C["muted"])
+            self.nav[name].set_colors(C["side"], C["nav_hover"], C["muted"])
 
     def _fit_page_box(self, name):
         """Высота области вкладок — по открытой вкладке (остальные лежат под ней)."""
@@ -4228,6 +4237,14 @@ class App(tk.Tk):
     def show_page(self, name):
         if name == getattr(self, "current_page", None):
             return
+        started = time.perf_counter()
+        if self.winfo_ismapped():
+            # Вкладка открылась дольше 0.2 с — пишем в журнал, чтобы было видно, что тормозит на компьютере
+            def report():
+                ms = int((time.perf_counter() - started) * 1000)
+                if ms > 200:
+                    self.log(f"(вкладка «{name}» открылась за {ms} мс)")
+            self.after_idle(lambda: self.after(1, report))
         self.current_page = name
         if name == "СДЭК" and hasattr(self, "cdek_keys"):
             self.refresh_cdek()  # ключи могли появиться в «Настройках»
