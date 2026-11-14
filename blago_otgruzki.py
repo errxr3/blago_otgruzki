@@ -72,12 +72,55 @@ from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.pdfgen import canvas
 
 APP_NAME = "BLAGO OTGRUZKI"
-APP_VERSION = "1.50"  # при каждом обновлении +0.1, запись в CHANGELOG.md
+APP_VERSION = "1.51"  # при каждом обновлении +0.1, запись в CHANGELOG.md
 API = "https://api-seller.ozon.ru"
 BATCH = 20                   # максимум отправлений в одном запросе этикеток
 READY = "awaiting_deliver"   # статус, в котором Ozon отдаёт этикетку
 BASE_DIR = Path(sys.executable).parent if getattr(sys, "frozen", False) else Path(__file__).parent
-CONFIG = BASE_DIR / "cabinets.json"
+
+
+def _data_dir():
+    """Где хранятся настройки, ключи и служебные файлы (1.51).
+    Windows: %APPDATA%\\BLAGO OTGRUZKI — рядом с exe ничего не лежит, exe можно носить куда угодно.
+    Другие системы (разработка, тесты): папка программы, как раньше."""
+    appdata = os.environ.get("APPDATA") if sys.platform == "win32" else None
+    if appdata:
+        folder = Path(appdata) / "BLAGO OTGRUZKI"
+        try:
+            folder.mkdir(parents=True, exist_ok=True)
+            return folder
+        except OSError:
+            pass
+    return BASE_DIR
+
+
+DATA_DIR = _data_dir()
+DATA_FILES = ("cabinets.json", "wb.json", "cdek.json", "sklad.json", "morning.json", "ui.json",
+              "stickers.json", "sklad_pending.json", "sklad_morning.json")
+
+
+def move_old_data():
+    """Файлы настроек из папки программы (до 1.51) — переносятся в DATA_DIR один раз."""
+    if DATA_DIR == BASE_DIR:
+        return []
+    moved = []
+    for name in DATA_FILES:
+        old, new = BASE_DIR / name, DATA_DIR / name
+        if old.exists() and not new.exists():
+            try:
+                os.replace(old, new)
+                moved.append(name)
+            except OSError:
+                try:   # другой диск — копируем, старый удаляем
+                    new.write_bytes(old.read_bytes())
+                    old.unlink()
+                    moved.append(name)
+                except OSError:
+                    pass
+    return moved
+
+
+CONFIG = DATA_DIR / "cabinets.json"
 
 # --- производства
 KOMINTERNA, UCHITELSKAYA = "Коминтерна", "Учительская"
@@ -681,7 +724,7 @@ def sticker_codes(text):
     return out
 
 
-STICKERS_FILE = BASE_DIR / "stickers.json"  # код «ii…» → отправление, за 14 дней (1.32)
+STICKERS_FILE = DATA_DIR / "stickers.json"  # код «ii…» → отправление, за 14 дней (1.32)
 
 
 def remember_stickers(found):
@@ -1318,7 +1361,7 @@ def process(excel, sheet, cabinets, days, out, log, progress, download=True,
 # ================================================================ Wildberries
 
 WB_API = "https://marketplace-api.wildberries.ru"
-WB_CONFIG = BASE_DIR / "wb.json"
+WB_CONFIG = DATA_DIR / "wb.json"
 WB_BATCH = 100            # заданий в одном запросе добавления в поставку и стикеров
 WB_GAP = 0.21             # WB: не чаще одного запроса в 200 мс
 WB_CARGO = {1: "МГТ", 2: "СГТ", 3: "КГТ"}
@@ -1986,7 +2029,7 @@ def _wb_download(token, supplies, known, out, day, log, progress):
 
 # ================================================================ Утро: отчёты и сборка
 
-MORNING_CONFIG = BASE_DIR / "morning.json"
+MORNING_CONFIG = DATA_DIR / "morning.json"
 MSK = timezone(timedelta(hours=3))   # время в отчётах — московское, как в выгрузках Ozon
 OZON_STATUSES = (PACKING, READY)     # «ожидают сборки» и «ожидают отгрузки»
 # склад с таким словом в названии — отчёт КГТ (в кабинете R он называется «FBS - СГТ Тверь»)
@@ -2492,7 +2535,7 @@ def add_cdek(template, cdek, out, log, today=None, send_sklad=True):
 # ---------------------------------------------------------------- СДЭК по заказам (WB DBS)
 # Файл заказов: «№ задания», «Артикул продавца», «трэк» (номер заказа СДЭК, статус «Создан»).
 # На каждое производство: лист сборки, ШК СДЭК в том же порядке и акт приёма-передачи.
-CDEK_CONFIG = BASE_DIR / "cdek.json"
+CDEK_CONFIG = DATA_DIR / "cdek.json"
 CDEK_API = "https://api.cdek.ru/v2"
 CDEK = {"account": "", "secure": ""}
 COL_TASK = ("№ задания", "Номер задания", "Номер отправления ИМ")
@@ -3113,8 +3156,8 @@ def make_cdek(orders, out, log, today=None):
 # и партии скачанных этикеток (по ним грузчики сверяют зеркала при погрузке).
 # Если склад не настроен — программа работает как раньше, без него.
 
-SKLAD_CONFIG = BASE_DIR / "sklad.json"
-SKLAD_PENDING = BASE_DIR / "sklad_pending.json"   # не ушло на склад — отправится при следующей связи
+SKLAD_CONFIG = DATA_DIR / "sklad.json"
+SKLAD_PENDING = DATA_DIR / "sklad_pending.json"   # не ушло на склад — отправится при следующей связи
 SKLAD = {"url": "", "key": ""}                     # заполняется из «Настроек»
 # Что последним ушло на склад — строка состояния над журналом: (ok|err, текст)
 SKLAD_LAST = {"kind": "", "text": ""}
@@ -3156,7 +3199,7 @@ def sklad_check():
         raise RuntimeError(f"ошибка {r.status_code}")
 
 
-SKLAD_MORNING = BASE_DIR / "sklad_morning.json"   # заказы ждут проверки и кнопки «Отправить на склад»
+SKLAD_MORNING = DATA_DIR / "sklad_morning.json"   # заказы ждут проверки и кнопки «Отправить на склад»
 
 
 def morning_load():
@@ -3453,7 +3496,7 @@ C_DARK = {
     "on_accent": "#0E1220", "btn": "#222A42", "btn_hi": "#2C3552", "nav_hi": "#232A4D", "nav_hover": "#191F33",
     "ok": "#22C55E", "err": "#F87171", "warn": "#FB923C", "note": "#FBBF24",
 }
-UI_CONFIG = BASE_DIR / "ui.json"   # тема окна — у каждого компьютера своя
+UI_CONFIG = DATA_DIR / "ui.json"   # тема окна — у каждого компьютера своя
 
 
 def ui_theme():
@@ -4714,7 +4757,7 @@ class App(tk.Tk):
         top = ttk.Frame(tab, style="Bg.TFrame")
         top.pack(fill="x", pady=(0, 4))
         self.button(top, "Сохранить настройки", self.save_now, "Accent.TButton")
-        self.save_status = tk.Label(top, text=f"Настройки и ключи хранятся в папке программы: {BASE_DIR}",
+        self.save_status = tk.Label(top, text=f"Настройки и ключи хранятся в папке: {DATA_DIR}",
                                     bg=C["bg"], fg=C["muted"], font=(FONT, 9), anchor="w")
         self.save_status.pack(side="left", padx=(12, 0))
         look = self.card(tab, "Вид окна")
@@ -4996,12 +5039,12 @@ class App(tk.Tk):
             ok = False
         t = datetime.now(MSK)
         if ok:
-            self.save_status.configure(text=f"✔ Сохранено в {t:%H:%M} — папка {BASE_DIR}", foreground=C["ok"])
-            self.log(f"✔ Настройки сохранены: {BASE_DIR}")
+            self.save_status.configure(text=f"✔ Сохранено в {t:%H:%M} — папка {DATA_DIR}", foreground=C["ok"])
+            self.log(f"✔ Настройки сохранены: {DATA_DIR}")
         else:
-            self.save_status.configure(text=f"✖ Не сохранилось — нет доступа к папке {BASE_DIR}",
+            self.save_status.configure(text=f"✖ Не сохранилось — нет доступа к папке {DATA_DIR}",
                                        foreground=C["err"])
-            self.log(f"✖ Настройки не сохранились в {BASE_DIR}. Перенеси программу в обычную папку "
+            self.log(f"✖ Настройки не сохранились в {DATA_DIR}. Перенеси программу в обычную папку "
                      f"(например, на Рабочий стол) и запускай всегда оттуда.")
 
     def on_close(self):
@@ -5693,4 +5736,8 @@ class App(tk.Tk):
 
 
 if __name__ == "__main__":
-    App().mainloop()
+    _moved = move_old_data()
+    app = App()
+    if _moved:
+        app.log(f"Настройки перенесены из папки программы в {DATA_DIR}: " + ", ".join(_moved))
+    app.mainloop()
