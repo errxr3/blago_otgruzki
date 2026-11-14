@@ -72,7 +72,7 @@ from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.pdfgen import canvas
 
 APP_NAME = "BLAGO OTGRUZKI"
-APP_VERSION = "1.57"  # при каждом обновлении +0.1, запись в CHANGELOG.md
+APP_VERSION = "1.58"  # при каждом обновлении +0.1, запись в CHANGELOG.md
 API = "https://api-seller.ozon.ru"
 BATCH = 20                   # максимум отправлений в одном запросе этикеток
 READY = "awaiting_deliver"   # статус, в котором Ozon отдаёт этикетку
@@ -4256,6 +4256,7 @@ class App(tk.Tk):
         self.page_box.pack(fill="x")
         self.page_box.grid_propagate(False)
         self.page_box.columnconfigure(0, weight=1)
+        self.page_box.rowconfigure(0, weight=1)   # вкладка тянется на всю высоту области (иначе «Настройки» с дырой)
         self.pages = {name: ttk.Frame(self.page_box, style="Bg.TFrame") for name in PAGES}
         for name, frame in self.pages.items():
             frame.grid(row=0, column=0, sticky="nsew")   # каждая закрывает всю область, под ней не видно других
@@ -4398,37 +4399,14 @@ class App(tk.Tk):
     def show_page(self, name):
         if name == getattr(self, "current_page", None):
             return
-        started = time.perf_counter()
-        measure = self.winfo_ismapped()
         self.current_page = name
         if name == "СДЭК" and hasattr(self, "cdek_keys"):
             self.refresh_cdek()  # ключи могли появиться в «Настройках»
-        steps = []
-
-        def mark(what):
-            steps.append((what, time.perf_counter()))
-
         self.pages[name].tkraise()
-        mark("поднять")
         self._fit_page_box(name)
-        mark("высота")
         for n in PAGES:
             self.paint_nav(n)
-        mark("меню")
         self.page_title.configure(text=name)
-        if measure:
-            # Замер по шагам: где именно тормозит на этом компьютере (пишется в журнал, если дольше 0.15 с)
-            self.update_idletasks()
-            mark("раскладка")
-            self.update()
-            mark("рисование")
-            ms = int((time.perf_counter() - started) * 1000)
-            if ms > 150:
-                parts, prev = [], started
-                for what, t in steps:
-                    parts.append(f"{what} {int((t - prev) * 1000)}")
-                    prev = t
-                self.log(f"(вкладка «{name}» {ms} мс: " + ", ".join(parts) + ")")
 
     def hand_cursor(self, widget):
         """Рука над всем, что нажимается."""
