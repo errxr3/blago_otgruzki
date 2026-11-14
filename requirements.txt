@@ -2,3 +2,4 @@ requests
 openpyxl
 pypdf
 reportlab
+pywebview

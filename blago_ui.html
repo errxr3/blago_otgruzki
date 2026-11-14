@@ -1,0 +1,597 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<title>BLAGO OTGRUZKI</title>
+<!-- Окно BLAGO OTGRUZKI (2.0): страница во встроенном браузере Windows, вид — как у сайта склада.
+     Программа отвечает через window.pywebview.api; события забираются раз в 0.1 с (poll). -->
+<style>
+:root {
+	--bg: #f4f6fb; --card: #ffffff; --side: #ffffff; --text: #1b2037; --muted: #6b7285; --dim: #9aa1b2;
+	--line: #e6e9f1; --field: #ffffff; --field-line: #d9deea; --accent: #4c5fd5; --accent-dark: #3d4fc2;
+	--accent-soft: #eef0fd; --on-accent: #ffffff; --btn: #eef0f6; --btn-hi: #e2e6f3; --hover: #f5f6fa;
+	--ok: #15803d; --err: #c62828; --warn: #b45309; --note: #9a6700;
+	--shadow: 0 1px 2px rgba(23,31,66,.04), 0 6px 20px rgba(23,31,66,.06);
+	--radius: 14px; --radius-sm: 10px;
+	color-scheme: light;
+}
+:root[data-theme="dark"] {
+	--bg: #0e1220; --card: #161b2c; --side: #121728; --text: #e8ebf5; --muted: #98a1b8; --dim: #6b7490;
+	--line: #252c42; --field: #11162a; --field-line: #2c3450; --accent: #7c8cff; --accent-dark: #95a2ff;
+	--accent-soft: #232a4d; --on-accent: #0e1220; --btn: #222a42; --btn-hi: #2c3552; --hover: #191f33;
+	--ok: #22c55e; --err: #f87171; --warn: #fb923c; --note: #fbbf24;
+	--shadow: 0 1px 2px rgba(0,0,0,.3), 0 8px 22px rgba(0,0,0,.25);
+	color-scheme: dark;
+}
+* { box-sizing: border-box; }
+html, body { height: 100%; margin: 0; }
+body {
+	font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; font-size: 14px;
+	background: var(--bg); color: var(--text); display: flex; overflow: hidden;
+	-webkit-font-smoothing: antialiased; user-select: none; cursor: default;
+}
+input, textarea, .log, .selectable { user-select: text; }
+
+/* ---------- меню слева */
+aside {
+	width: 228px; flex: none; background: var(--side); border-right: 1px solid var(--line);
+	display: flex; flex-direction: column; padding: 24px 14px 20px;
+}
+.logo { padding: 0 10px 22px; font-size: 19px; font-weight: 800; letter-spacing: .02em; }
+.logo span { color: var(--accent); font-size: 13px; font-weight: 700; margin-left: 8px; letter-spacing: 0; }
+nav a {
+	display: flex; align-items: center; gap: 12px; padding: 10px 12px; margin: 2px 0; border-radius: var(--radius-sm);
+	color: var(--muted); font-weight: 650; text-decoration: none; cursor: pointer;
+}
+nav a svg { width: 20px; height: 20px; flex: none; }
+nav a svg.brand { width: 22px; height: 22px; margin: -1px; }
+
+nav a:hover { background: var(--hover); color: var(--text); }
+nav a.active { background: var(--accent-soft); color: var(--accent); }
+.side-foot { margin-top: auto; padding: 0 10px; }
+.side-foot b { display: block; font-size: 16px; }
+.side-foot small { color: var(--muted); display: block; margin-top: 2px; }
+.side-foot .ver { color: var(--dim); font-size: 11px; margin-top: 10px; }
+
+/* ---------- основная часть */
+main { flex: 1; min-width: 0; display: flex; flex-direction: column; padding: 22px 28px 20px; gap: 12px; }
+.top { display: flex; align-items: center; gap: 12px; }
+.top h1 { margin: 0; font-size: 26px; font-weight: 800; flex: 1; }
+.path { color: var(--muted); cursor: pointer; padding: 6px 4px; border-radius: 8px; }
+.path:hover { color: var(--text); }
+.sklad { display: flex; align-items: center; gap: 12px; min-height: 30px; font-weight: 650; font-size: 13px; }
+.pages { flex: 1 1 auto; min-height: 0; overflow-y: auto; margin-right: -8px; padding-right: 8px; }
+.page { display: none; flex-direction: column; gap: 12px; padding-bottom: 2px; }
+.page.on { display: flex; }
+
+.card { background: var(--card); border: 1px solid var(--line); border-radius: var(--radius); box-shadow: var(--shadow);
+	padding: 16px 20px 18px; }
+.card h2 { margin: 0 0 12px; font-size: 15px; font-weight: 750; display: flex; align-items: center; gap: 10px; }
+.card h2 .right { margin-left: auto; font-size: 13px; font-weight: 500; }
+.row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.row .grow { flex: 1; }
+.pair { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+.info { color: var(--muted); margin-top: 10px; line-height: 1.45; white-space: pre-line; }
+.info:empty { display: none; }
+.file { font-weight: 700; font-size: 14px; }
+.link { color: var(--muted); margin-top: 12px; font-size: 13px; }
+.link a { color: var(--muted); text-decoration: none; cursor: pointer; margin-left: 6px; }
+.link a:hover { color: var(--accent); }
+.link a .open { margin-left: 14px; }
+.c-ok { color: var(--ok) !important; } .c-err { color: var(--err) !important; } .c-warn { color: var(--warn) !important; }
+.c-accent { color: var(--accent) !important; } .c-dim { color: var(--dim) !important; } .c-text { color: var(--text) !important; }
+.c-muted { color: var(--muted) !important; }
+
+/* ---------- кнопки */
+button {
+	font: inherit; font-weight: 700; border: 0; border-radius: var(--radius-sm); padding: 9px 16px; cursor: pointer;
+	background: var(--btn); color: var(--text); transition: background .12s, transform .06s; white-space: nowrap;
+}
+button:hover { background: var(--btn-hi); }
+button:active { transform: translateY(1px); }
+button.big { padding: 11px 18px; }
+button.accent { background: var(--accent); color: var(--on-accent); padding: 11px 22px; font-size: 14.5px; }
+button.accent:hover { background: var(--accent-dark); }
+button.chip { padding: 7px 16px; }
+button.chip.on { background: var(--accent); color: var(--on-accent); }
+button.ghost { background: none; color: var(--muted); padding: 4px 6px; font-weight: 500; text-decoration: underline; }
+button.ghost:hover { color: var(--accent); }
+body.busy button.job, body.busy button.chip { opacity: .45; pointer-events: none; }
+.sep { width: 1px; height: 26px; background: var(--line); margin: 0 6px; }
+
+/* ---------- поля */
+input[type=text], input[type=password], input[type=number], select {
+	font: inherit; color: var(--text); background: var(--field); border: 1px solid var(--field-line);
+	border-radius: 9px; padding: 8px 11px; outline: none; min-width: 0;
+}
+input:focus, select:focus { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
+input[type=number] { width: 72px; }
+label.chk { display: inline-flex; align-items: center; gap: 8px; cursor: pointer; font-weight: 500; }
+label.chk input { width: 16px; height: 16px; accent-color: var(--accent); }
+.grid { display: grid; grid-template-columns: auto 1fr auto; gap: 8px 10px; align-items: center; }
+.grid .lbl, .lbl { color: var(--muted); }
+.cabs { display: grid; grid-template-columns: 150px 130px 1fr 150px; gap: 8px; align-items: center; }
+.cabs .h { color: var(--muted); font-size: 12px; }
+
+/* ---------- журнал */
+.journal { flex: 0 0 34%; min-height: 150px; display: flex; flex-direction: column; padding: 12px 8px 10px 18px; }
+body.settings .journal { flex-basis: 20%; }
+.journal .head { display: flex; align-items: center; gap: 14px; padding-right: 12px; }
+.journal .head b { font-size: 15px; }
+.pill { font-size: 12px; font-weight: 700; color: var(--ok); }
+.pill.busy { color: var(--accent); }
+.bar { height: 4px; background: var(--btn); border-radius: 4px; margin: 10px 12px 0 0; overflow: hidden; display: none; }
+.bar i { display: block; height: 100%; width: 0; background: var(--accent); border-radius: 4px; transition: width .35s ease-out; }
+body.busy .bar.shown { display: block; }
+.log { flex: 1; overflow-y: auto; margin-top: 8px; padding-right: 10px; font-size: 13.5px; line-height: 1.55; }
+.log div { white-space: pre-wrap; word-break: break-word; min-height: 1.55em; }
+.log .ok { color: var(--ok); } .log .err { color: var(--err); } .log .head { color: var(--accent); font-weight: 750; margin-top: 4px; }
+.log .warn { color: var(--warn); font-weight: 700; } .log .warnbody { color: var(--warn); }
+.log .yellow { color: var(--note); } .log .big { color: var(--ok); font-weight: 750; font-size: 14.5px; } .log .muted { color: var(--dim); }
+
+::-webkit-scrollbar { width: 10px; height: 10px; }
+::-webkit-scrollbar-thumb { background: var(--btn-hi); border-radius: 10px; border: 2px solid var(--card); }
+::-webkit-scrollbar-track { background: transparent; }
+
+/* ---------- окно вопроса */
+.modal { position: fixed; inset: 0; background: rgba(10,14,30,.45); display: none; align-items: center; justify-content: center; z-index: 10; }
+.modal.on { display: flex; }
+.modal .box { background: var(--card); border-radius: 16px; box-shadow: 0 20px 60px rgba(0,0,0,.35); width: min(560px, 90vw);
+	padding: 22px 24px 18px; border: 1px solid var(--line); }
+.modal .text { white-space: pre-line; line-height: 1.5; max-height: 60vh; overflow-y: auto; user-select: text; }
+.modal .box.warn { border-top: 4px solid var(--warn); }
+.modal .box.err { border-top: 4px solid var(--err); }
+.modal .btns { display: flex; justify-content: flex-end; gap: 10px; margin-top: 18px; }
+</style>
+</head>
+<body>
+<aside>
+	<div class="logo">BLAGO<span>отгрузки</span></div>
+	<nav id="nav"></nav>
+	<div class="side-foot"><b id="date"></b><small id="weekday"></small><div class="ver" id="ver"></div></div>
+</aside>
+<main>
+	<div class="top">
+		<h1 id="title">Сборка</h1>
+		<span class="path" id="root" title="Открыть папку" onclick="act('open_link','root')"></span>
+		<button onclick="act('pick_root')">Сменить папку…</button>
+	</div>
+	<div class="sklad">
+		<span id="sklad"></span>
+		<button id="sklad_resend" style="display:none" onclick="act('flush_sklad')">Отправить неотправленное</button>
+		<button id="sklad_send" class="accent" style="display:none" onclick="act('send_morning')">Отправить на склад</button>
+	</div>
+
+	<div class="pages">
+	<!-- ===== Сборка ===== -->
+	<section class="page" data-page="Сборка">
+		<div class="card">
+			<h2>Утренняя сборка</h2>
+			<div class="row">
+				<button class="accent job" onclick="act('start_morning')">Скачать отчёты и сборку</button>
+				<button class="big job" onclick="act('start_cdek')">Добавить СДЭК…</button>
+				<button class="big job" onclick="act('pick_left')">Не уехало вчера…</button>
+			</div>
+			<div class="info" id="left_status"></div>
+			<div class="link">Сохраняется в:<a data-link="sborka"></a></div>
+			<div class="info" id="mo_status"></div>
+		</div>
+		<div class="card">
+			<h2>В течение дня</h2>
+			<div class="row" id="waves"></div>
+			<div class="row" style="margin-top:14px"><button class="accent job" onclick="act('start_wave')">Скачать отчёт и сборку</button></div>
+			<div class="link">Сохраняется в:<a data-link="wave"></a></div>
+			<div class="info" id="wave_status"></div>
+		</div>
+	</section>
+
+	<!-- ===== Ozon ===== -->
+	<section class="page" data-page="Ozon">
+		<div class="card">
+			<h2>Отчёт</h2>
+			<div class="row">
+				<span class="file grow" id="excel_name">не выбран</span>
+				<span id="sheet_box" style="display:none"><span class="lbl">лист</span>
+					<select id="sheet" onchange="act('set_sheet', this.value)"></select></span>
+				<button onclick="act('pick_excel')">Выбрать файл…</button>
+			</div>
+			<div class="info" id="report_info">Отчёт подставляется сам после «Сборки». Покрась его в Excel, сохрани и закрой.</div>
+		</div>
+		<div class="card">
+			<h2>Этикетки</h2>
+			<div class="row">
+				<span class="lbl">Надпись на ШК</span>
+				<input type="text" id="s_footer" list="footers" style="width:170px">
+				<datalist id="footers"></datalist>
+				<label class="chk" style="margin-left:14px"><input type="checkbox" id="s_autoship"> Собирать заказы из «Ожидают сборки»</label>
+			</div>
+			<div class="row" style="margin-top:16px">
+				<button class="big job" onclick="act('start_ozon','check')">Проверить</button>
+				<button class="accent job" onclick="act('start_ozon','run')">Скачать и собрать</button>
+				<button class="job" onclick="act('start_ozon','merge')">Пересобрать ленты</button>
+				<button class="job" onclick="act('start_passes')">Пропуска</button>
+			</div>
+			<div class="link">Сохраняется в:<a data-link="ozon"></a></div>
+		</div>
+	</section>
+
+	<!-- ===== Wildberries ===== -->
+	<section class="page" data-page="Wildberries">
+		<div class="card">
+			<h2>Отчёты ВБ и СГТ</h2>
+			<div class="row">
+				<span class="file grow" id="wb_files">не выбраны</span>
+				<button onclick="act('pick_wb')">Добавить файл…</button>
+				<button onclick="api('clear_wb')">Очистить</button>
+			</div>
+			<div class="info" id="wb_info">Отчёты подставляются сами после «Сборки».</div>
+		</div>
+		<div class="card">
+			<h2>Поставки и стикеры</h2>
+			<div class="row">
+				<button class="big job" onclick="act('start_wb','check')">Проверить</button>
+				<button class="accent job" onclick="act('start_wb','run')">Создать поставки и скачать</button>
+				<button class="job" onclick="act('start_wb','stickers')">Скачать ШК открытых поставок</button>
+			</div>
+			<div class="link">Сохраняется в:<a data-link="wb"></a></div>
+		</div>
+	</section>
+
+	<!-- ===== СДЭК ===== -->
+	<section class="page" data-page="СДЭК">
+		<div class="card">
+			<h2>Заказы СДЭК</h2>
+			<div class="row">
+				<span class="file grow" id="cdek_file">не выбран</span>
+				<button onclick="act('pick_cdek_file')">Выбрать файл…</button>
+			</div>
+			<div class="info" id="cdek_info">Файл из «макса»: № задания, Артикул продавца, трэк. Покраска — как в отчётах Ozon: красный не едет, жёлтый — сколько указано рядом.</div>
+		</div>
+		<div class="card">
+			<h2>Листы сборки, ШК и акты</h2>
+			<div class="row">
+				<button class="big job" onclick="act('start_cdek_check')">Проверить</button>
+				<button class="accent job" onclick="act('start_cdek_docs')">Сделать листы, ШК и акты</button>
+				<span class="lbl" id="cdek_keys"></span>
+			</div>
+			<div class="link">Сохраняется в:<a data-link="cdek"></a></div>
+			<div class="info" id="cdek_done"></div>
+		</div>
+	</section>
+
+	<!-- ===== Настройки ===== -->
+	<section class="page" data-page="Настройки">
+		<div class="row">
+			<button class="accent" onclick="act('save_now')">Сохранить настройки</button>
+			<span class="lbl selectable" id="save_status"></span>
+		</div>
+		<div class="card">
+			<h2>Вид окна</h2>
+			<div class="row">
+				<button class="chip" data-theme-btn="light" onclick="setTheme('light')">Светлая тема</button>
+				<button class="chip" data-theme-btn="dark" onclick="setTheme('dark')">Тёмная тема</button>
+			</div>
+		</div>
+		<div class="card">
+			<h2>Кабинеты Ozon <label class="chk right"><input type="checkbox" id="show_keys"> показать ключи</label></h2>
+			<div class="cabs" id="cabs"></div>
+			<div class="row" style="margin-top:10px">
+				<button class="job" onclick="act('test_keys')">Проверить ключи</button>
+				<button onclick="addCabinet()">+ кабинет</button>
+			</div>
+		</div>
+		<div class="pair">
+			<div class="card">
+				<h2>Wildberries</h2>
+				<div class="grid" style="grid-template-columns:auto 1fr">
+					<span class="lbl">Токен</span><input type="password" id="s_wb_token" class="secret">
+				</div>
+				<div class="row" style="margin-top:10px">
+					<button class="job" onclick="act('test_wb')">Проверить токен</button>
+					<span class="lbl" id="wb_status"></span>
+					<label class="chk" style="margin-left:auto"><input type="checkbox" onchange="reveal('s_wb_token', this.checked)"> показать</label>
+				</div>
+			</div>
+			<div class="card">
+				<h2>Файлы</h2>
+				<div class="grid">
+					<span class="lbl">Шаблон сборки</span><input type="text" id="s_template"><button onclick="act('pick_template')">…</button>
+					<span class="lbl">Куда сохранять</span><input type="text" id="s_root_dir"><button onclick="act('pick_root')">…</button>
+				</div>
+			</div>
+		</div>
+		<div class="card">
+			<h2>Склад BLAGO</h2>
+			<div class="grid" style="grid-template-columns:auto 1fr">
+				<span class="lbl">Адрес склада</span><input type="text" id="s_sklad_url">
+				<span class="lbl">Ключ</span><input type="password" id="s_sklad_key" class="secret">
+			</div>
+			<div class="row" style="margin-top:10px">
+				<button onclick="act('test_sklad')">Проверить связь</button>
+				<button class="job" onclick="act('flush_sklad')">Отправить на склад неотправленное</button>
+				<span class="lbl" id="sklad_status"></span>
+			</div>
+			<div class="info">Ключ создаётся на складе: Администратор → Ключи API. Пусто — программа работает без склада, как раньше.</div>
+		</div>
+		<div class="card">
+			<h2>СДЭК</h2>
+			<div class="grid" style="grid-template-columns:auto 1fr">
+				<span class="lbl">Account</span><input type="text" id="s_cdek_account">
+				<span class="lbl">Secure</span><input type="password" id="s_cdek_secure" class="secret">
+			</div>
+			<div class="row" style="margin-top:10px">
+				<button onclick="act('test_cdek')">Проверить ключи</button>
+				<span class="lbl" id="cdek_status"></span>
+			</div>
+			<div class="info">Ключи — в кабинете СДЭК: Интеграция → Ключи API. По ним программа качает ШК СДЭК.</div>
+		</div>
+		<div class="card">
+			<h2>Этикетки Ozon</h2>
+			<div class="row" style="gap:12px 26px">
+				<span><span class="lbl">Искать заказы за, дней</span> <input type="number" id="s_days" min="1" max="90"></span>
+				<span><span class="lbl">Отступ подписи</span> <input type="number" id="s_top_margin" min="8" max="40"></span>
+				<span><span class="lbl">Шрифт подписи</span> <input type="number" id="s_font_size" min="6" max="24"></span>
+			</div>
+		</div>
+		<div class="card">
+			<h2>Пропуска <label class="chk right"><input type="checkbox" id="s_pass_on"> делать пропуска</label></h2>
+			<div class="grid" style="grid-template-columns:auto 1fr auto 1fr">
+				<span class="lbl">Водитель</span><input type="text" id="s_pass_driver">
+				<span class="lbl">Телефон</span><input type="text" id="s_pass_phone">
+				<span class="lbl">Машины</span><input type="text" id="s_pass_cars" style="grid-column: span 3">
+			</div>
+		</div>
+	</section>
+	</div>
+
+	<div class="card journal">
+		<div class="head">
+			<b>Журнал</b><span class="pill" id="pill">●  готова к работе</span>
+			<button class="ghost" style="margin-left:auto" onclick="clearLog()">очистить</button>
+		</div>
+		<div class="bar" id="bar"><i></i></div>
+		<div class="log" id="log"></div>
+	</div>
+</main>
+
+<div class="modal" id="modal"><div class="box"><div class="text" id="m_text"></div>
+	<div class="btns" id="m_btns"></div></div></div>
+
+<script>
+const PAGES = ["Сборка", "Ozon", "Wildberries", "СДЭК", "Настройки"];
+const ICONS = {
+	"Сборка": '<path d="M9 5h11M9 12h11M9 19h11"/><path d="m3.5 5 1.5 1.5L7.5 4"/><path d="m3.5 12 1.5 1.5L7.5 11"/><path d="m3.5 19 1.5 1.5L7.5 18"/>',
+	"Ozon": '<rect x="2.5" y="3.5" width="19" height="17" rx="4.5"/><text x="12" y="16" text-anchor="middle" font-size="11" font-weight="800" fill="currentColor" stroke="none" font-family="system-ui, Segoe UI, sans-serif">O</text>',
+	"Wildberries": '<rect x="2.5" y="3.5" width="19" height="17" rx="4.5"/><text x="12" y="16" text-anchor="middle" font-size="8.5" font-weight="800" fill="currentColor" stroke="none" font-family="system-ui, Segoe UI, sans-serif">WB</text>',
+	"СДЭК": '<rect x="2.5" y="3.5" width="19" height="17" rx="4.5"/><text x="12" y="16" text-anchor="middle" font-size="11" font-weight="800" fill="currentColor" stroke="none" font-family="system-ui, Segoe UI, sans-serif">С</text>',
+	"Настройки": '<circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 0 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 0 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 0 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 0 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z"/>',
+};
+// Значки площадок — как их иконки: СДЭК зелёный со стрелкой, Ozon белый с кольцом, WB фиолетовый
+const BRANDS = {
+	"Ozon": '<svg class="brand" viewBox="0 0 24 24"><rect x="1" y="1" width="22" height="22" rx="6" fill="#fff" stroke="#d9deea"/><ellipse cx="12" cy="12" rx="6.2" ry="4.6" fill="none" stroke="#001a34" stroke-width="2.8"/></svg>',
+	"Wildberries": '<svg class="brand" viewBox="0 0 24 24"><defs><linearGradient id="wbg" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#cb11ab"/><stop offset="1" stop-color="#481173"/></linearGradient></defs><rect x="1" y="1" width="22" height="22" rx="6" fill="url(#wbg)"/><text x="12" y="15.6" text-anchor="middle" font-size="9.5" font-weight="800" fill="#fff" font-family="system-ui, Segoe UI, sans-serif">WB</text></svg>',
+	"СДЭК": '<svg class="brand" viewBox="0 0 24 24"><rect x="1" y="1" width="22" height="22" rx="6" fill="#1ab248"/><path d="M6.5 15.5 13.5 8.5M9 8h5.5v5.5" fill="none" stroke="#fff" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"/></svg>',
+};
+const $ = id => document.getElementById(id);
+const LOG_LIMIT = 6000;
+let state = null;
+
+function api(name, ...args) { return window.pywebview.api[name](...args); }
+function act(name, arg) { return api('action', name, arg === undefined ? null : arg); }
+
+// ---------- вкладки
+function showPage(name) {
+	for (const s of document.querySelectorAll('.page')) s.classList.toggle('on', s.dataset.page === name);
+	for (const a of document.querySelectorAll('nav a')) a.classList.toggle('active', a.dataset.page === name);
+	$('title').textContent = name;
+	document.body.classList.toggle('settings', name === 'Настройки');
+	document.querySelector('.pages').scrollTop = 0;
+}
+function buildNav() {
+	$('nav').innerHTML = PAGES.map(p => `<a data-page="${p}">${BRANDS[p] || `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">${ICONS[p]}</svg>`}${p}</a>`).join('');
+	for (const a of document.querySelectorAll('nav a')) a.onclick = () => showPage(a.dataset.page);
+}
+
+// ---------- тема
+function setTheme(t, save = true) {
+	document.documentElement.dataset.theme = t;
+	for (const b of document.querySelectorAll('[data-theme-btn]')) {
+		b.classList.toggle('on', b.dataset.themeBtn === t);
+		b.textContent = (b.dataset.themeBtn === t ? '✓ ' : '') + (b.dataset.themeBtn === 'dark' ? 'Тёмная тема' : 'Светлая тема');
+	}
+	if (save) act('set_theme', t);
+}
+
+// ---------- поля настроек: каждое меняется сразу, программа сохраняет сама
+function bindSettings(s) {
+	for (const [key, value] of Object.entries(s)) {
+		const el = $('s_' + key);
+		if (!el) continue;
+		if (el.type === 'checkbox') { el.checked = !!value; el.onchange = () => api('set', key, el.checked); }
+		else { el.value = value ?? ''; el.oninput = () => api('set', key, el.type === 'number' ? el.value : el.value); }
+	}
+}
+function setField(key, value) {
+	const el = $('s_' + key);
+	if (el) { if (el.type === 'checkbox') el.checked = !!value; else el.value = value; }
+	if (key === 'wave') drawWaves();
+}
+function reveal(id, on) { $(id).type = on ? 'text' : 'password'; }
+
+// ---------- волны
+function drawWaves() {
+	const wrap = $('waves');
+	const cur = state.s.wave;
+	wrap.innerHTML = '';
+	state.waves.forEach((w, i) => {
+		if (i && /кгт/i.test(w) && !/кгт/i.test(state.waves[i - 1])) wrap.insertAdjacentHTML('beforeend', '<span class="sep"></span>');
+		const b = document.createElement('button');
+		b.className = 'chip' + (w === cur ? ' on' : '');
+		b.textContent = w;
+		b.onclick = () => { state.s.wave = w; api('set', 'wave', w); drawWaves(); };
+		wrap.appendChild(b);
+	});
+}
+
+// ---------- кабинеты
+function drawCabs() {
+	const show = $('show_keys').checked;
+	const wrap = $('cabs');
+	wrap.innerHTML = '<span class="h">Название</span><span class="h">Client-Id</span><span class="h">Api-Key</span><span></span>';
+	state.cab.forEach((c, i) => {
+		for (const [field, type] of [['name', 'text'], ['cid', 'text'], ['key', show ? 'text' : 'password']]) {
+			const inp = document.createElement('input');
+			inp.type = type; inp.value = c[field] || '';
+			inp.oninput = () => { c[field] = inp.value; api('set_cabinet', i, field, inp.value); };
+			wrap.appendChild(inp);
+		}
+		const st = document.createElement('span');
+		st.className = 'lbl'; st.id = 'cab_' + i;
+		wrap.appendChild(st);
+	});
+}
+async function addCabinet() { state.cab = await api('add_cabinet'); drawCabs(); }
+
+// ---------- ссылки на папки
+function drawLinks(links, root) {
+	for (const a of document.querySelectorAll('[data-link]')) {
+		a.innerHTML = (links[a.dataset.link] || '') + '<span class="open">открыть ↗</span>';
+		a.onclick = () => act('open_link', a.dataset.link);
+	}
+	$('root').textContent = 'Папка:  ' + root;
+}
+
+// ---------- журнал
+let logBox;
+function logAdd(lines) {
+	if (!lines.length) return;
+	const atEnd = logBox.scrollTop + logBox.clientHeight >= logBox.scrollHeight - 4;
+	const frag = document.createDocumentFragment();
+	for (const l of lines) {
+		const d = document.createElement('div');
+		if (l.tag) d.className = l.tag;
+		d.textContent = l.text;
+		frag.appendChild(d);
+	}
+	logBox.appendChild(frag);
+	let extra = logBox.childElementCount - LOG_LIMIT;
+	while (extra-- > 0) logBox.firstElementChild.remove();
+	if (atEnd) logBox.scrollTop = logBox.scrollHeight;
+}
+function clearLog() { logBox.innerHTML = ''; }
+
+// ---------- полоса и «работаю…»
+function setBusy(on) {
+	document.body.classList.toggle('busy', on);
+	$('pill').textContent = on ? '●  работаю…' : '●  готова к работе';
+	$('pill').classList.toggle('busy', on);
+	if (!on) { $('bar').classList.remove('shown'); $('bar').firstElementChild.style.width = '0'; }
+}
+function setProgress(done, total) {
+	$('bar').classList.add('shown');
+	$('bar').firstElementChild.style.width = Math.min(100, done / total * 100) + '%';
+}
+
+// ---------- надписи
+function setStatus(id, text, color) {
+	const el = $(id);
+	if (!el) return;
+	el.textContent = text;
+	el.className = el.className.replace(/\bc-\w+/g, '').trim() + (color ? ' c-' + color : '');
+}
+
+// ---------- вопросы и предупреждения
+const asks = [];
+function showModal() {
+	if ($('modal').classList.contains('on') || !asks.length) return;
+	const q = asks.shift();
+	$('m_text').textContent = q.text;
+	$('modal').querySelector('.box').className = 'box' + (q.warn ? ' warn' : q.kind === 'err' ? ' err' : '');
+	const btns = $('m_btns');
+	btns.innerHTML = '';
+	const close = ok => { $('modal').classList.remove('on'); if (q.id) api('answer', q.id, ok); setTimeout(showModal, 0); };
+	if (q.id) {
+		const no = document.createElement('button'); no.textContent = 'Нет'; no.onclick = () => close(false);
+		const yes = document.createElement('button'); yes.className = 'accent'; yes.textContent = 'Да'; yes.onclick = () => close(true);
+		btns.append(no, yes);
+		setTimeout(() => yes.focus(), 0);
+	} else {
+		const ok = document.createElement('button'); ok.className = 'accent'; ok.textContent = 'Понятно'; ok.onclick = () => close(true);
+		btns.append(ok);
+		setTimeout(() => ok.focus(), 0);
+	}
+	$('modal').classList.add('on');
+}
+
+// ---------- события от программы
+function apply(ev) {
+	switch (ev.t) {
+		case 'status': setStatus(ev.id, ev.text, ev.color); break;
+		case 'progress': setProgress(ev.done, ev.total); break;
+		case 'progress_reset': $('bar').classList.remove('shown'); $('bar').firstElementChild.style.width = '0'; break;
+		case 'busy': setBusy(ev.on); break;
+		case 'links': drawLinks(ev.links, ev.root); break;
+		case 'set': state.s[ev.key] = ev.value; setField(ev.key, ev.value); break;
+		case 'excel':
+			$('excel_name').textContent = ev.name;
+			$('sheet').innerHTML = ev.sheets.map(s => `<option>${s.replace(/</g, '&lt;')}</option>`).join('');
+			$('sheet').value = ev.sheet;
+			$('sheet_box').style.display = ev.sheets.length > 1 ? '' : 'none';
+			break;
+		case 'wb_files': $('wb_files').textContent = ev.text; break;
+		case 'cdek_file': $('cdek_file').textContent = ev.name; break;
+		case 'cdek_keys': drawCdekKeys(ev.on); break;
+		case 'alert': asks.push({ text: ev.text, kind: ev.kind }); showModal(); break;
+		case 'ask': asks.push({ id: ev.id, text: ev.text, warn: ev.warn }); showModal(); break;
+	}
+}
+function drawCdekKeys(on) {
+	setStatus('cdek_keys', on ? 'ШК качаются по ключам СДЭК' : 'нет ключей СДЭК — «Настройки → СДЭК»', on ? 'muted' : 'err');
+}
+function drawSklad(s) {
+	setStatus('sklad', s.text, s.color);
+	$('sklad_send').style.display = s.send ? '' : 'none';
+	$('sklad_resend').style.display = s.resend ? '' : 'none';
+}
+
+async function poll() {
+	try {
+		const r = await api('poll');
+		const lines = [];
+		for (const ev of r.events) {
+			if (ev.t === 'log') { lines.push(ev); continue; }
+			logAdd(lines.splice(0));
+			apply(ev);
+		}
+		logAdd(lines);
+		drawSklad(r.sklad);
+		setBusy(r.busy);
+	} catch (e) { window.__pollError = String(e && e.stack || e); }
+	setTimeout(poll, 100);
+}
+
+async function start() {
+	logBox = $('log');
+	buildNav();
+	state = await api('init');
+	setTheme(state.theme, false);
+	$('date').textContent = state.date; $('weekday').textContent = state.weekday; $('ver').textContent = 'версия ' + state.version;
+	$('save_status').textContent = 'Настройки и ключи хранятся в папке: ' + state.data_dir;
+	$('footers').innerHTML = state.footers.map(f => `<option value="${f}">`).join('');
+	bindSettings(state.s);
+	$('show_keys').onchange = drawCabs;
+	drawCabs(); drawWaves(); drawLinks(state.links, state.root); drawCdekKeys(state.cdek_keys);
+	showPage('Сборка');
+	setBusy(state.busy);
+	poll();
+}
+// Esc закрывает предупреждение, Enter — «Да»
+document.addEventListener('keydown', e => {
+	if (!$('modal').classList.contains('on')) return;
+	if (e.key === 'Escape') { const b = $('m_btns').firstElementChild; if (b) b.click(); }
+});
+if (window.pywebview && window.pywebview.api && window.pywebview.api.init) start();
+else window.addEventListener('pywebviewready', start);
+</script>
+</body>
+</html>

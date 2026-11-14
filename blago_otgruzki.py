@@ -23,12 +23,13 @@ BLAGO OTGRUZKI — этикетки Ozon FBS и поставки Wildberries FBS
      в одну ленту (сортировка Я->А):
         «Коминтерна объединенные.pdf», «Учительская объединенные.pdf».
 
-Установка (один раз):  pip install requests openpyxl pypdf reportlab
-Запуск:                python blago_otgruzki.py
+Окно (2.0) — страница blago_ui.html во встроенном браузере Windows (Edge WebView2, библиотека pywebview).
+Установка (один раз):  pip install requests openpyxl pypdf reportlab pywebview
+Запуск:                py blago_otgruzki.py   (blago_ui.html — рядом)
 
 Сборка в .exe (значок — синий «B», как у сайта склада): запустить «Собрать exe.bat» или
-    pip install pyinstaller pillow
-    pyinstaller --onefile --windowed --icon blago.ico --splash splash.png --add-data "blago.ico;." --name "BLAGO OTGRUZKI" blago_otgruzki.py
+    pip install pyinstaller pywebview
+    pyinstaller --onefile --windowed --icon blago.ico --splash splash.png --add-data "blago_ui.html;." --name "BLAGO OTGRUZKI" blago_otgruzki.py
 
 Вкладка Wildberries (кнопка «Создать поставки и скачать»):
   1. читает отчёт(ы) WB — «№ задания», «Артикул продавца»; склад и дату
@@ -44,9 +45,8 @@ BLAGO OTGRUZKI — этикетки Ozon FBS и поставки Wildberries FBS
   В доставку поставки не передаются.
 
 Ключи кабинетов сохраняются в cabinets.json, токен WB — в wb.json
-рядом с программой. Эти файлы никому не пересылать.
+в папке %APPDATA%\\BLAGO OTGRUZKI. Эти файлы никому не пересылать.
 """
-import base64
 import io
 import json
 import os
@@ -57,12 +57,9 @@ import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-import tkinter as tk
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from tkinter import filedialog, messagebox, ttk
-from tkinter import font as tkfont
 
 import openpyxl
 import requests
@@ -72,7 +69,7 @@ from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.pdfgen import canvas
 
 APP_NAME = "BLAGO OTGRUZKI"
-APP_VERSION = "1.58"  # при каждом обновлении +0.1, запись в CHANGELOG.md
+APP_VERSION = "2.0"  # при каждом обновлении +0.1, запись в CHANGELOG.md
 API = "https://api-seller.ozon.ru"
 BATCH = 20                   # максимум отправлений в одном запросе этикеток
 READY = "awaiting_deliver"   # статус, в котором Ozon отдаёт этикетку
@@ -3480,22 +3477,6 @@ def sklad_decide(market, channel, truck, postings, times, colored, log, confirm,
 
 # ================================================================ окно
 
-# Палитра — «slate dark» для рабочих панелей (UI/UX Pro Max: Financial/Operations dashboard),
-# фирменный золотой акцент BLAGO оставлен. Контраст основного и серого текста — не ниже 4.5:1.
-# Вид как у сайта склада (1.42): светлая тема по умолчанию, индиго-акцент; тёмная — в «Настройках».
-# nav_hi — фон выбранного раздела слева, note — «●» строки журнала (жёлтые артикулы, вопросы).
-C_LIGHT = {
-    "side": "#FFFFFF", "bg": "#F4F6FB", "card": "#FFFFFF", "field": "#FFFFFF", "line": "#E1E5EF",
-    "text": "#1B2037", "muted": "#6B7285", "dim": "#9AA1B2", "accent": "#4C5FD5", "accent_hi": "#3D4FC2",
-    "on_accent": "#FFFFFF", "btn": "#EEF0F6", "btn_hi": "#E2E6F3", "nav_hi": "#EEF0FD", "nav_hover": "#F5F6FA",
-    "ok": "#15803D", "err": "#C62828", "warn": "#B45309", "note": "#9A6700",
-}
-C_DARK = {
-    "side": "#121728", "bg": "#0E1220", "card": "#161B2C", "field": "#11162A", "line": "#252C42",
-    "text": "#E8EBF5", "muted": "#98A1B8", "dim": "#6B7490", "accent": "#7C8CFF", "accent_hi": "#95A2FF",
-    "on_accent": "#0E1220", "btn": "#222A42", "btn_hi": "#2C3552", "nav_hi": "#232A4D", "nav_hover": "#191F33",
-    "ok": "#22C55E", "err": "#F87171", "warn": "#FB923C", "note": "#FBBF24",
-}
 UI_CONFIG = DATA_DIR / "ui.json"   # тема окна — у каждого компьютера своя
 
 
@@ -3518,9 +3499,6 @@ def ui_theme():
     return "dark" if ui_settings().get("theme") == "dark" else "light"
 
 
-C = dict(C_DARK if ui_theme() == "dark" else C_LIGHT)
-PAGES = ("Сборка", "Ozon", "Wildberries", "СДЭК", "Настройки")
-FONT = "Segoe UI"
 MONTHS = ("Январь", "Февраль", "Март", "Апрель", "Май", "Июнь",
           "Июль", "Август", "Сентябрь", "Октябрь", "Ноябрь", "Декабрь")
 MONTHS_GEN = ("января", "февраля", "марта", "апреля", "мая", "июня",
@@ -3752,955 +3730,727 @@ def today_msk():
     return datetime.now(MSK).date()
 
 
-def enable_dpi_awareness():
-    """Windows: программа сама рисует себя в полном разрешении экрана (1.43).
+# ================================================================ окно (2.0): страница в стиле сайта склада
+# Окно — веб-страница blago_ui.html во встроенном браузере Windows (Edge WebView2, через pywebview).
+# Рисует видеокарта, вкладки и разворот на весь экран — мгновенно, как на сайте. Логика выше не менялась.
+# Страница раз в 0.1 с забирает у программы события (журнал, полоса, надписи) — api.poll().
 
-    Без этого на мониторе 2K/4K с масштабом 125–150 % Windows растягивает окно как картинку — оно мыльное.
-    """
-    if sys.platform != "win32":
-        return
-    import ctypes
+UI_FILE = "blago_ui.html"
+LOG_LIMIT = 6000
+
+
+def resource_path(name):
+    """Файл рядом с программой или внутри exe (PyInstaller кладёт их в _MEIPASS)."""
+    return Path(getattr(sys, "_MEIPASS", Path(__file__).parent)) / name
+
+
+def log_tag(text):
+    """Цвет строки журнала по её началу: ✔ зелёная, ✖ красная, === заголовок, ⚠ оранжевая …"""
+    s = text.lstrip()
+    tag = ("big" if s.startswith(("✔ ВСЕГО ШК", "✔ СКАЧАНО ШК", "✔ ГОТОВО")) else
+           "ok" if s.startswith("✔") else "err" if s.startswith("✖") else
+           "head" if s.startswith("===") else "warn" if s.startswith("⚠") else
+           "warnbody" if s.startswith("│") else "yellow" if s.startswith("●") else
+           "muted" if s.startswith("…") else "")
+    return (s.strip("= ").strip() if tag == "head" else text), tag
+
+
+def default_root():
+    desk = Path.home() / "Desktop"
+    return desk if desk.exists() else BASE_DIR
+
+
+DIR_ALIASES = {"кгт1": ("кгт",), "вб": ("wb", "вб1")}
+
+
+def _dir_key(name):
+    return "".join(str(name).lower().replace("ё", "е").split())
+
+
+def find_dir(base, sub):
+    """Уже созданная папка с таким названием (без учёта регистра и пробелов: «озон2» = «Озон 2»;
+    «КГТ» = «КГТ 1», «WB» = «ВБ») или None. «Озон утро» и «Озон 1» — разные папки."""
+    key = _dir_key(sub)
+    keys = {key, *DIR_ALIASES.get(key, ())}
     try:
-        ctypes.windll.shcore.SetProcessDpiAwareness(1)   # чётко на основном мониторе (Windows 8.1+)
-    except (AttributeError, OSError):
-        try:
-            ctypes.windll.user32.SetProcessDPIAware()      # Windows 7
-        except (AttributeError, OSError):
-            pass
+        for d in sorted(Path(base).iterdir()):
+            if d.is_dir() and _dir_key(d.name) in keys:
+                return d
+    except OSError:
+        pass
+    return None
 
 
-# ================================================================ скруглённые кнопки, карточки, поля (1.52)
-# Каждая кнопка и карточка — обычная надпись Tk с готовой картинкой (Pillow): Windows рисует её одним
-# копированием. Холсты (1.45–1.51) Windows прорисовывал по кусочку — окно появлялось с чёрными пятнами.
-
-def pick_font(root):
-    """Шрифт окна. На Windows — обычный Segoe UI (1.55): переменные шрифты («Segoe UI Variable», Inter 4)
-    окна Python рисуют через медленный путь Windows — вкладки открывались секунду-две.
-    На других системах — Inter, если есть (для снимков экрана), иначе что найдётся."""
-    if sys.platform == "win32":
-        return "Segoe UI"
+def _setting_num(value, default):
     try:
-        families = set(tkfont.families(root))
-    except tk.TclError:
-        return "Segoe UI"
-    return "Inter" if "Inter" in families else "Segoe UI"
+        return float(str(value).replace(",", "."))
+    except (TypeError, ValueError):
+        return default
 
 
-def ui_font(widget, size, bold=True):
-    """Общий шрифт кнопок: один на размер в окне, а не по шрифту на каждую кнопку."""
-    root = widget.winfo_toplevel()
-    fonts = root.__dict__.setdefault("_ui_fonts", {})
-    key = (FONT, size, bold)
-    if key not in fonts:
-        fonts[key] = tkfont.Font(root=root, family=FONT, size=size, weight="bold" if bold else "normal")
-    return fonts[key]
+class BlagoApp:
+    """Всё, что умеет окно: настройки, кнопки, журнал. Без интерфейса — его рисует страница."""
 
+    SETTINGS_KEYS = ("template", "root_dir", "days", "top_margin", "font_size", "wb_token", "sklad_url",
+                     "sklad_key", "cdek_account", "cdek_secure", "footer", "autoship", "pass_on",
+                     "pass_driver", "pass_phone", "pass_cars", "wave")
 
-def _bg_of(widget):
-    """Фон родителя: у tk — bg, у ttk — из стиля."""
-    try:
-        return widget.cget("bg")
-    except tk.TclError:
-        style = ttk.Style(widget)
-        name = str(widget.cget("style") or widget.winfo_class())
-        return style.lookup(name, "background") or style.lookup(widget.winfo_class(), "background") or C["bg"]
-
-
-def _ui_scale(widget):
-    return getattr(widget.winfo_toplevel(), "ui", 1.0)
-
-
-def _corner_tile(r, fill, border, outer):
-    """Угол скругления r×r (левый верхний), сглаженный; кэш на всю программу."""
-    key = (r, fill, border, outer)
-    tile = _CORNER_TILES.get(key)
-    if tile is None:
-        from PIL import Image, ImageDraw
-        s = 4
-        big = Image.new("RGB", (2 * r * s, 2 * r * s), outer)
-        draw = ImageDraw.Draw(big)
-        edge = 2 * r * s - 1
-        if border:
-            draw.ellipse((0, 0, edge, edge), fill=border)
-            draw.ellipse((s, s, edge - s, edge - s), fill=fill)
-        else:
-            draw.ellipse((0, 0, edge, edge), fill=fill)
-        tile = big.resize((2 * r, 2 * r), Image.LANCZOS).crop((0, 0, r, r))
-        _CORNER_TILES[key] = tile
-    return tile
-
-
-_CORNER_TILES = {}
-
-
-def round_photo(widget, w, h, r, fill, border, outer):
-    """Картинка «скруглённый прямоугольник» w×h для Tk; одинаковые берутся из кэша окна.
-    None — нет Pillow (тогда элементы просто прямоугольные)."""
-    root = widget.winfo_toplevel()
-    if not getattr(root, "rounded", True):
-        return None
-    cache = root.__dict__.setdefault("_round_photos", {})
-    key = (w, h, r, fill, border, outer)
-    if key in cache:
-        return cache[key]
-    try:
-        from PIL import Image, ImageDraw
-    except ImportError:
-        return None
-    r = max(2, min(int(r), w // 2, h // 2))
-    img = Image.new("RGB", (w, h), fill)
-    if border:
-        ImageDraw.Draw(img).rectangle((0, 0, w - 1, h - 1), outline=border)
-    tile = _corner_tile(r, fill, border, outer)
-    img.paste(tile, (0, 0))
-    img.paste(tile.transpose(Image.FLIP_LEFT_RIGHT), (w - r, 0))
-    img.paste(tile.transpose(Image.FLIP_TOP_BOTTOM), (0, h - r))
-    img.paste(tile.transpose(Image.ROTATE_180), (w - r, h - r))
-    buf = io.BytesIO()
-    img.save(buf, "PNG", compress_level=1)
-    photo = tk.PhotoImage(master=root, data=base64.b64encode(buf.getvalue()))
-    if len(cache) > 400:   # окно тянули мышью — старые размеры больше не нужны
-        cache.clear()
-    cache[key] = photo
-    return photo
-
-
-def corner_photo(widget, r, fill, border, outer, which):
-    """Маленький уголок r×r (nw, ne, sw, se) для карточки; кэш окна."""
-    root = widget.winfo_toplevel()
-    cache = root.__dict__.setdefault("_corner_photos", {})
-    key = (r, fill, border, outer, which)
-    if key not in cache:
-        from PIL import Image
-        tile = _corner_tile(r, fill, border, outer)
-        tile = {"nw": tile, "ne": tile.transpose(Image.FLIP_LEFT_RIGHT),
-                "sw": tile.transpose(Image.FLIP_TOP_BOTTOM), "se": tile.transpose(Image.ROTATE_180)}[which]
-        buf = io.BytesIO()
-        tile.save(buf, "PNG")
-        cache[key] = tk.PhotoImage(master=root, data=base64.b64encode(buf.getvalue()))
-    return cache[key]
-
-
-class RoundBox(tk.Frame):
-    """Скруглённая карточка из кусочков (1.57): заливка — цвет самой рамки, по углам — маленькие картинки,
-    рамка — линии в 1 точку. При изменении размера ничего не перерисовывается: окно на весь экран
-    разворачивается сразу, а не собирается по карточке. Содержимое кладут в .inner (отступ pad).
-    stretch — содержимое тянется по высоте рамки."""
-
-    def __init__(self, parent, fill, border=None, radius=14, pad=5, stretch=False, height=1):
-        self.outer = _bg_of(parent)
-        super().__init__(parent, bg=fill, height=height, width=1, bd=0, highlightthickness=0)
-        ui = _ui_scale(parent)
-        self.fill, self.border, self.r = fill, border, max(2, int(radius * ui))
-        self.pad = max(1, int(pad * ui))
-        r = self.r
-        self._corners = {}
-        for which, opts in (("nw", {"x": 0, "y": 0}), ("ne", {"relx": 1, "y": 0}),
-                            ("sw", {"x": 0, "rely": 1}), ("se", {"relx": 1, "rely": 1})):
-            lbl = tk.Label(self, bd=0, highlightthickness=0, padx=0, pady=0, bg=fill)
-            lbl.place(anchor=which, **opts)
-            self._corners[which] = lbl
-        self._lines = []
-        for opts in ({"x": r, "y": 0, "relwidth": 1, "width": -2 * r, "height": 1},
-                     {"x": r, "rely": 1, "y": -1, "relwidth": 1, "width": -2 * r, "height": 1},
-                     {"x": 0, "y": r, "width": 1, "relheight": 1, "height": -2 * r},
-                     {"relx": 1, "x": -1, "y": r, "width": 1, "relheight": 1, "height": -2 * r}):
-            line = tk.Frame(self, bd=0, highlightthickness=0, bg=border or fill)
-            line.place(**opts)
-            self._lines.append(line)
-        self.inner = tk.Frame(self, bg=fill, bd=0, highlightthickness=0)
-        self.inner.pack(fill="both", expand=True, padx=self.pad, pady=self.pad)
-        if stretch:
-            self.pack_propagate(False)
-        self._paint()
-
-    def _paint(self):
-        try:
-            for which, lbl in self._corners.items():
-                lbl.configure(image=corner_photo(self, self.r, self.fill, self.border, self.outer, which))
-        except ImportError:   # нет Pillow — углы просто прямые
-            for lbl in self._corners.values():
-                lbl.place_forget()
-        for line in self._lines:
-            line.configure(bg=self.border or self.fill)
-
-    def redraw(self):
-        self._paint()
-
-    def set_fill(self, fill):
-        if fill != self.fill:
-            self.fill = fill
-            tk.Frame.configure(self, bg=fill)
-            self.inner.configure(bg=fill)
-            for child in self.inner.winfo_children():
-                try:
-                    child.configure(bg=fill)
-                except tk.TclError:
-                    pass
-            self._paint()
-
-    def set_border(self, color):
-        if color != self.border:
-            self.border = color
-            self._paint()
-
-
-class REntry(RoundBox):
-    """Поле ввода со скруглением; рамка синеет, когда в поле курсор."""
-
-    def __init__(self, parent, textvariable=None, show="", width=20, **_):
-        super().__init__(parent, fill=C["field"], border=C["line"], radius=9, pad=3)
-        ui = _ui_scale(parent)
-        self.entry = tk.Entry(self.inner, textvariable=textvariable, show=show or "", width=width, bd=0,
-                              relief="flat", highlightthickness=0, bg=C["field"], fg=C["text"],
-                              insertbackground=C["text"], selectbackground=C["accent"],
-                              selectforeground=C["on_accent"], font=(FONT, 10))
-        self.entry.pack(fill="x", padx=int(8 * ui), pady=int(5 * ui))
-        self.entry.bind("<FocusIn>", lambda e: self.set_border(C["accent"]), add="+")
-        self.entry.bind("<FocusOut>", lambda e: self.set_border(C["line"]), add="+")
-        for w in (self, self.inner):
-            w.bind("<Button-1>", lambda e: self.entry.focus_set(), add="+")
-
-    def configure(self, cnf=None, **kw):
-        kw.update(cnf or {})
-        entry_kw = {k: kw.pop(k) for k in ("show", "state", "textvariable") if k in kw}
-        if entry_kw:
-            self.entry.configure(**entry_kw)
-        return tk.Frame.configure(self, **kw) if kw else None
-
-    config = configure
-
-    def get(self):
-        return self.entry.get()
-
-
-# Вид кнопок: фон, фон под мышью, текст, размер шрифта, отступы (x, y)
-BUTTON_KINDS = {
-    "TButton": ("btn", "btn_hi", "text", 10, 14, 8),
-    "Big.TButton": ("btn", "btn_hi", "text", 10, 18, 10),
-    "Accent.TButton": ("accent", "accent_hi", "on_accent", 11, 22, 10),
-    "Nav": ("side", "nav_hover", "muted", 11, 14, 9),
-    "Chip": ("btn", "btn_hi", "text", 10, 16, 7),
-}
-
-
-class RButton(tk.Label):
-    """Скруглённая кнопка: надпись Tk поверх готовой картинки-подложки.
-    Понимает text, textvariable, command, state, как ttk.Button. anchor="w" — текст слева (меню)."""
-
-    def __init__(self, parent, text="", command=None, style="TButton", textvariable=None, width=None,
-                 cursor="hand2", anchor="center", **_):
-        self.outer = _bg_of(parent)
-        self.ui = _ui_scale(parent)
-        self._parent = parent
-        self.command, self._width, self.anchor = command, width, anchor
-        self._state, self._hover, self._down = "normal", False, False
-        self._text = textvariable.get() if textvariable is not None else text
-        self._job, self._drawn = None, None
-        self._apply_style(style)
-        super().__init__(parent, text=self._text, font=self.font, fg=self.colors[2], bg=self.outer, bd=0,
-                         highlightthickness=0, padx=0, pady=0, compound="center", cursor=cursor)
-        self.flat = not getattr(self.winfo_toplevel(), "rounded", True)
-        if self.flat:   # без скруглений: обычная плоская надпись-кнопка
-            tk.Label.configure(self, padx=self.padx, pady=self.pady, anchor=anchor)
-            self._paint_flat()
-        else:
-            self._redraw_now(self._want_width(), self._want_height())
-            self.bind("<Configure>", self._later)
-        self.bind("<Enter>", lambda e: self._set_hover(True))
-        self.bind("<Leave>", lambda e: self._set_hover(False))
-        self.bind("<ButtonPress-1>", self._press)
-        self.bind("<ButtonRelease-1>", self._release)
-        if textvariable is not None:
-            textvariable.trace_add("write", lambda *_: self.configure(text=textvariable.get()))
-
-    def _apply_style(self, style):
-        fill, hover, fg, size, px, py = BUTTON_KINDS.get(style, BUTTON_KINDS["TButton"])
-        self.style = style
-        self.colors = (C[fill], C[hover], C[fg])
-        self.font = ui_font(self._parent, size)
-        self.padx, self.pady = int(px * self.ui), int(py * self.ui)
-        self.r = int((10 if style != "Chip" else 9) * self.ui)
-
-    def _want_width(self):
-        if self._width:
-            return self.font.measure("0") * self._width + 2 * self.padx
-        return self.font.measure(self._text) + 2 * self.padx
-
-    def _want_height(self):
-        return self.font.metrics("linespace") + 2 * self.pady
-
-    def _paint(self):
-        if self._state == "disabled":
-            return C["btn"] if self.style != "Nav" else self.colors[0], C["dim"]
-        return (self.colors[1] if self._hover else self.colors[0]), self.colors[2]
-
-    def _later(self, _event=None):
-        if self._job is None:
-            self._job = self.after_idle(self.redraw)
-
-    def _paint_flat(self):
-        fill, fg = self._paint()
-        tk.Label.configure(self, bg=fill, fg=fg, text=self._text)
-
-    def redraw(self):
-        self._job = None
-        if self.flat:
-            self._paint_flat()
-            return
-        w = max(self.winfo_width(), self._want_width())
-        h = max(self.winfo_height(), self._want_height())
-        if not self.winfo_ismapped():
-            w, h = self._want_width(), self._want_height()
-        self._redraw_now(w, h)
-
-    def _redraw_now(self, w, h):
-        fill, fg = self._paint()
-        key = (w, h, fill, fg, self._text)
-        if key == self._drawn:
-            return
-        self._drawn = key
-        photo = round_photo(self, w, h, self.r, fill, None, self.outer)
-        if self.anchor == "w":   # меню слева: надпись отдельной меткой, прижата влево
-            tk.Label.configure(self, image=photo or "", text="", bg=self.outer if photo is not None else fill)
-            self._left_text(fill, fg)
-        else:
-            tk.Label.configure(self, image=photo or "", fg=fg, text=self._text,
-                               bg=self.outer if photo is not None else fill)
-
-    def _left_text(self, fill, fg):
-        """Меню слева: надпись — отдельная метка поверх подложки, прижата влево."""
-        if not hasattr(self, "_label"):
-            self._label = tk.Label(self, font=self.font, bd=0, highlightthickness=0, padx=0, pady=0,
-                                   cursor=self.cget("cursor"))
-            self._label.place(x=self.padx, rely=0.5, anchor="w")
-            for seq, fn in (("<Enter>", lambda e: self._set_hover(True)),
-                            ("<ButtonPress-1>", self._press), ("<ButtonRelease-1>", self._release_label)):
-                self._label.bind(seq, fn)
-        self._label.configure(text=self._text, bg=fill, fg=fg)
-
-    def set_colors(self, fill, hover, fg):
-        self.colors = (fill, hover, fg)
-        self.redraw()
-
-    def _set_hover(self, on):
-        if on != self._hover:
-            self._hover = on
-            self.redraw()
-
-    def _press(self, _event):
-        self._down = True
-
-    def _release(self, event):
-        inside = 0 <= event.x < self.winfo_width() and 0 <= event.y < self.winfo_height()
-        self._fire(inside)
-
-    def _release_label(self, event):
-        x = event.x_root - self.winfo_rootx()
-        y = event.y_root - self.winfo_rooty()
-        self._fire(0 <= x < self.winfo_width() and 0 <= y < self.winfo_height())
-
-    def _fire(self, inside):
-        if self._down and inside and self._state != "disabled" and self.command:
-            self.command()
-        self._down = False
-
-    def configure(self, cnf=None, **kw):
-        kw.update(cnf or {})
-        if not kw:
-            return tk.Label.configure(self)
-        redraw = False
-        if "style" in kw:
-            self._apply_style(kw.pop("style"))
-            tk.Label.configure(self, font=self.font)
-            redraw = True
-        if "text" in kw:
-            self._text = str(kw.pop("text"))
-            redraw = True
-        if "state" in kw:
-            self._state = str(kw.pop("state"))
-            tk.Label.configure(self, cursor="arrow" if self._state == "disabled" else "hand2")
-            redraw = True
-        if "command" in kw:
-            self.command = kw.pop("command")
-        if kw:
-            tk.Label.configure(self, **kw)
-        if redraw:
-            self.redraw()
-        return None
-
-    config = configure
-
-    def cget(self, key):
-        if key == "text":
-            return self._text
-        if key == "state":
-            return self._state
-        if key == "command":
-            return self.command
-        return tk.Label.cget(self, key)
-
-    __getitem__ = cget
-
-    def state(self, spec=None):
-        """Как у ttk: b.state(["disabled"]) / b.state(["!disabled"])."""
-        for s in spec or ():
-            self.configure(state="normal" if s == "!disabled" else "disabled" if s == "disabled" else self._state)
-        return (self._state,) if self._state == "disabled" else ()
-
-    def instate(self, spec):
-        return all((s == "disabled") == (self._state == "disabled") for s in spec)
-
-    def invoke(self):
-        if self._state != "disabled" and self.command:
-            self.command()
-
-
-class App(tk.Tk):
     def __init__(self):
-        enable_dpi_awareness()   # до создания окна, иначе Windows уже решила растягивать
-        super().__init__()
-        self.withdraw()   # окно прячется, пока строится: показывается сразу готовым, без дорисовки по кускам
-        self.title(APP_NAME)
-        self.set_icon()
-        # Масштаб экрана: 1.0 — 100 %, 1.5 — 150 %. Шрифты Tk растут сами, размеры окна в точках — по нему
-        self.ui = min(max(self.winfo_fpixels("1i") / 96, 1.0), 3.0)
-        sw, sh = self.winfo_screenwidth(), self.winfo_screenheight()
-        w, h = min(int(1060 * self.ui), sw - 40), min(int(920 * self.ui), sh - 80)
-        self.geometry(f"{w}x{h}")
-        self.minsize(min(int(960 * self.ui), w), min(int(760 * self.ui), h))
-        self.configure(bg=C["bg"])
-        global FONT
-        FONT = pick_font(self)
-        self.rounded = True   # Inter, как на сайте склада, если установлен; иначе Segoe UI
-        self.q = queue.Queue()
+        self.window = None
+        self.events = queue.Queue()
         self.busy = False
-        self.buttons = []      # кнопки, которые гасятся, пока идёт работа
-        self.cab_rows = []
-        self.wb_files = []
-        self._save_job = None
-        self.setup_style()
-
-        # --- переменные настроек
-        self.template = tk.StringVar()
-        self.root_dir = tk.StringVar(value=str(self.default_root()))
-        self.by_day = tk.BooleanVar(value=False)   # папки по дням больше не делаем: главную папку выбираешь сам
-        self.days = tk.IntVar(value=14)
-        self.top_margin = tk.DoubleVar(value=DEFAULT_TOP_MARGIN_PT)
-        self.font_size = tk.DoubleVar(value=DEFAULT_FONT_SIZE)
-        self.wb_token = tk.StringVar()
-        self.sklad_url = tk.StringVar(value="https://89-169-45-92.sslip.io")
-        self.sklad_key = tk.StringVar()
-        self.cdek_account = tk.StringVar()
-        self.cdek_secure = tk.StringVar()
-        self.excel = tk.StringVar()
-        self.sheet = tk.StringVar()
-        self.footer = tk.StringVar(value="Озон утро")
-        self.autoship = tk.BooleanVar(value=True)
+        self.lock = threading.Lock()
+        self._answers = {}
+        self._ask_id = 0
+        self._save_timer = None
         self._pass_running = {}
-        self.last_ozon_out = None   # папка последнего скачивания Ozon — для «Пересобрать ленты»
-        self.pass_on = tk.BooleanVar(value=PASS_DEFAULT["on"])
-        self.pass_driver = tk.StringVar(value=PASS_DEFAULT["driver"])
-        self.pass_phone = tk.StringVar(value=PASS_DEFAULT["phone"])
-        self.pass_cars = tk.StringVar(value=PASS_DEFAULT["cars"].replace("\n", "; "))
-        self.wave = tk.StringVar(value=WAVES[0])
-        self.show_keys = tk.BooleanVar(value=False)
-
-        # --- боковая панель: логотип, разделы, дата
-        side = tk.Frame(self, bg=C["side"], width=int(220 * self.ui))
-        side.pack(side="left", fill="y")
-        side.pack_propagate(False)
-        tk.Frame(self, bg=C["line"], width=1).pack(side="left", fill="y")   # граница меню, как на сайте
-        # Логотип: «BLAGO» и синим «отгрузки», без значка
-        logo = tk.Frame(side, bg=C["side"])
-        logo.pack(fill="x", padx=24, pady=(26, 22))
-        tk.Label(logo, text="BLAGO", bg=C["side"], fg=C["text"], font=(FONT, 15, "bold")).pack(side="left")
-        tk.Label(logo, text="отгрузки", bg=C["side"], fg=C["accent"], font=(FONT, 10, "bold")
-                 ).pack(side="left", padx=(8, 0), pady=(4, 0))
-        self.nav = {}
-        for name in PAGES:
-            self.nav[name] = self.nav_item(side, name)
-        d = today_msk()
-        foot = tk.Frame(side, bg=C["side"])
-        foot.pack(side="bottom", fill="x", padx=24, pady=22)
-        tk.Label(foot, text=f"{d.day} {MONTHS_GEN[d.month - 1]}", bg=C["side"], fg=C["text"],
-                 font=(FONT, 13, "bold")).pack(anchor="w")
-        tk.Label(foot, text=WEEKDAYS[d.weekday()], bg=C["side"], fg=C["muted"], font=(FONT, 10)).pack(anchor="w")
-        tk.Label(foot, text=f"версия {APP_VERSION}", bg=C["side"], fg=C["dim"],
-                 font=(FONT, 8)).pack(anchor="w", pady=(10, 0))
-
-        # --- основная часть: заголовок раздела, раздел, журнал
-        main = ttk.Frame(self, style="Bg.TFrame")
-        main.pack(side="left", fill="both", expand=True, padx=28, pady=(22, 20))
-        top = ttk.Frame(main, style="Bg.TFrame")
-        top.pack(fill="x", pady=(0, 10))
-        self.page_title = ttk.Label(top, text="", style="Page.TLabel")
-        self.page_title.pack(side="left")
-        # главная папка дня — видна всегда и меняется в один клик
-        RButton(top, text="Сменить папку…", command=self.pick_root).pack(side="right")
-        self.root_label = ttk.Button(top, text="", style="BgPath.TButton", cursor="hand2",
-                                     command=lambda: self.open_out(self.root_dir.get() or self.default_root()))
-        self.root_label.pack(side="right", padx=(0, 10))
-        # Склад: что последним ушло и не застряло ли что-то без интернета
-        srow = tk.Frame(main, bg=C["bg"])
-        srow.pack(fill="x", pady=(0, 10))
-        self.sklad_line = tk.Label(srow, text="", bg=C["bg"], fg=C["muted"], font=(FONT, 10, "bold"), anchor="w")
-        self.sklad_line.pack(side="left")
-        self.sklad_resend = RButton(srow, text="Отправить неотправленное", command=self.flush_sklad)
-        # Заказы дня уходят на склад только после проверки — этой кнопкой
-        self.sklad_send = RButton(srow, text="Отправить на склад", style="Accent.TButton",
-                                  command=self.send_morning)
-        # Все вкладки строятся один раз и лежат стопкой в одной клетке; переключение — поднять нужную
-        # наверх (tkraise). Ничего не перестраивается и не перерисовывается заново — на Windows это и тормозило.
-        self.page_box = ttk.Frame(main, style="Bg.TFrame", height=1)
-        self.page_box.pack(fill="x")
-        self.page_box.grid_propagate(False)
-        self.page_box.columnconfigure(0, weight=1)
-        self.page_box.rowconfigure(0, weight=1)   # вкладка тянется на всю высоту области (иначе «Настройки» с дырой)
-        self.pages = {name: ttk.Frame(self.page_box, style="Bg.TFrame") for name in PAGES}
-        for name, frame in self.pages.items():
-            frame.grid(row=0, column=0, sticky="nsew")   # каждая закрывает всю область, под ней не видно других
-            frame.bind("<Configure>", lambda e, n=name: self._fit_page_box(n))
-        self.build_sborka(self.pages["Сборка"])
-        self.build_ozon(self.pages["Ozon"])
-        self.build_wb(self.pages["Wildberries"])
-        self.build_cdek(self.pages["СДЭК"])
-        self.build_settings(self.scroll_page(self.pages["Настройки"]))
-
-        jb = RoundBox(main, fill=C["card"], border=C["line"], radius=16, pad=5, stretch=True,
-                      height=int(200 * self.ui))
-        jb.pack(fill="both", expand=True, pady=(14, 0))
-        jcard = jb.inner
-        jh = tk.Frame(jcard, bg=C["card"])
-        jh.pack(fill="x", padx=14, pady=(8, 0))
-        tk.Label(jh, text="Журнал", bg=C["card"], fg=C["text"], font=(FONT, 12, "bold")).pack(side="left")
-        self.state_pill = tk.Label(jh, text="●  готова к работе", bg=C["card"], fg=C["ok"], font=(FONT, 9, "bold"))
-        self.state_pill.pack(side="left", padx=(14, 0))
-        ttk.Button(jh, text="очистить", style="Link.TButton", command=self.clear_log,
-                   cursor="hand2").pack(side="right")
-        self.bar = ttk.Progressbar(jcard, mode="determinate")   # виден только пока идёт работа
-        box = tk.Frame(jcard, bg=C["card"])
-        box.pack(fill="both", expand=True, padx=(8, 4), pady=(6, 8))
-        self._log_frame = box
-        self.log_box = tk.Text(box, height=10, wrap="word", state="disabled", bd=0, relief="flat",
-                               bg=C["card"], fg=C["text"], insertbackground=C["text"],
-                               selectbackground=C["accent"], selectforeground=C["on_accent"],
-                               padx=10, pady=6, font=(FONT, 10), highlightthickness=0,
-                               spacing1=2, spacing3=2)
-        sb = ttk.Scrollbar(box, command=self.log_box.yview)
-        self.log_box.configure(yscrollcommand=sb.set)
-        sb.pack(side="right", fill="y")
-        self.log_box.pack(fill="both", expand=True)
-        for tag, color, bold in (("ok", C["ok"], False), ("err", C["err"], False), ("head", C["accent"], True),
-                                 ("warn", C["warn"], True), ("warnbody", C["warn"], False),
-                                 ("yellow", C["note"], False), ("big", C["ok"], True),
-                                 ("muted", C["dim"], False)):
-            self.log_box.tag_configure(tag, foreground=color,
-                                       font=(FONT, 11 if tag == "big" else 10, "bold" if bold else ""))
-
-        self.setup_clipboard()
+        self._sklad_cache = (0.0, None)
+        self.s = {
+            "template": "", "root_dir": str(default_root()), "days": 14, "top_margin": DEFAULT_TOP_MARGIN_PT,
+            "font_size": DEFAULT_FONT_SIZE, "wb_token": "", "sklad_url": "https://89-169-45-92.sslip.io",
+            "sklad_key": "", "cdek_account": "", "cdek_secure": "", "footer": "Озон утро", "autoship": True,
+            "pass_on": PASS_DEFAULT["on"], "pass_driver": PASS_DEFAULT["driver"], "pass_phone": PASS_DEFAULT["phone"],
+            "pass_cars": PASS_DEFAULT["cars"].replace("\n", "; "), "wave": WAVES[0],
+        }
+        self.cab = []            # [{"name", "cid", "key"}]
+        self.excel, self.sheet, self.sheets = "", "", []
+        self.wb_files = []
+        self.cdek_file = None
+        self.left_files, self.left_day = [], None
+        self.last_ozon_out = None
         self.load_settings()
-        self.refresh_wave_chips()
-        self.hand_cursor(self)
-        for var in (self.template, self.root_dir, self.by_day, self.days, self.top_margin, self.font_size,
-                    self.wb_token, self.autoship, self.pass_on, self.pass_driver, self.pass_phone,
-                    self.pass_cars, self.sklad_url, self.sklad_key, self.cdek_account, self.cdek_secure):
-            var.trace_add("write", lambda *_: self.schedule_save())
-        self.footer.trace_add("write", lambda *_: self.refresh_links())
-        self.show_page("Сборка")
-        self.update_idletasks()
-        self.dark_titlebar()
-        # Прозрачность (-alpha) не трогаем: Windows после неё рисует окно «слоями» — медленно (1.55)
-        self.deiconify()
-        try:   # заставка exe (пока он распаковывается) — убрать, окно готово
-            import pyi_splash
-            pyi_splash.close()
-        except ImportError:
+
+    # ------------------------------------------------------------ события для страницы
+    def emit(self, event, /, **data):
+        self.events.put({"t": event, **data})
+
+    def log(self, text=""):
+        line, tag = log_tag(str(text))
+        self.events.put({"t": "log", "text": line, "tag": tag})
+
+    def status(self, el, text, color="muted"):
+        self.emit("status", id=el, text=text, color=color)
+
+    def progress(self, done, total):
+        self.emit("progress", done=done, total=max(total, 1))
+
+    def headline(self, text):
+        self.emit("progress_reset")
+        self.log("")
+        self.log(f"=== {text} ===")
+
+    def alert(self, text, kind="warn"):
+        self.emit("alert", text=text, kind=kind)
+
+    def ask(self, text, warn=False):
+        """Вопрос «да/нет» на странице; ждёт ответа (вызывается не из окна — из потока работы)."""
+        with self.lock:
+            self._ask_id += 1
+            ask_id = self._ask_id
+            done = threading.Event()
+            self._answers[ask_id] = [done, False]
+        self.emit("ask", id=ask_id, text=text, warn=warn)
+        done.wait()
+        with self.lock:
+            return self._answers.pop(ask_id)[1]
+
+    def answer(self, ask_id, ok):
+        with self.lock:
+            item = self._answers.get(int(ask_id))
+        if item:
+            item[1] = bool(ok)
+            item[0].set()
+
+    def poll(self):
+        """Что накопилось для страницы: события (журнал — пачкой) и строка склада."""
+        out = []
+        try:
+            while len(out) < 3000:
+                out.append(self.events.get_nowait())
+        except queue.Empty:
             pass
-        self.protocol("WM_DELETE_WINDOW", self.on_close)
-        self.after(100, self.poll)
-        self.after(100, self.ease_bar)
-        self.after(500, self.refresh_sklad_line)
+        now = time.monotonic()
+        stamp, line = self._sklad_cache
+        if now - stamp > 2 or line is None:
+            line = self.sklad_line()
+            self._sklad_cache = (now, line)
+        return {"events": out, "busy": self.busy, "sklad": line}
 
-    def set_icon(self):
-        """Значок окна и панели задач — синий «B», как у сайта склада (файл blago.ico рядом или внутри exe)."""
-        here = Path(getattr(sys, "_MEIPASS", Path(__file__).parent))
-        for ico in (here / "blago.ico", BASE_DIR / "blago.ico"):
-            if ico.exists():
-                try:
-                    if sys.platform == "win32":
-                        self.iconbitmap(default=str(ico))
-                    else:
-                        from PIL import Image, ImageTk
-                        self._icon = ImageTk.PhotoImage(Image.open(ico).convert("RGBA").resize((64, 64)))
-                        self.iconphoto(True, self._icon)
-                except Exception:  # noqa: BLE001 — значок не главное
-                    pass
-                return
-
-    def refresh_sklad_line(self):
-        """Строка «Склад: …»: подключён ли, что ушло последним, что ждёт отправки."""
+    # ------------------------------------------------------------ склад: строка сверху
+    def sklad_line(self):
         try:
             pending = len(_pending_load())
         except Exception:  # noqa: BLE001
             pending = 0
-        morning = morning_load() if sklad_on() else None
+        morning_items = morning_load() if sklad_on() else None
         if not sklad_on():
-            text, color = "Склад: не подключён — «Настройки → Склад BLAGO»", C["dim"]
-        elif morning and not pending:
-            warn = morning_problems(morning)
-            text = f"Склад: ждёт проверки — {morning_text(morning)}"
-            color = C["warn"] if warn else C["accent"]
+            text, color = "Склад: не подключён — «Настройки → Склад BLAGO»", "dim"
+        elif morning_items and not pending:
+            warn = morning_problems(morning_items)
+            text = f"Склад: ждёт проверки — {morning_text(morning_items)}"
+            color = "warn" if warn else "accent"
         elif pending:
-            text = f"Склад: ✖ не ушло {plural(pending, 'партия', 'партии', 'партий')} — нет связи"
-            color = C["err"]
+            text, color = f"Склад: ✖ не ушло {plural(pending, 'партия', 'партии', 'партий')} — нет связи", "err"
         elif SKLAD_LAST["text"]:
             ok = SKLAD_LAST["kind"] == "ok"
-            text, color = f"Склад: {'✔' if ok else '✖'} {SKLAD_LAST['text']}", C["ok"] if ok else C["err"]
+            text, color = f"Склад: {'✔' if ok else '✖'} {SKLAD_LAST['text']}", "ok" if ok else "err"
         else:
-            text, color = "Склад: подключён, сегодня ещё ничего не отправлялось", C["muted"]
-        self.sklad_line.configure(text=text, fg=color)
-        if pending and not self.sklad_resend.winfo_ismapped():
-            self.sklad_resend.pack(side="left", padx=(12, 0))
-        elif not pending and self.sklad_resend.winfo_ismapped():
-            self.sklad_resend.pack_forget()
-        show_send = bool(morning) and not pending
-        if show_send and not self.sklad_send.winfo_ismapped():
-            self.sklad_send.pack(side="left", padx=(12, 0))
-        elif not show_send and self.sklad_send.winfo_ismapped():
-            self.sklad_send.pack_forget()
-        self.after(2000, self.refresh_sklad_line)
+            text, color = "Склад: подключён, сегодня ещё ничего не отправлялось", "muted"
+        return {"text": text, "color": color, "send": bool(morning_items) and not pending, "resend": bool(pending)}
 
-    # ------------------------------------------------------------ навигация
-    def nav_item(self, parent, name):
-        """Пункт меню слева — скруглённая плашка, как на сайте склада."""
-        item = RButton(parent, text=name, style="Nav", anchor="w", command=lambda n=name: self.show_page(n))
-        item.pack(fill="x", padx=14, pady=2)
-        return item
+    # ------------------------------------------------------------ настройки
+    def state(self):
+        """Всё для первой отрисовки страницы."""
+        d = today_msk()
+        return {
+            "version": APP_VERSION, "theme": ui_theme(), "data_dir": str(DATA_DIR),
+            "date": f"{d.day} {MONTHS_GEN[d.month - 1]}", "weekday": WEEKDAYS[d.weekday()],
+            "s": {k: self.s[k] for k in self.SETTINGS_KEYS}, "cab": self.cab, "waves": list(WAVES),
+            "footers": list(FOOTERS), "links": self.links(), "root": self.root_text(),
+            "cdek_keys": cdek_on(), "busy": self.busy,
+        }
 
-    def paint_nav(self, name, hover=False):
-        on = name == getattr(self, "current_page", None)
-        if on:
-            self.nav[name].set_colors(C["nav_hi"], C["nav_hi"], C["accent"])
-        else:
-            self.nav[name].set_colors(C["side"], C["nav_hover"], C["muted"])
+    def load_settings(self):
+        if CONFIG.exists():
+            try:
+                for name, cfg in json.loads(CONFIG.read_text(encoding="utf-8")).items():
+                    self.cab.append({"name": name, "cid": str(cfg.get("client_id", "")),
+                                     "key": cfg.get("api_key", "")})
+            except ValueError:
+                self.log(f"✖ Файл {CONFIG.name} повреждён, ключи не загружены")
+        while len(self.cab) < 3:
+            self.cab.append({"name": f"Озон {len(self.cab) + 1}", "cid": "", "key": ""})
+        if WB_CONFIG.exists():
+            try:
+                self.s["wb_token"] = json.loads(WB_CONFIG.read_text(encoding="utf-8")).get("token", "")
+            except ValueError:
+                pass
+        if SKLAD_CONFIG.exists():
+            try:
+                cfg = json.loads(SKLAD_CONFIG.read_text(encoding="utf-8"))
+                self.s["sklad_url"] = cfg.get("url") or self.s["sklad_url"]
+                self.s["sklad_key"] = cfg.get("key", "")
+            except ValueError:
+                pass
+        SKLAD.update(url=self.s["sklad_url"], key=self.s["sklad_key"])
+        if CDEK_CONFIG.exists():
+            try:
+                cfg = json.loads(CDEK_CONFIG.read_text(encoding="utf-8"))
+                self.s["cdek_account"], self.s["cdek_secure"] = cfg.get("account", ""), cfg.get("secure", "")
+            except ValueError:
+                pass
+        CDEK.update(account=self.s["cdek_account"].strip(), secure=self.s["cdek_secure"].strip())
+        data = {}
+        if MORNING_CONFIG.exists():
+            try:
+                data = json.loads(MORNING_CONFIG.read_text(encoding="utf-8"))
+            except ValueError:
+                pass
+        self.s["template"] = data.get("template") or (str(BASE_DIR / "BLAGO.xlsx")
+                                                      if (BASE_DIR / "BLAGO.xlsx").exists() else "")
+        root = data.get("root")
+        if not root and data.get("out"):
+            # прежняя версия: «…/Октябрь 2026/28.10/Сборка» -> рабочая папка «…»
+            p = Path(data["out"])
+            if len(p.parts) > 3 and re.fullmatch(r"\d\d\.\d\d", p.parts[-2]) and re.search(r"\d{4}$", p.parts[-3]):
+                root = str(p.parents[2])
+        if root:
+            self.s["root_dir"] = root
+        for key, name in (("days", "days"), ("margin", "top_margin"), ("font", "font_size")):
+            if key in data:
+                self.s[name] = data[key]
+        self.s["autoship"] = bool(data.get("autoship", True))
+        pc = {**PASS_DEFAULT, **(data.get("passes") or {})}
+        self.s.update(pass_on=bool(pc["on"]), pass_driver=pc["driver"], pass_phone=pc["phone"],
+                      pass_cars=str(pc["cars"]).replace("\n", "; "))
 
-    def _fit_page_box(self, name=None):
-        """Высота области вкладок одна на все вкладки — по самой высокой (кроме «Настроек», они листаются).
-        При переключении вкладок журнал внизу не двигается и не перерисовывается (1.56)."""
-        height = max(f.winfo_reqheight() for n, f in self.pages.items() if n != "Настройки")
-        if getattr(self, "current_page", None) == "Настройки":
-            # В «Настройках» журнал поменьше — настройкам больше места (1.57)
-            top = self.page_box.winfo_rooty() - self.winfo_rooty()
-            height = max(height, self.winfo_height() - top - int(150 * self.ui))
-        if int(float(self.page_box.cget("height"))) != height:
-            self.page_box.configure(height=height)
+    def set(self, key, value):
+        """Поле настроек поменяли на странице."""
+        if key not in self.SETTINGS_KEYS:
+            return False
+        self.s[key] = value
+        self.schedule_save()
+        if key in ("root_dir", "footer", "wave"):
+            self.emit("links", links=self.links(), root=self.root_text())
+        return True
 
-    def show_page(self, name):
-        if name == getattr(self, "current_page", None):
-            return
-        self.current_page = name
-        if name == "СДЭК" and hasattr(self, "cdek_keys"):
-            self.refresh_cdek()  # ключи могли появиться в «Настройках»
-        self.pages[name].tkraise()
-        self._fit_page_box(name)
-        for n in PAGES:
-            self.paint_nav(n)
-        self.page_title.configure(text=name)
+    def set_cabinet(self, index, field, value):
+        index = int(index)
+        if 0 <= index < len(self.cab) and field in ("name", "cid", "key"):
+            self.cab[index][field] = value
+            self.schedule_save()
 
-    def hand_cursor(self, widget):
-        """Рука над всем, что нажимается."""
-        for w in widget.winfo_children():
-            if isinstance(w, (ttk.Button, ttk.Checkbutton, ttk.Radiobutton, ttk.Combobox, tk.Radiobutton)):
-                try:
-                    w.configure(cursor="hand2")
-                except tk.TclError:
-                    pass
-            self.hand_cursor(w)
+    def add_cabinet(self):
+        self.cab.append({"name": f"Озон {len(self.cab) + 1}", "cid": "", "key": ""})
+        self.schedule_save()
+        return self.cab
 
-    # ------------------------------------------------------------ оформление
-    def setup_style(self):
-        st = ttk.Style(self)
-        st.theme_use("clam")
-        base = (FONT, 10)
-        st.configure(".", background=C["card"], foreground=C["text"], font=base,
-                     bordercolor=C["line"], lightcolor=C["card"], darkcolor=C["card"],
-                     troughcolor=C["field"], focuscolor=C["accent"])
-        st.configure("Bg.TFrame", background=C["bg"])
-        st.configure("Card.TFrame", background=C["card"])
-        st.configure("TLabel", background=C["card"], foreground=C["text"])
-        st.configure("Muted.TLabel", foreground=C["muted"], font=(FONT, 9))
-        st.configure("Info.TLabel", foreground=C["muted"], font=(FONT, 10))
-        st.configure("Field.TLabel", foreground=C["muted"], font=(FONT, 10))
-        st.configure("Caps.TLabel", background=C["bg"], foreground=C["muted"], font=(FONT, 8, "bold"))
-        st.configure("Page.TLabel", background=C["bg"], foreground=C["text"], font=(FONT, 20, "bold"))
-        st.configure("Title.TLabel", font=(FONT, 12, "bold"))
-        st.configure("File.TLabel", font=(FONT, 11, "bold"))
-        st.configure("Status.TLabel", foreground=C["muted"], font=(FONT, 9))
+    def schedule_save(self):
+        if self._save_timer:
+            self._save_timer.cancel()
+        self._save_timer = threading.Timer(0.7, self.save_settings)
+        self._save_timer.daemon = True
+        self._save_timer.start()
 
-        st.configure("TButton", background=C["btn"], foreground=C["text"], borderwidth=0,
-                     padding=(14, 8), focusthickness=0, relief="flat")
-        st.map("TButton", background=[("disabled", C["card"]), ("pressed", C["line"]), ("active", C["btn_hi"])],
-               foreground=[("disabled", C["dim"])])
-        st.configure("Accent.TButton", background=C["accent"], foreground=C["on_accent"],
-                     font=(FONT, 11, "bold"), padding=(24, 11))
-        st.map("Accent.TButton",
-               background=[("disabled", C["btn"]), ("pressed", C["accent"]), ("active", C["accent_hi"])],
-               foreground=[("disabled", C["dim"])])
-        st.configure("Big.TButton", font=(FONT, 10, "bold"), padding=(18, 11))
-        st.configure("Link.TButton", background=C["card"], foreground=C["muted"], padding=(2, 2),
-                     font=(FONT, 9, "underline"))
-        st.map("Link.TButton", background=[("active", C["card"]), ("pressed", C["card"])],
-               foreground=[("active", C["accent"]), ("disabled", C["dim"])])
-        st.configure("Path.TButton", background=C["card"], foreground=C["muted"], padding=(2, 2),
-                     font=(FONT, 10))
-        st.map("Path.TButton", background=[("active", C["card"]), ("pressed", C["card"])],
-               foreground=[("active", C["text"])])
-        st.configure("BgPath.TButton", background=C["bg"], foreground=C["muted"], padding=(2, 6),
-                     font=(FONT, 10))
-        st.map("BgPath.TButton", background=[("active", C["bg"]), ("pressed", C["bg"])],
-               foreground=[("active", C["text"])])
-        st.configure("BgLink.TButton", background=C["bg"], foreground=C["muted"], padding=(2, 2),
-                     font=(FONT, 9, "underline"))
-        st.map("BgLink.TButton", background=[("active", C["bg"])], foreground=[("active", C["accent"])])
-
-        for w in ("TEntry", "TCombobox", "TSpinbox"):
-            st.configure(w, fieldbackground=C["field"], foreground=C["text"], insertcolor=C["text"],
-                         bordercolor=C["line"], lightcolor=C["field"], darkcolor=C["field"],
-                         arrowcolor=C["muted"], background=C["btn"], padding=6,
-                         selectbackground=C["accent"], selectforeground=C["on_accent"])
-            st.map(w, fieldbackground=[("readonly", C["field"]), ("disabled", C["card"])],
-                   foreground=[("readonly", C["text"])],
-                   bordercolor=[("focus", C["accent"])],
-                   lightcolor=[("focus", C["accent"])], darkcolor=[("focus", C["accent"])],
-                   selectbackground=[("readonly", C["field"])],
-                   selectforeground=[("readonly", C["text"])])
-        self.option_add("*TCombobox*Listbox.background", C["field"])
-        self.option_add("*TCombobox*Listbox.foreground", C["text"])
-        self.option_add("*TCombobox*Listbox.selectBackground", C["accent"])
-        self.option_add("*TCombobox*Listbox.selectForeground", C["on_accent"])
-        self.option_add("*TCombobox*Listbox.font", base)
-
-        st.configure("TCheckbutton", background=C["card"], foreground=C["text"],
-                     indicatorbackground=C["field"], indicatorforeground=C["accent"])
-        st.map("TCheckbutton", background=[("active", C["card"])], foreground=[("active", C["accent_hi"])],
-               indicatorbackground=[("selected", C["field"])])
-        st.configure("TNotebook", background=C["bg"], borderwidth=0, tabmargins=(0, 0, 0, 0))
-        st.configure("TNotebook.Tab", background=C["btn"], foreground=C["muted"], padding=(18, 8),
-                     borderwidth=0, font=(FONT, 10, "bold"))
-        st.map("TNotebook.Tab", background=[("selected", C["accent"]), ("active", C["btn_hi"])],
-               padding=[("selected", (18, 8))], expand=[("selected", (0, 0, 0, 0))],
-               foreground=[("selected", C["on_accent"]), ("active", C["text"])])
-        st.configure("Horizontal.TProgressbar", background=C["accent"], troughcolor=C["btn"],
-                     bordercolor=C["card"], lightcolor=C["accent"], darkcolor=C["accent"], thickness=4)
-        # Ползунок — одна гладкая полоса: без стрелок, без рисок и объёмных краёв
-        st.layout("Vertical.TScrollbar", [("Vertical.Scrollbar.trough", {"sticky": "ns", "children": [
-            ("Vertical.Scrollbar.thumb", {"expand": "1", "sticky": "nswe"})]})])
-        st.configure("Vertical.TScrollbar", background=C["btn_hi"], troughcolor=C["card"], bordercolor=C["card"],
-                     lightcolor=C["btn_hi"], darkcolor=C["btn_hi"], gripcount=0, relief="flat", arrowsize=8,
-                     borderwidth=0)
-        st.map("Vertical.TScrollbar", background=[("active", C["muted"]), ("pressed", C["muted"])],
-               lightcolor=[("active", C["muted"]), ("pressed", C["muted"])],
-               darkcolor=[("active", C["muted"]), ("pressed", C["muted"])])
-
-    def card(self, parent, title, side=None, grid=None):
-        """Тёмная карточка с заголовком. side — виджет-функция для правой части заголовка."""
-        border = RoundBox(parent, fill=C["card"], border=C["line"], radius=16, pad=5)
-        if grid:
-            border.grid(row=grid[0], column=grid[1], sticky="nsew", pady=6,
-                        padx=(0, 7) if grid[1] == 0 else (7, 0))
-        else:
-            border.pack(fill="x", pady=6)
-        body = ttk.Frame(border.inner, style="Card.TFrame", padding=(15, 9, 15, 13))
-        body.pack(fill="both", expand=True)
-        head = ttk.Frame(body, style="Card.TFrame")
-        head.pack(fill="x", pady=(0, 10))
-        ttk.Label(head, text=title, style="Title.TLabel").pack(side="left")
-        if side:
-            side(head)
-        return body
-
-    def button(self, parent, text, command, style="TButton", **pack):
-        b = RButton(parent, text=text, command=command, style=style)
-        b.pack(side="left", **pack)
-        self.buttons.append(b)
-        return b
-
-    def folder_link(self, parent, sub):
-        """Строка «Сохраняется в: Рабочий стол / Октябрь 2026 / 29.10 / Озон 2» — нажатие открывает папку."""
-        row = ttk.Frame(parent, style="Card.TFrame")
-        row.pack(fill="x", pady=(12, 0))
-        ttk.Label(row, text="Сохраняется в:", style="Field.TLabel").pack(side="left")
-        var = tk.StringVar()
-        ttk.Button(row, textvariable=var, style="Path.TButton",
-                   command=lambda: self.open_out(self.day_dir(sub() if callable(sub) else sub))
-                   ).pack(side="left", padx=(6, 0))
-        self._links = getattr(self, "_links", [])
-        self._links.append((var, sub))
-        return var
-
-    def refresh_links(self):
-        if hasattr(self, "root_label"):
-            r = Path(self.root_dir.get().strip() or self.default_root())
-            self.root_label.configure(text="Папка:  " + "  ›  ".join(r.parts[-3:]))
-        for var, sub in getattr(self, "_links", []):
-            p = self.day_dir(sub() if callable(sub) else sub)
-            var.set("  ›  ".join(p.parts[-2:]) + "     открыть ↗")
-
-    def dark_titlebar(self):
-        """Тёмный заголовок окна в Windows 10/11 — только в тёмной теме."""
-        if sys.platform != "win32" or ui_theme() != "dark":
-            return
+    def save_settings(self):
+        s = self.s
         try:
-            import ctypes
-            hwnd = ctypes.windll.user32.GetParent(self.winfo_id())
-            val = ctypes.c_int(1)
-            for attr in (20, 19):
-                ctypes.windll.dwmapi.DwmSetWindowAttribute(hwnd, attr, ctypes.byref(val), ctypes.sizeof(val))
-        except Exception:  # noqa: BLE001 — украшение, не критично
-            pass
+            CONFIG.write_text(json.dumps(self.cabinets(), ensure_ascii=False, indent=2), encoding="utf-8")
+            WB_CONFIG.write_text(json.dumps({"token": str(s["wb_token"]).strip()}), encoding="utf-8")
+            SKLAD.update(url=str(s["sklad_url"]).strip(), key=str(s["sklad_key"]).strip())
+            SKLAD_CONFIG.write_text(json.dumps(SKLAD), encoding="utf-8")
+            CDEK.update(account=str(s["cdek_account"]).strip(), secure=str(s["cdek_secure"]).strip())
+            CDEK_CONFIG.write_text(json.dumps(CDEK), encoding="utf-8")
+            MORNING_CONFIG.write_text(json.dumps({
+                "template": str(s["template"]).strip(), "root": str(s["root_dir"]).strip(), "by_day": False,
+                "days": int(_setting_num(s["days"], 14)), "margin": _setting_num(s["top_margin"], DEFAULT_TOP_MARGIN_PT),
+                "font": _setting_num(s["font_size"], DEFAULT_FONT_SIZE), "autoship": bool(s["autoship"]),
+                "passes": self.pass_cfg(),
+            }, ensure_ascii=False, indent=2), encoding="utf-8")
+            return True
+        except OSError as e:
+            self.log(f"✖ Не удалось сохранить настройки: {e}")
+            return False
 
-    # ------------------------------------------------------------ вкладка «Сборка»
-    def build_sborka(self, tab):
-        c1 = self.card(tab, "Утренняя сборка")
-        row = ttk.Frame(c1, style="Card.TFrame")
-        row.pack(fill="x")
-        self.button(row, "Скачать отчёты и сборку", self.start_morning, "Accent.TButton")
-        self.button(row, "Добавить СДЭК…", self.start_cdek, "Big.TButton", padx=(10, 0))
-        self.button(row, "Не уехало вчера…", self.pick_left, "Big.TButton", padx=(10, 0))
-        self.left_files, self.left_day = [], None
-        self.left_status = ttk.Label(c1, text="", style="Info.TLabel")
-        self.left_status.pack(anchor="w", pady=(8, 0))
-        self.folder_link(c1, "Сборка")
-        self.mo_status = ttk.Label(c1, text="", style="Info.TLabel")
-        self.mo_status.pack(anchor="w", pady=(10, 0))
+    def save_now(self):
+        if self._save_timer:
+            self._save_timer.cancel()
+        ok = self.save_settings()
+        try:
+            saved = json.loads(MORNING_CONFIG.read_text(encoding="utf-8")).get("passes") or {}
+            ok = ok and saved.get("phone", "") == self.pass_cfg()["phone"]
+        except (OSError, ValueError):
+            ok = False
+        t = datetime.now(MSK)
+        if ok:
+            self.status("save_status", f"✔ Сохранено в {t:%H:%M} — папка {DATA_DIR}", "ok")
+            self.log(f"✔ Настройки сохранены: {DATA_DIR}")
+        else:
+            self.status("save_status", f"✖ Не сохранилось — нет доступа к папке {DATA_DIR}", "err")
 
-        c2 = self.card(tab, "В течение дня")
-        chips = ttk.Frame(c2, style="Card.TFrame")
-        chips.pack(fill="x")
-        self.wave_chips = {}
-        for i, name in enumerate(WAVES):
-            if i and "кгт" in name.lower() and "кгт" not in WAVES[i - 1].lower():
-                tk.Frame(chips, bg=C["line"], width=1, height=26).pack(side="left", padx=10)
-            b = RButton(chips, text=name, style="Chip",
-                        command=lambda n=name: (self.wave.set(n), self.refresh_wave_chips()))
-            b.pack(side="left", padx=(0, 6))
-            self.wave_chips[name] = b
-        row2 = ttk.Frame(c2, style="Card.TFrame")
-        row2.pack(fill="x", pady=(14, 0))
-        self.wave_btn = self.button(row2, "Скачать отчёт и сборку", self.start_wave, "Accent.TButton")
-        self.folder_link(c2, self.wave_name)
-        self.wave_status = ttk.Label(c2, text="", style="Info.TLabel")
-        self.wave_status.pack(anchor="w", pady=(10, 0))
+    def set_theme(self, key):
+        try:
+            ui_save(theme="dark" if key == "dark" else "light")
+        except OSError as e:
+            self.log(f"✖ Тема не сохранилась: {e}")
 
-    def wave_name(self):
-        return self.wave.get() or WAVES[0]
+    def cabinets(self):
+        """Заполненные кабинеты в порядке строк: {название: {client_id, api_key}}."""
+        result = {}
+        for c in self.cab:
+            cid, key = str(c["cid"]).strip(), str(c["key"]).strip()
+            if cid and key:
+                result[str(c["name"]).strip() or cid] = {"client_id": cid, "api_key": key}
+        return result
 
-    def refresh_wave_chips(self):
-        for name, b in self.wave_chips.items():
-            on = name == self.wave.get()
-            b.set_colors(C["accent"] if on else C["btn"], C["accent_hi"] if on else C["btn_hi"],
-                         C["on_accent"] if on else C["text"])
-        self.refresh_links()
+    def pass_cfg(self):
+        s = self.s
+        return {"on": bool(s["pass_on"]), "driver": " ".join(str(s["pass_driver"]).split()),
+                "phone": str(s["pass_phone"]).strip(), "cars": str(s["pass_cars"]).strip()}
 
-    # ------------------------------------------------------------ вкладка Ozon
-    def build_ozon(self, tab):
-        c1 = self.card(tab, "Отчёт")
-        row = ttk.Frame(c1, style="Card.TFrame")
-        row.pack(fill="x")
-        self.excel_name = ttk.Label(row, text="не выбран", style="File.TLabel")
-        self.excel_name.pack(side="left")
-        RButton(row, text="Выбрать файл…", command=self.pick_excel).pack(side="right")
-        self.sheet_box = ttk.Frame(row, style="Card.TFrame")
-        ttk.Label(self.sheet_box, text="лист", style="Field.TLabel").pack(side="left", padx=(0, 6))
-        self.sheet_cb = ttk.Combobox(self.sheet_box, textvariable=self.sheet, state="readonly", width=14)
-        self.sheet_cb.pack(side="left")
-        self.sheet_cb.bind("<<ComboboxSelected>>", lambda e: self.count_report())
-        self.report_info = ttk.Label(c1, text="Отчёт подставляется сам после «Сборки». "
-                                              "Покрась его в Excel, сохрани и закрой.", style="Info.TLabel")
-        self.report_info.pack(anchor="w", pady=(8, 0))
+    # ------------------------------------------------------------ папки
+    def root(self):
+        return Path(str(self.s["root_dir"]).strip() or default_root())
 
-        c2 = self.card(tab, "Этикетки")
-        g = ttk.Frame(c2, style="Card.TFrame")
-        g.pack(fill="x")
-        ttk.Label(g, text="Надпись на ШК", style="Field.TLabel").pack(side="left")
-        fcb = ttk.Combobox(g, textvariable=self.footer, width=16, values=FOOTERS)
-        fcb.pack(side="left", padx=(10, 24))
-        fcb.bind("<<ComboboxSelected>>", lambda e: self.refresh_links())
-        fcb.bind("<KeyRelease>", lambda e: self.refresh_links())
-        ttk.Checkbutton(g, variable=self.autoship, text="Собирать заказы из «Ожидают сборки»"
-                        ).pack(side="left")
-        row2 = ttk.Frame(c2, style="Card.TFrame")
-        row2.pack(fill="x", pady=(16, 0))
-        self.button(row2, "Проверить", lambda: self.start("check"), "Big.TButton")
-        self.button(row2, "Скачать и собрать", lambda: self.start("run"), "Accent.TButton", padx=(10, 0))
-        self.button(row2, "Пересобрать ленты", lambda: self.start("merge"), padx=(10, 0))
-        self.button(row2, "Пропуска", self.start_passes, padx=(10, 0))
-        self.folder_link(c2, self.ozon_sub)
+    def day_dir(self, sub):
+        """Главная папка / <sub>. Если такая папка уже создана (хоть «озон 2», хоть «Озон2») — она."""
+        base = self.root()
+        return find_dir(base, sub) or base / sub
 
     def ozon_sub(self):
         """Папка этикеток Ozon по подписи: «Озон утро», «Озон 1», «Озон 2», «КГТ 2»… — у каждой своя."""
-        name = " ".join(self.footer.get().split())
-        return name or "Озон утро"
+        return " ".join(str(self.s["footer"]).split()) or "Озон утро"
 
-    # ------------------------------------------------------------ вкладка Wildberries
-    def build_wb(self, tab):
-        c1 = self.card(tab, "Отчёты ВБ и СГТ")
-        row = ttk.Frame(c1, style="Card.TFrame")
-        row.pack(fill="x")
-        self.wb_files_label = ttk.Label(row, text="не выбраны", style="File.TLabel")
-        self.wb_files_label.pack(side="left")
-        RButton(row, text="Очистить", command=self.clear_wb).pack(side="right")
-        RButton(row, text="Добавить файл…", command=self.pick_wb).pack(side="right", padx=(0, 8))
-        self.wb_info = ttk.Label(c1, text="Отчёты подставляются сами после «Сборки».", style="Info.TLabel",
-                                 justify="left")
-        self.wb_info.pack(anchor="w", pady=(8, 0))
+    def wave_name(self):
+        return self.s["wave"] or WAVES[0]
 
-        c2 = self.card(tab, "Поставки и стикеры")
-        row2 = ttk.Frame(c2, style="Card.TFrame")
-        row2.pack(fill="x")
-        self.button(row2, "Проверить", lambda: self.start_wb("check"), "Big.TButton")
-        self.button(row2, "Создать поставки и скачать", lambda: self.start_wb("run"), "Accent.TButton",
-                    padx=(10, 0))
-        self.button(row2, "Скачать ШК открытых поставок", lambda: self.start_wb("stickers"), padx=(10, 0))
-        self.folder_link(c2, "ВБ")
+    def link_subs(self):
+        return {"sborka": "Сборка", "wave": self.wave_name(), "ozon": self.ozon_sub(), "wb": "ВБ", "cdek": "СДЭК"}
 
-    # ------------------------------------------------------------ вкладка «СДЭК»
-    def build_cdek(self, tab):
-        self.cdek_file = None
-        c1 = self.card(tab, "Заказы СДЭК")
-        row = ttk.Frame(c1, style="Card.TFrame")
-        row.pack(fill="x")
-        self.cdek_file_label = ttk.Label(row, text="не выбран", style="File.TLabel")
-        self.cdek_file_label.pack(side="left")
-        RButton(row, text="Выбрать файл…", command=self.pick_cdek_file).pack(side="right")
-        self.cdek_info = ttk.Label(c1, text="Файл из «макса»: № задания, Артикул продавца, трэк. Покраска — "
-                                            "как в отчётах Ozon: красный не едет, жёлтый — сколько указано рядом.",
-                                   style="Info.TLabel", justify="left", wraplength=720)
-        self.cdek_info.pack(anchor="w", pady=(8, 0))
+    def links(self):
+        return {k: "  ›  ".join(self.day_dir(sub).parts[-2:]) for k, sub in self.link_subs().items()}
 
-        c3 = self.card(tab, "Листы сборки, ШК и акты")
-        row3 = ttk.Frame(c3, style="Card.TFrame")
-        row3.pack(fill="x")
-        self.button(row3, "Проверить", self.start_cdek_check, "Big.TButton")
-        self.button(row3, "Сделать листы, ШК и акты", self.start_cdek_docs, "Accent.TButton", padx=(10, 0))
-        self.cdek_keys = ttk.Label(row3, text="", style="Info.TLabel")
-        self.cdek_keys.pack(side="left", padx=(14, 0))
-        self.folder_link(c3, "СДЭК")
-        self.cdek_done = ttk.Label(c3, text="", style="Info.TLabel")
-        self.cdek_done.pack(anchor="w", pady=(10, 0))
-        self.refresh_cdek()
+    def root_text(self):
+        return "  ›  ".join(self.root().parts[-3:])
 
-    def refresh_cdek(self):
-        if cdek_on():
-            self.cdek_keys.configure(text="ШК качаются по ключам СДЭК", foreground=C["muted"])
+    def place_reports(self, base, files, log):
+        """Утренние отчёты Озон/КГТ/ВБ/СГТ — в папки «Озон утро», «КГТ 1», «ВБ», если такие папки уже созданы."""
+        for key, sub in (("ozon", "Озон утро"), ("kgt", "КГТ 1"), ("wb", "ВБ"), ("sgt", "ВБ")):
+            src = files.get(key)
+            dst_dir = find_dir(base, sub)
+            if not src or not dst_dir or Path(src).parent == dst_dir:
+                continue
+            dst = dst_dir / Path(src).name
+            try:
+                os.replace(src, dst)
+                files[key] = dst
+                log(f"   {Path(src).name} → папка «{dst_dir.name}»")
+            except OSError as e:
+                log(f"⚠ {Path(src).name} не перенёс в «{dst_dir.name}»: {e}")
+        return files
+
+    def open_path(self, path):
+        p = Path(path)
+        if not p.exists():
+            p.mkdir(parents=True, exist_ok=True)
+        if sys.platform == "win32":
+            os.startfile(p)  # noqa: S606
         else:
-            self.cdek_keys.configure(text="нет ключей СДЭК — «Настройки → СДЭК»", foreground=C["err"])
+            subprocess.Popen(["open" if sys.platform == "darwin" else "xdg-open", str(p)])
 
+    def open_link(self, key):
+        sub = self.link_subs().get(key)
+        self.open_path(self.day_dir(sub) if sub else self.root())
+
+    # ------------------------------------------------------------ диалоги выбора файлов
+    def _dialog(self, kind, title="", multiple=False, types=()):
+        if not self.window:
+            return []
+        import webview
+        dialogs = getattr(webview, "FileDialog", None)
+        mode = (getattr(dialogs, kind) if dialogs else
+                {"OPEN": webview.OPEN_DIALOG, "FOLDER": webview.FOLDER_DIALOG}[kind])
+        kwargs = {"allow_multiple": multiple}
+        if types:
+            kwargs["file_types"] = types
+        if kind == "FOLDER":
+            kwargs = {"directory": str(self.root())}
+        result = self.window.create_file_dialog(mode, **kwargs)
+        return [str(p) for p in (result or [])]
+
+    EXCEL_TYPES = ("Excel (*.xlsx;*.xlsm)",)
+
+    def pick_template(self):
+        paths = self._dialog("OPEN", types=("Excel (*.xlsx)",))
+        if paths:
+            self.s["template"] = paths[0]
+            self.schedule_save()
+            self.emit("set", key="template", value=paths[0])
+
+    def pick_root(self):
+        paths = self._dialog("FOLDER")
+        if paths:
+            self.s["root_dir"] = paths[0]
+            self.save_settings()
+            self.emit("set", key="root_dir", value=paths[0])
+            self.emit("links", links=self.links(), root=self.root_text())
+
+    def check_template(self):
+        t = str(self.s["template"]).strip()
+        if t and not Path(t).exists():
+            self.alert(f"Не найден шаблон сборки:\n{t}\n\nВыбери его во вкладке «Настройки».")
+            return None
+        if not t:
+            self.alert("Выбери шаблон сборки во вкладке «Настройки».")
+            return None
+        return t
+
+    # ------------------------------------------------------------ запуск работ
+    def run(self, work):
+        """Работа в фоне; кнопки на странице гаснут, пока она идёт."""
+        self.busy = True
+        self.emit("busy", on=True)
+
+        def wrapped():
+            try:
+                work()
+            except Exception as e:  # noqa: BLE001
+                self.log(f"✖ Ошибка: {e}")
+            finally:
+                self.busy = False
+                self.emit("busy", on=False)
+                self.emit("links", links=self.links(), root=self.root_text())
+        threading.Thread(target=wrapped, daemon=True).start()
+
+    # --- «Сборка»
+    def pick_left(self):
+        """Файлы с тем, что не уехало вчера: эти отправления утренний отчёт не возьмёт (1.32)."""
+        if self.busy:
+            return
+        if self.left_files and self.ask("Уже выбрано:\n" + "\n".join(Path(p).name for p in self.left_files)
+                                        + "\n\nУбрать выбор? (Нет — выбрать другие файлы)"):
+            self.set_left([])
+            return
+        paths = self._dialog("OPEN", multiple=True,
+                             types=("ШК или отчёт (*.pdf;*.xlsx;*.xlsm;*.csv)", "PDF (*.pdf)",
+                                    "Excel или CSV (*.xlsx;*.xlsm;*.csv)"))
+        if paths:
+            self.set_left(paths)
+
+    def set_left(self, paths):
+        self.left_files, self.left_day = list(paths), (today_msk() if paths else None)
+        if not paths:
+            self.status("left_status", "")
+            self.log("Не уехало вчера: выбор убран")
+            return
+        postings, _, notes = left_numbers(paths)
+        self.log("Не уехало вчера — выбрано:")
+        for note in notes:
+            self.log(note)
+        self.status("left_status",
+                    f"Не уехало вчера: {plural(len(postings), 'отправление', 'отправления', 'отправлений')} — "
+                    f"в утренний отчёт не попадут. Убрать — нажми кнопку ещё раз.", "ok" if postings else "err")
+
+    def start_morning(self):
+        if self.busy:
+            return
+        template = self.check_template()
+        if not template:
+            return
+        cabinets, token = self.cabinets(), str(self.s["wb_token"]).strip()
+        if not cabinets and not token:
+            self.alert("Заполни ключи Ozon и токен WB во вкладке «Настройки».")
+            return
+        self.save_settings()
+        out, days = self.day_dir("Сборка"), int(_setting_num(self.s["days"], 14))
+        base = self.root()
+        d = today_msk()
+        self.headline(f"УТРЕННЯЯ СБОРКА · {d:%d.%m}")
+        self.status("mo_status", "скачиваю…")
+        if self.left_files and self.left_day != d:
+            self.set_left([])  # выбрано в другой день — не применяем
+        left = list(self.left_files)
+
+        def work():
+            try:
+                files = morning(cabinets, token, template, "", out, days, log=self.log, progress=self.progress,
+                                left=left)
+                files = self.place_reports(base, files, self.log)
+                self.after_morning(files)
+            except Exception as e:  # noqa: BLE001
+                self.log(f"✖ Ошибка: {e}")
+                self.status("mo_status", "✖ ошибка — см. журнал", "err")
+        self.run(work)
+
+    def after_morning(self, files):
+        wb = [str(files[k]) for k in ("wb", "sgt") if files.get(k)]
+        if not files.get("ozon") and self.cabinets():
+            self.status("mo_status", "✖ Озон не скачался — нажми «Скачать отчёты и сборку» ещё раз.", "err")
+            if wb:
+                self.set_wb_files(wb)
+            return
+        if files.get("ozon"):
+            self.set_excel(str(files["ozon"]))
+            self.s["footer"] = "Озон утро"
+            self.emit("set", key="footer", value="Озон утро")
+        if wb:
+            self.set_wb_files(wb)
+        t = datetime.now(MSK)
+        self.status("mo_status", f"✔ Готово в {t:%H:%M}. Отчёты уже стоят на вкладках Ozon и Wildberries.", "ok")
+
+    def start_cdek(self):
+        """«Добавить СДЭК…» на «Сборке»: файл СДЭК — в сборку."""
+        if self.busy:
+            return
+        template = self.check_template()
+        if not template:
+            return
+        paths = self._dialog("OPEN", types=self.EXCEL_TYPES)
+        if not paths:
+            return
+        cdek = paths[0]
+        try:
+            orders = read_cdek_orders(cdek)
+        except Exception as e:  # noqa: BLE001
+            self.alert(f"Не удалось прочитать файл СДЭК: {e}", "err")
+            return
+        out = self.day_dir("Сборка")
+        self.headline("СДЭК В СБОРКУ")
+
+        def work():
+            try:
+                add_cdek(template, cdek, out, log=self.log, send_sklad=not orders)
+                if orders:
+                    self.log("│ Листы сборки, ШК и акты СДЭК — на странице «СДЭК» слева.")
+            except PermissionError:
+                self.log("✖ Файл сборки открыт в Excel — закрой его и нажми ещё раз")
+        self.run(work)
+
+    def start_wave(self):
+        if self.busy:
+            return
+        cabinets = self.cabinets()
+        if not cabinets:
+            self.alert("Заполни ключи Ozon во вкладке «Настройки».")
+            return
+        template = self.check_template()
+        if not template:
+            return
+        wave = self.wave_name()
+        kgt = "кгт" in wave.lower()
+        out, days = self.day_dir(wave), int(_setting_num(self.s["days"], 14))
+        self.save_settings()
+        self.headline(f"{wave.upper()} · {'КГТ' if kgt else 'МГТ'} · только «ожидают сборки»")
+        self.status("wave_status", "скачиваю…")
+
+        def work():
+            try:
+                files = ozon_wave(cabinets, template, out, days, wave, kgt, log=self.log, progress=self.progress)
+                report = files.get("kgt") or files.get("ozon")
+                if report:
+                    self.set_excel(str(report))
+                self.s["footer"] = wave
+                self.emit("set", key="footer", value=wave)
+                t = datetime.now(MSK)
+                self.status("wave_status", f"✔ {wave} готов в {t:%H:%M}. Отчёт уже стоит на вкладке Ozon.", "ok")
+            except Exception as e:  # noqa: BLE001
+                self.log(f"✖ Ошибка: {e}")
+                self.status("wave_status", "✖ ошибка — см. журнал", "err")
+        self.run(work)
+
+    # --- Ozon
+    def pick_excel(self):
+        paths = self._dialog("OPEN", types=self.EXCEL_TYPES)
+        if paths:
+            self.set_excel(paths[0])
+
+    def set_excel(self, path):
+        try:
+            names = sheet_names(path)
+        except Exception as e:  # noqa: BLE001
+            self.alert(f"Не удалось открыть файл: {e}", "err")
+            return
+        self.excel, self.sheets, self.sheet = path, list(names), names[0]
+        self.emit("excel", name=Path(path).name, sheets=self.sheets, sheet=self.sheet)
+        self.count_report()
+
+    def set_sheet(self, name):
+        if name in self.sheets:
+            self.sheet = name
+            self.count_report()
+
+    def count_report(self):
+        path, sheet = self.excel, self.sheet
+        self.status("report_info", "читаю отчёт…")
+
+        def work():
+            try:
+                text, color = ozon_report_summary(path, sheet), "text"
+            except Exception as e:  # noqa: BLE001
+                text, color = f"Не получилось прочитать: {e}", "err"
+            if path == self.excel:
+                self.status("report_info", text, color)
+        threading.Thread(target=work, daemon=True).start()
+
+    def start_ozon(self, mode):
+        """mode: run — скачать и собрать, check — проверка, merge — пересобрать ленты."""
+        if self.busy:
+            return
+        font = _setting_num(self.s["font_size"], DEFAULT_FONT_SIZE)
+        margin = _setting_num(self.s["top_margin"], DEFAULT_TOP_MARGIN_PT)
+        out = self.day_dir(self.ozon_sub())
+        footer = str(self.s["footer"])
+        if mode == "merge":
+            src, note = self.last_ozon_out, ""
+            if src and Path(src) != out and Path(src).exists():
+                # надпись поменяли после скачивания — переименуем папку под новую надпись
+                if not out.exists():
+                    try:
+                        Path(src).rename(out)
+                        note = f"Папка «{Path(src).name}» переименована в «{out.name}»"
+                    except OSError as e:
+                        out, note = Path(src), f"⚠ Не удалось переименовать папку «{Path(src).name}»: {e}"
+                else:
+                    out = Path(src)
+                    note = f"⚠ Папка «{self.ozon_sub()}» уже есть — пересобираю «{out.name}» с новой надписью"
+            self.last_ozon_out = out
+            self.headline(f"ПЕРЕСБОРКА ЛЕНТ · {' '.join(footer.split()) or 'без надписи'}")
+
+            def work():
+                if note:
+                    self.log(note)
+                merge_all(out, font, margin, self.log, footer)
+            self.run(work)
+            return
+        cabinets = self.cabinets()
+        if not cabinets:
+            self.alert("Заполни ключи Ozon во вкладке «Настройки».")
+            return
+        if not self.excel:
+            self.alert("Выбери отчёт.")
+            return
+        self.save_settings()
+        self.headline(f"OZON · {'СКАЧИВАНИЕ И СБОРКА' if mode == 'run' else 'ПРОВЕРКА'} · {self.ozon_sub()}")
+        args = (self.excel, self.sheet, cabinets, int(_setting_num(self.s["days"], 14)), out)
+        autoship = bool(self.s["autoship"])
+        pass_cfg = self.pass_cfg() if self.s["pass_on"] else None
+        if mode == "run":
+            self.last_ozon_out = out
+
+        def work():
+            form = process(*args, log=self.log, progress=self.progress, download=mode == "run", font_size=font,
+                           top_margin=margin, autoship=autoship, confirm=self.ask, footer=footer)
+            if mode == "run" and pass_cfg and form:
+                self.log("\n=== ОТГРУЗКА И ПРОПУСКА ===")
+                ozon_passes(cabinets, pass_cfg, self.log, form=form, confirm=self.ask)
+        self.run(work)
+
+    def start_passes(self):
+        cabinets = self.cabinets()
+        if not cabinets:
+            self.alert("Заполни ключи Ozon во вкладке «Настройки».")
+            return
+        if self._pass_running.get("ozon"):
+            self.log("… пропуска уже делаются — смотри журнал")
+            return
+        self._pass_running["ozon"] = True
+        cfg = self.pass_cfg()
+
+        def work():   # пропуска идут отдельно от кнопок: WB может ждать между пропусками по 10 минут
+            try:
+                ozon_passes(cabinets, cfg, self.log)
+            except Exception as e:  # noqa: BLE001
+                self.log(f"✖ Пропуска: {e}")
+            self._pass_running["ozon"] = False
+        threading.Thread(target=work, daemon=True).start()
+
+    # --- Wildberries
+    def pick_wb(self):
+        paths = self._dialog("OPEN", multiple=True, types=self.EXCEL_TYPES)
+        if paths:
+            self.set_wb_files(self.wb_files + [p for p in paths if p not in self.wb_files])
+
+    def set_wb_files(self, files):
+        self.wb_files = list(files)
+        self.emit("wb_files", text="   ·   ".join(Path(p).stem for p in files) or "не выбраны")
+        if not files:
+            self.status("wb_info", "Отчёты подставляются сами после «Сборки».")
+            return
+        self.status("wb_info", "читаю отчёты…")
+        snapshot = list(files)
+
+        def work():
+            try:
+                text, color = wb_files_summary(snapshot), "text"
+            except Exception as e:  # noqa: BLE001
+                text, color = f"Не получилось прочитать: {e}", "err"
+            if snapshot == self.wb_files:
+                self.status("wb_info", text, color)
+        threading.Thread(target=work, daemon=True).start()
+
+    def start_wb(self, mode):
+        if self.busy:
+            return
+        token = str(self.s["wb_token"]).strip()
+        if not token:
+            self.alert("Вставь токен WB во вкладке «Настройки».")
+            return
+        if mode != "stickers" and not self.wb_files:
+            self.alert("Добавь отчёты ВБ и СГТ.")
+            return
+        self.save_settings()
+        out = self.day_dir("ВБ")
+        self.headline({"run": "WB · ПОСТАВКИ И СТИКЕРЫ", "check": "WB · ПРОВЕРКА",
+                       "stickers": "WB · СТИКЕРЫ ОТКРЫТЫХ ПОСТАВОК"}[mode])
+        files = list(self.wb_files)
+        self.run(lambda: process_wb(files, token, out, log=self.log, progress=self.progress, mode=mode,
+                                    confirm=self.ask))
+
+    # --- СДЭК
     def pick_cdek_file(self):
-        path = filedialog.askopenfilename(title="Заказы СДЭК", filetypes=[("Excel", "*.xlsx *.xlsm")])
-        if path:
-            self.load_cdek_file(path)
+        paths = self._dialog("OPEN", types=self.EXCEL_TYPES)
+        if paths:
+            self.load_cdek_file(paths[0])
 
     def load_cdek_file(self, path):
         """Прочитать файл заказов: сколько едет на каждое производство с учётом покраски."""
@@ -4708,33 +4458,35 @@ class App(tk.Tk):
             orders = read_cdek_orders(path)
             going, stopped = cdek_filter(path, orders) if orders else ([], [])
         except Exception as e:  # noqa: BLE001
-            messagebox.showerror(APP_NAME, f"Не удалось прочитать файл: {e}")
+            self.alert(f"Не удалось прочитать файл: {e}", "err")
             return
         if not orders:
-            messagebox.showwarning(APP_NAME, "В файле нет колонки «трэк» или нет заказов с трэком.")
+            self.alert("В файле нет колонки «трэк» или нет заказов с трэком.")
             return
         self.cdek_file = path
-        self.cdek_file_label.configure(text=Path(path).name)
+        self.emit("cdek_file", name=Path(path).name)
         kom = sum(production_of(o["article"]) == KOMINTERNA for o in going)
         text = f"Едут {len(going)}: {KOMINTERNA} {kom}, {UCHITELSKAYA} {len(going) - kom}"
         if stopped:
             text += f" · не едут (покраска): {len(stopped)}"
-        self.cdek_info.configure(text=text + ". Покрасил или поправил файл — выбери его ещё раз.")
+        self.status("cdek_info", text + ". Покрасил или поправил файл — выбери его ещё раз.", "text")
+
+    def cdek_keys(self):
+        self.emit("cdek_keys", on=cdek_on())
 
     def start_cdek_check(self):
         """«Проверить»: что уедет, что не едет по покраске и как заказы выглядят в СДЭК. Ничего не создаёт."""
         if self.busy:
             return
         if not self.cdek_file:
-            messagebox.showwarning(APP_NAME, "Сначала выбери файл заказов СДЭК.")
+            self.alert("Сначала выбери файл заказов СДЭК.")
             return
-        self.refresh_cdek()
-        path = self.cdek_file
+        self.cdek_keys()
+        path, log = self.cdek_file, self.log
         self.headline("СДЭК: ПРОВЕРКА")
-        self.cdek_done.configure(text="… проверяю", foreground=C["muted"])
+        self.status("cdek_done", "… проверяю")
 
         def work():
-            log = lambda s: self.q.put(("log", s))  # noqa: E731
             try:
                 orders, stopped = cdek_filter(path, read_cdek_orders(path), log)
                 for prod in (KOMINTERNA, UCHITELSKAYA):
@@ -4751,42 +4503,36 @@ class App(tk.Tk):
                     log(f"⛔ Не едут (покраска): {len(stopped)}")
                 if not cdek_on():
                     log("⚠ Ключей СДЭК нет — заказы в СДЭК не проверены и ШК не скачаются")
-                    text, color = f"Едут {pieces(orders)} шт., не едут {len(stopped)} · без проверки в СДЭК", C["warn"]
+                    text, color = f"Едут {pieces(orders)} шт., не едут {len(stopped)} · без проверки в СДЭК", "warn"
                 else:
                     log(f"… проверяю в СДЭК {len(orders)} заказов ({pieces(orders)} шт.)")
                     bad = cdek_check(orders, log)
                     if bad:
-                        text, color = f"⚠ Едут {len(orders)}, в СДЭК проблем: {bad} — смотри журнал", C["err"]
+                        text, color = f"⚠ Едут {len(orders)}, в СДЭК проблем: {bad} — смотри журнал", "err"
                     else:
                         log(f"✔ В СДЭК все {len(orders)} заказов найдены и «Созданы»")
                         text, color = (f"✔ Едут {pieces(orders)} шт., не едут {len(stopped)} · в СДЭК всё в порядке",
-                                       C["ok"])
-                self.q.put(("status", self.cdek_done, text, color))
+                                       "ok")
+                self.status("cdek_done", text, color)
             except (RuntimeError, requests.RequestException) as e:
                 log(f"✖ СДЭК: {e}")
-                self.q.put(("status", self.cdek_done, "✖ проверка не прошла — смотри журнал", C["err"]))
-            except Exception as e:  # noqa: BLE001
-                log(f"✖ Ошибка: {e}")
-            self.q.put(("done",))
-
+                self.status("cdek_done", "✖ проверка не прошла — смотри журнал", "err")
         self.run(work)
 
     def start_cdek_docs(self):
         if self.busy:
             return
         if not self.cdek_file:
-            messagebox.showwarning(APP_NAME, "Сначала выбери файл заказов СДЭК.")
+            self.alert("Сначала выбери файл заказов СДЭК.")
             return
-        self.refresh_cdek()
-        if not cdek_on() and not messagebox.askyesno(
-                APP_NAME, "Нет ключей СДЭК — ШК не скачаются.\nСделать только листы сборки и акты?"):
+        self.cdek_keys()
+        if not cdek_on() and not self.ask("Нет ключей СДЭК — ШК не скачаются.\nСделать только листы сборки и акты?"):
             return
-        path, out = self.cdek_file, self.day_dir("СДЭК")
+        path, out, log = self.cdek_file, self.day_dir("СДЭК"), self.log
         self.headline("СДЭК: ЛИСТЫ, ШК И АКТЫ")
-        self.cdek_done.configure(text="… делаю", foreground=C["muted"])
+        self.status("cdek_done", "… делаю")
 
         def work():
-            log = lambda s: self.q.put(("log", s))  # noqa: E731
             try:
                 orders, stopped = cdek_filter(path, read_cdek_orders(path), log)  # заново — свежая покраска
                 if not orders:
@@ -4799,531 +4545,84 @@ class App(tk.Tk):
                     write_cdek_stopped(Path(out) / name, stopped, path)
                     log(f"⛔ Не уехало {len(stopped)} — список для менеджеров: «СДЭК» / {name}")
                     log("│ " + ", ".join(o["task"] for o in stopped))
-                    self.q.put(("status", self.cdek_done,
-                                f"✔ Готово в {datetime.now(MSK):%H:%M} — {len(orders)} заказов, папка «СДЭК»",
-                                C["ok"]))
+                self.status("cdek_done",
+                            f"✔ Готово в {datetime.now(MSK):%H:%M} — {len(orders)} заказов, папка «СДЭК»", "ok")
             except PermissionError:
                 log("✖ Файл в папке «СДЭК» открыт (Excel/Word/PDF) — закрой и нажми ещё раз")
-            except Exception as e:  # noqa: BLE001
-                log(f"✖ Ошибка: {e}")
-            self.q.put(("done",))
-
         self.run(work)
 
-    # ------------------------------------------------------------ вкладка «Настройки»
-    def scroll_page(self, page):
-        """Страница с прокруткой: длинные настройки листаются колесом, журнал внизу остаётся виден."""
-        canvas = tk.Canvas(page, bg=C["bg"], highlightthickness=0, bd=0, height=1)
-        bar = ttk.Scrollbar(page, orient="vertical", command=canvas.yview)
-        inner = ttk.Frame(canvas, style="Bg.TFrame")
-        win = canvas.create_window((0, 0), window=inner, anchor="nw")
-        canvas.configure(yscrollcommand=bar.set)
-        canvas.pack(side="left", fill="both", expand=True)   # высота — вся область вкладок (1.56)
-        bar.pack(side="right", fill="y", padx=(6, 0))
-        def fit(_=None):
-            canvas.configure(scrollregion=(0, 0, 0, inner.winfo_reqheight()))
-
-        def wheel(e):
-            if getattr(self, "current_page", "") != "Настройки":
-                return
-            w = self.winfo_containing(e.x_root, e.y_root)
-            if w is not None and str(w).startswith(str(canvas)):
-                canvas.yview_scroll(-1 if e.delta > 0 else 1, "units")
-
-        def on_window(e):
-            # Привязка к окну срабатывает и на каждый виджет внутри — пересчёт только для самого окна
-            if e.widget is self:
-                fit()
-                self._fit_page_box()
-
-        def on_canvas(e):
-            if int(canvas.itemcget(win, "width") or 0) != e.width:
-                canvas.itemconfigure(win, width=e.width)
-
-        inner.bind("<Configure>", fit)
-        canvas.bind("<Configure>", on_canvas)
-        self.bind("<Configure>", on_window, add="+")
-        self.bind_all("<MouseWheel>", wheel, add="+")
-        return inner
-
-    def set_theme(self, key):
-        """Тема окна: запоминается на этом компьютере, меняется после перезапуска программы."""
-        try:
-            ui_save(theme=key)
-        except OSError as e:
-            self.theme_note.configure(text=f"Не сохранилось: {e}", foreground=C["err"])
-            return
-        same = key == ui_theme() and key == ("dark" if C["bg"] == C_DARK["bg"] else "light")
-        self.theme_note.configure(text="" if same else "Тема поменяется после перезапуска программы",
-                                  foreground=C["accent"])
-
-    def build_settings(self, tab):
-        top = ttk.Frame(tab, style="Bg.TFrame")
-        top.pack(fill="x", pady=(0, 4))
-        self.button(top, "Сохранить настройки", self.save_now, "Accent.TButton")
-        self.save_status = tk.Label(top, text=f"Настройки и ключи хранятся в папке: {DATA_DIR}",
-                                    bg=C["bg"], fg=C["muted"], font=(FONT, 9), anchor="w")
-        self.save_status.pack(side="left", padx=(12, 0))
-        look = self.card(tab, "Вид окна")
-        lrow = ttk.Frame(look, style="Card.TFrame")
-        lrow.pack(fill="x")
-        now = ui_theme()
-        for key, title in (("light", "Светлая тема"), ("dark", "Тёмная тема")):
-            self.button(lrow, ("✓ " if key == now else "") + title, lambda k=key: self.set_theme(k),
-                        "Accent.TButton" if key == now else "TButton", padx=(0, 8))
-        self.theme_note = ttk.Label(lrow, text="", style="Info.TLabel")
-        self.theme_note.pack(side="left", padx=(8, 0))
-        c1 = self.card(tab, "Кабинеты Ozon", side=lambda h: ttk.Checkbutton(
-            h, text="показать ключи", variable=self.show_keys, command=self.toggle_keys).pack(side="right"))
-        self.cab_box = ttk.Frame(c1, style="Card.TFrame")
-        self.cab_box.pack(fill="x")
-        for i, t in enumerate(("Название", "Client-Id", "Api-Key", "")):
-            ttk.Label(self.cab_box, text=t, style="Muted.TLabel").grid(row=0, column=i, sticky="w", padx=(0, 8))
-        self.cab_box.columnconfigure(2, weight=1)
-        b1 = ttk.Frame(c1, style="Card.TFrame")
-        b1.pack(fill="x", pady=(8, 0))
-        self.btn_test = self.button(b1, "Проверить ключи", self.test_keys)
-        RButton(b1, text="+ кабинет", command=self.add_cabinet).pack(side="left", padx=(8, 0))
-
-        pair = ttk.Frame(tab, style="Bg.TFrame")
-        pair.pack(fill="x")
-        pair.columnconfigure(0, weight=1, uniform="p")
-        pair.columnconfigure(1, weight=1, uniform="p")
-
-        c2 = self.card(pair, "Wildberries", grid=(0, 0))
-        g = ttk.Frame(c2, style="Card.TFrame")
-        g.pack(fill="x")
-        g.columnconfigure(1, weight=1)
-        ttk.Label(g, text="Токен", style="Field.TLabel").grid(row=0, column=0, sticky="w", padx=(0, 10))
-        self.wb_token_entry = REntry(g, textvariable=self.wb_token, show="•")
-        self.wb_token_entry.grid(row=0, column=1, sticky="ew")
-        b2 = ttk.Frame(c2, style="Card.TFrame")
-        b2.pack(fill="x", pady=(8, 0))
-        self.button(b2, "Проверить токен", self.test_wb)
-        self.wb_status = ttk.Label(b2, text="", style="Status.TLabel")
-        self.wb_status.pack(side="left", padx=(10, 0))
-        self.wb_show = tk.BooleanVar(value=False)
-        ttk.Checkbutton(b2, text="показать", variable=self.wb_show,
-                        command=lambda: self.wb_token_entry.configure(show="" if self.wb_show.get() else "•")
-                        ).pack(side="right")
-
-        c3 = self.card(pair, "Файлы", grid=(0, 1))
-        g3 = ttk.Frame(c3, style="Card.TFrame")
-        g3.pack(fill="x")
-        g3.columnconfigure(1, weight=1)
-        for r, (label, var, pick) in enumerate((("Шаблон сборки", self.template, self.pick_template),
-                                                ("Куда сохранять", self.root_dir, self.pick_root))):
-            ttk.Label(g3, text=label, style="Field.TLabel").grid(row=r, column=0, sticky="w", padx=(0, 10), pady=3)
-            REntry(g3, textvariable=var).grid(row=r, column=1, sticky="ew")
-            RButton(g3, text="…", width=3, command=pick).grid(row=r, column=2, padx=(6, 0))
-
-        c5 = self.card(tab, "Склад BLAGO")
-        g5 = ttk.Frame(c5, style="Card.TFrame")
-        g5.pack(fill="x")
-        g5.columnconfigure(1, weight=1)
-        ttk.Label(g5, text="Адрес склада", style="Field.TLabel").grid(row=0, column=0, sticky="w", padx=(0, 10), pady=3)
-        REntry(g5, textvariable=self.sklad_url).grid(row=0, column=1, sticky="ew")
-        ttk.Label(g5, text="Ключ", style="Field.TLabel").grid(row=1, column=0, sticky="w", padx=(0, 10), pady=3)
-        self.sklad_key_entry = REntry(g5, textvariable=self.sklad_key, show="•")
-        self.sklad_key_entry.grid(row=1, column=1, sticky="ew")
-        b5 = ttk.Frame(c5, style="Card.TFrame")
-        b5.pack(fill="x", pady=(8, 0))
-        self.button(b5, "Проверить связь", self.test_sklad)
-        self.button(b5, "Отправить на склад неотправленное", self.flush_sklad, padx=(8, 0))
-        self.sklad_status = ttk.Label(b5, text="", style="Status.TLabel")
-        self.sklad_status.pack(side="left", padx=(10, 0))
-        ttk.Label(c5, text="Ключ создаётся на складе: Администратор → Ключи API. Пусто — программа "
-                           "работает без склада, как раньше.", style="Info.TLabel").pack(anchor="w", pady=(8, 0))
-
-        c6 = self.card(tab, "СДЭК")
-        g6 = ttk.Frame(c6, style="Card.TFrame")
-        g6.pack(fill="x")
-        g6.columnconfigure(1, weight=1)
-        ttk.Label(g6, text="Account", style="Field.TLabel").grid(row=0, column=0, sticky="w", padx=(0, 10), pady=3)
-        REntry(g6, textvariable=self.cdek_account).grid(row=0, column=1, sticky="ew")
-        ttk.Label(g6, text="Secure", style="Field.TLabel").grid(row=1, column=0, sticky="w", padx=(0, 10), pady=3)
-        REntry(g6, textvariable=self.cdek_secure, show="•").grid(row=1, column=1, sticky="ew")
-        b6 = ttk.Frame(c6, style="Card.TFrame")
-        b6.pack(fill="x", pady=(8, 0))
-        self.button(b6, "Проверить ключи", self.test_cdek)
-        self.cdek_status = ttk.Label(b6, text="", style="Status.TLabel")
-        self.cdek_status.pack(side="left", padx=(10, 0))
-        ttk.Label(c6, text="Ключи — в кабинете СДЭК: Интеграция → Ключи API. По ним программа качает ШК СДЭК.",
-                  style="Info.TLabel").pack(anchor="w", pady=(8, 0))
-
-        c4 = self.card(tab, "Этикетки Ozon")
-        g4 = ttk.Frame(c4, style="Card.TFrame")
-        g4.pack(fill="x")
-        for text, var, lo, hi in (("Искать заказы за, дней", self.days, 1, 90),
-                                  ("Отступ подписи", self.top_margin, 8, 40),
-                                  ("Шрифт подписи", self.font_size, 6, 24)):
-            ttk.Label(g4, text=text, style="Field.TLabel").pack(side="left")
-            ttk.Spinbox(g4, from_=lo, to=hi, textvariable=var, width=4).pack(side="left", padx=(8, 26))
-
-        c5 = self.card(tab, "Пропуска", side=lambda h: ttk.Checkbutton(
-            h, text="делать пропуска", variable=self.pass_on).pack(side="right"))
-        g5 = ttk.Frame(c5, style="Card.TFrame")
-        g5.pack(fill="x")
-        g5.columnconfigure(1, weight=1)
-        g5.columnconfigure(3, weight=1)
-        for r, c, (label, var) in ((0, 0, ("Водитель", self.pass_driver)), (0, 2, ("Телефон", self.pass_phone)),
-                                   (1, 0, ("Машины", self.pass_cars))):
-            ttk.Label(g5, text=label, style="Field.TLabel").grid(row=r, column=c, sticky="w",
-                                                                 padx=(0 if c == 0 else 18, 10), pady=3)
-            REntry(g5, textvariable=var).grid(row=r, column=c + 1, sticky="ew")
-
-    # ------------------------------------------------------------ папки и настройки
-    @staticmethod
-    def default_root():
-        desk = Path.home() / "Desktop"
-        return desk if desk.exists() else BASE_DIR
-
-    DIR_ALIASES = {"кгт1": ("кгт",), "вб": ("wb", "вб1")}
-
-    @staticmethod
-    def _dir_key(name):
-        return "".join(str(name).lower().replace("ё", "е").split())
-
-    def find_dir(self, base, sub):
-        """Уже созданная папка с таким названием (без учёта регистра и пробелов: «озон2» = «Озон 2»;
-        «КГТ» = «КГТ 1», «WB» = «ВБ») или None. «Озон утро» и «Озон 1» — разные папки."""
-        key = self._dir_key(sub)
-        keys = {key, *self.DIR_ALIASES.get(key, ())}
-        try:
-            for d in sorted(Path(base).iterdir()):
-                if d.is_dir() and self._dir_key(d.name) in keys:
-                    return d
-        except OSError:
-            pass
-        return None
-
-    def day_dir(self, sub):
-        """Главная папка / <sub>. Если такая папка уже создана (хоть «озон 2», хоть «Озон2») — она."""
-        base = Path(self.root_dir.get().strip() or self.default_root())
-        if self.by_day.get():
-            d = today_msk()
-            base = base / f"{MONTHS[d.month - 1]} {d.year}" / f"{d:%d.%m}"
-        return self.find_dir(base, sub) or base / sub
-
-    def place_reports(self, base, files, log):
-        """Утренние отчёты Озон/КГТ/ВБ/СГТ — в папки «Озон утро», «КГТ 1», «ВБ», если такие папки уже созданы."""
-        for key, sub in (("ozon", "Озон утро"), ("kgt", "КГТ 1"), ("wb", "ВБ"), ("sgt", "ВБ")):
-            src = files.get(key)
-            dst_dir = self.find_dir(base, sub)
-            if not src or not dst_dir or Path(src).parent == dst_dir:
-                continue
-            dst = dst_dir / Path(src).name
-            try:
-                os.replace(src, dst)
-                files[key] = dst
-                log(f"   {Path(src).name} → папка «{dst_dir.name}»")
-            except OSError as e:
-                log(f"⚠ {Path(src).name} не перенёс в «{dst_dir.name}»: {e}")
-        return files
-
-    def load_settings(self):
-        if CONFIG.exists():
-            try:
-                for name, cfg in json.loads(CONFIG.read_text(encoding="utf-8")).items():
-                    self.add_cabinet(name, str(cfg.get("client_id", "")), cfg.get("api_key", ""))
-            except ValueError:
-                self.log(f"✖ Файл {CONFIG.name} повреждён, ключи не загружены")
-        while len(self.cab_rows) < 3:
-            self.add_cabinet()
-        if WB_CONFIG.exists():
-            try:
-                self.wb_token.set(json.loads(WB_CONFIG.read_text(encoding="utf-8")).get("token", ""))
-            except ValueError:
-                pass
-        if SKLAD_CONFIG.exists():
-            try:
-                cfg = json.loads(SKLAD_CONFIG.read_text(encoding="utf-8"))
-                self.sklad_url.set(cfg.get("url") or self.sklad_url.get())
-                self.sklad_key.set(cfg.get("key", ""))
-            except ValueError:
-                pass
-        SKLAD.update(url=self.sklad_url.get(), key=self.sklad_key.get())
-        if CDEK_CONFIG.exists():
-            try:
-                cfg = json.loads(CDEK_CONFIG.read_text(encoding="utf-8"))
-                self.cdek_account.set(cfg.get("account", ""))
-                self.cdek_secure.set(cfg.get("secure", ""))
-            except ValueError:
-                pass
-        CDEK.update(account=self.cdek_account.get().strip(), secure=self.cdek_secure.get().strip())
-        data = {}
-        if MORNING_CONFIG.exists():
-            try:
-                data = json.loads(MORNING_CONFIG.read_text(encoding="utf-8"))
-            except ValueError:
-                pass
-        self.template.set(data.get("template") or (str(BASE_DIR / "BLAGO.xlsx")
-                                                   if (BASE_DIR / "BLAGO.xlsx").exists() else ""))
-        root = data.get("root")
-        if not root and data.get("out"):
-            # прежняя версия: «…/Октябрь 2026/28.10/Сборка» -> рабочая папка «…»
-            import re
-            p = Path(data["out"])
-            if len(p.parts) > 3 and re.fullmatch(r"\d\d\.\d\d", p.parts[-2]) and re.search(r"\d{4}$", p.parts[-3]):
-                root = str(p.parents[2])
-        if root:
-            self.root_dir.set(root)
-        self.by_day.set(False)
-        for key, var in (("days", self.days), ("margin", self.top_margin), ("font", self.font_size)):
-            if key in data:
-                var.set(data[key])
-        self.autoship.set(data.get("autoship", True))
-        pc = {**PASS_DEFAULT, **(data.get("passes") or {})}
-        self.pass_on.set(bool(pc["on"]))
-        self.pass_driver.set(pc["driver"])
-        self.pass_phone.set(pc["phone"])
-        self.pass_cars.set(str(pc["cars"]).replace("\n", "; "))
-
-    def schedule_save(self):
-        if self._save_job:
-            self.after_cancel(self._save_job)
-        self._save_job = self.after(700, self.save_settings)
-
-    def save_settings(self):
-        self._save_job = None
-        try:
-            CONFIG.write_text(json.dumps(self.cabinets(), ensure_ascii=False, indent=2), encoding="utf-8")
-            WB_CONFIG.write_text(json.dumps({"token": self.wb_token.get().strip()}), encoding="utf-8")
-            SKLAD.update(url=self.sklad_url.get().strip(), key=self.sklad_key.get().strip())
-            SKLAD_CONFIG.write_text(json.dumps(SKLAD), encoding="utf-8")
-            CDEK.update(account=self.cdek_account.get().strip(), secure=self.cdek_secure.get().strip())
-            CDEK_CONFIG.write_text(json.dumps(CDEK), encoding="utf-8")
-            MORNING_CONFIG.write_text(json.dumps({
-                "template": self.template.get().strip(), "root": self.root_dir.get().strip(),
-                "by_day": bool(self.by_day.get()), "days": int(self.num(self.days, 14)),
-                "margin": self.num(self.top_margin, DEFAULT_TOP_MARGIN_PT),
-                "font": self.num(self.font_size, DEFAULT_FONT_SIZE), "autoship": bool(self.autoship.get()),
-                "passes": self.pass_cfg(),
-            }, ensure_ascii=False, indent=2), encoding="utf-8")
-        except OSError as e:
-            self.log(f"✖ Не удалось сохранить настройки: {e}")
-        self.refresh_links()
-
-    def pass_cfg(self):
-        return {"on": bool(self.pass_on.get()), "driver": " ".join(self.pass_driver.get().split()),
-                "phone": self.pass_phone.get().strip(), "cars": self.pass_cars.get().strip()}
-
-    def passes_bg(self, func, *args):
-        """Пропуска идут отдельно от кнопок: WB может ждать между пропусками по 10 минут."""
-        if self._pass_running.get(func.__name__):
-            self.log("… пропуска уже делаются — смотри журнал")
-            return
-        self._pass_running[func.__name__] = True
-        cfg = self.pass_cfg()
-
-        def work():
-            try:
-                func(*args, cfg, lambda s: self.q.put(("log", s)))
-            except Exception as e:  # noqa: BLE001
-                self.q.put(("log", f"✖ Пропуска: {e}"))
-            self._pass_running[func.__name__] = False
-        threading.Thread(target=work, daemon=True).start()
-
-    def start_passes(self):
-        cabinets = self.cabinets()
-        if not cabinets:
-            messagebox.showwarning(APP_NAME, "Заполни ключи Ozon во вкладке «Настройки».")
-            return
-        self.passes_bg(ozon_passes, cabinets)
-
-    def save_now(self):
-        """Кнопка «Сохранить настройки»: сохранить сразу и проверить, что всё записалось."""
-        if self._save_job:
-            self.after_cancel(self._save_job)
-        self.save_settings()
-        try:
-            saved = json.loads(MORNING_CONFIG.read_text(encoding="utf-8")).get("passes") or {}
-            ok = saved.get("phone", "") == self.pass_cfg()["phone"]
-        except (OSError, ValueError):
-            ok = False
-        t = datetime.now(MSK)
-        if ok:
-            self.save_status.configure(text=f"✔ Сохранено в {t:%H:%M} — папка {DATA_DIR}", foreground=C["ok"])
-            self.log(f"✔ Настройки сохранены: {DATA_DIR}")
-        else:
-            self.save_status.configure(text=f"✖ Не сохранилось — нет доступа к папке {DATA_DIR}",
-                                       foreground=C["err"])
-            self.log(f"✖ Настройки не сохранились в {DATA_DIR}. Перенеси программу в обычную папку "
-                     f"(например, на Рабочий стол) и запускай всегда оттуда.")
-
-    def on_close(self):
-        self.save_settings()
-        self.destroy()
-
-    def pick_template(self):
-        path = filedialog.askopenfilename(filetypes=[("Excel", "*.xlsx")])
-        if path:
-            self.template.set(path)
-
-    def pick_root(self):
-        """Рабочая папка — одна на всё; внутри программа сама делает «Октябрь 2026 / 29.10 / …»."""
-        path = filedialog.askdirectory(title="Где хранить отчёты и этикетки",
-                                       initialdir=self.root_dir.get() or str(self.default_root()))
-        if path:
-            self.root_dir.set(path)
-            self.save_settings()
-
-    def open_out(self, path):
-        p = Path(path)
-        if not p.exists():
-            p.mkdir(parents=True, exist_ok=True)
-        if sys.platform == "win32":
-            os.startfile(p)  # noqa: S606
-        else:
-            subprocess.Popen(["open" if sys.platform == "darwin" else "xdg-open", str(p)])
-
-    def check_template(self):
-        t = self.template.get().strip()
-        if t and not Path(t).exists():
-            messagebox.showwarning(APP_NAME, f"Не найден шаблон сборки:\n{t}\n\nВыбери его во вкладке «Настройки».")
-            return None
-        if not t:
-            messagebox.showwarning(APP_NAME, "Выбери шаблон сборки во вкладке «Настройки».")
-            return None
-        return t
-
-    # ------------------------------------------------------------ копирование / вставка
-    def setup_clipboard(self):
-        """Ctrl+C/V/X/A при русской раскладке и меню по правой кнопке мыши."""
-        codes = {86: "<<Paste>>", 67: "<<Copy>>", 88: "<<Cut>>", 65: "<<SelectAll>>"}
-        latin = {"v", "c", "x", "a"}
-
-        def select_all(w):
-            if isinstance(w, tk.Text):
-                w.tag_add("sel", "1.0", "end-1c")
-            else:
-                w.select_range(0, "end")
-                w.icursor("end")
-
-        def on_ctrl_key(event):
-            if sys.platform != "win32" or event.keysym.lower() in latin:
-                return None
-            action = codes.get(event.keycode)
-            if not action:
-                return None
-            if action == "<<SelectAll>>":
-                select_all(event.widget)
-            else:
-                event.widget.event_generate(action)
-            return "break"
-
-        def on_select_all(event):
-            select_all(event.widget)
-            return "break"
-
-        menu = tk.Menu(self, tearoff=0, bg=C["card"], fg=C["text"], bd=0,
-                       activebackground=C["accent"], activeforeground=C["on_accent"])
-
-        def popup(event):
-            w = event.widget
-            w.focus_set()
-            menu.delete(0, "end")
-            readonly = isinstance(w, tk.Text) and str(w.cget("state")) == "disabled"
-            if not readonly:
-                menu.add_command(label="Вставить", command=lambda: w.event_generate("<<Paste>>"))
-                menu.add_command(label="Вырезать", command=lambda: w.event_generate("<<Cut>>"))
-            menu.add_command(label="Копировать", command=lambda: w.event_generate("<<Copy>>"))
-            menu.add_separator()
-            menu.add_command(label="Выделить всё", command=lambda: select_all(w))
-            menu.tk_popup(event.x_root, event.y_root)
-
-        for cls in ("TEntry", "Entry", "Text", "TCombobox", "TSpinbox"):
-            self.bind_class(cls, "<Control-KeyPress>", on_ctrl_key, add="+")
-            self.bind_class(cls, "<Control-a>", on_select_all)
-            self.bind_class(cls, "<Control-A>", on_select_all)
-            self.bind_class(cls, "<Button-3>", popup)
-
-    # ------------------------------------------------------------ кабинеты Ozon
-    def add_cabinet(self, name="", cid="", key=""):
-        if not hasattr(self, "show_keys"):
-            self.show_keys = tk.BooleanVar(value=False)
-        r = len(self.cab_rows) + 1
-        v = (tk.StringVar(value=name or f"Озон {r}"), tk.StringVar(value=cid), tk.StringVar(value=key))
-        e_name = REntry(self.cab_box, textvariable=v[0], width=14)
-        e_cid = REntry(self.cab_box, textvariable=v[1], width=12)
-        e_key = REntry(self.cab_box, textvariable=v[2], show="" if self.show_keys.get() else "•")
-        status = ttk.Label(self.cab_box, text="", width=22, style="Status.TLabel")
-        e_name.grid(row=r, column=0, padx=(0, 8), pady=3)
-        e_cid.grid(row=r, column=1, padx=(0, 8))
-        e_key.grid(row=r, column=2, padx=(0, 10), sticky="ew")
-        status.grid(row=r, column=3, sticky="w")
-        for var in v:
-            var.trace_add("write", lambda *_: self.schedule_save())
-        self.cab_rows.append((v, e_key, status))
-
-    def toggle_keys(self):
-        for _, e_key, _ in self.cab_rows:
-            e_key.configure(show="" if self.show_keys.get() else "•")
-
-    def cabinets(self):
-        """Заполненные кабинеты в порядке строк: {название: {client_id, api_key}}."""
-        result = {}
-        for (name, cid, key), _, _ in self.cab_rows:
-            if cid.get().strip() and key.get().strip():
-                result[name.get().strip() or cid.get().strip()] = {
-                    "client_id": cid.get().strip(), "api_key": key.get().strip()}
-        return result
-
+    # --- проверки ключей и склад
     def test_keys(self):
         if self.busy:
             return
-        rows = [(v[0].get(), v[1].get().strip(), v[2].get().strip(), st) for v, _, st in self.cab_rows]
+        rows = [(i, c["name"], str(c["cid"]).strip(), str(c["key"]).strip()) for i, c in enumerate(self.cab)]
         self.save_settings()
 
-        def one(name, cid, key, st):
+        def one(i, name, cid, key):
             if not cid or not key:
-                self.q.put(("status", st, "не заполнен", C["muted"]))
+                self.status(f"cab_{i}", "не заполнен")
                 return
-            self.q.put(("status", st, "проверяю…", C["muted"]))
+            self.status(f"cab_{i}", "проверяю…")
             try:
                 check_key(headers_for({"client_id": cid, "api_key": key}))
-                self.q.put(("status", st, "✔ работает", C["ok"]))
+                self.status(f"cab_{i}", "✔ работает", "ok")
             except Exception as e:  # noqa: BLE001
-                self.q.put(("status", st, "✖ ошибка", C["err"]))
-                self.q.put(("log", f"✖ {name}: {e}"))
+                self.status(f"cab_{i}", "✖ ошибка", "err")
+                self.log(f"✖ {name}: {e}")
 
         def work():
             with ThreadPoolExecutor(max_workers=max(1, len(rows))) as pool:
                 list(pool.map(lambda r: one(*r), rows))
-            self.q.put(("done",))
+        self.run(work)
 
+    def test_wb(self):
+        if self.busy:
+            return
+        token = str(self.s["wb_token"]).strip()
+        if not token:
+            self.status("wb_status", "не заполнен")
+            return
+        self.save_settings()
+        self.status("wb_status", "проверяю…")
+
+        def work():
+            try:
+                wb_check(token)
+                self.status("wb_status", "✔ работает", "ok")
+            except Exception as e:  # noqa: BLE001
+                self.status("wb_status", "✖ ошибка", "err")
+                self.log(f"✖ WB: {e}")
         self.run(work)
 
     def test_sklad(self):
         self.save_settings()
         if not sklad_on():
-            self.sklad_status.configure(text="впиши адрес и ключ", foreground=C["muted"])
+            self.status("sklad_status", "впиши адрес и ключ")
             return
-        self.sklad_status.configure(text="проверяю…", foreground=C["muted"])
+        self.status("sklad_status", "проверяю…")
 
         def work():
             try:
                 sklad_check()
-                self.q.put(("status", self.sklad_status, "✔ склад на связи", C["ok"]))
+                self.status("sklad_status", "✔ склад на связи", "ok")
             except (RuntimeError, requests.RequestException) as e:
-                self.q.put(("status", self.sklad_status, f"✖ {e}", C["err"]))
-
+                self.status("sklad_status", f"✖ {e}", "err")
         threading.Thread(target=work, daemon=True).start()
 
     def test_cdek(self):
         self.save_settings()
+        self.cdek_keys()
         if not cdek_on():
-            self.cdek_status.configure(text="впиши Account и Secure", foreground=C["muted"])
+            self.status("cdek_status", "впиши Account и Secure")
             return
-        self.cdek_status.configure(text="проверяю…", foreground=C["muted"])
+        self.status("cdek_status", "проверяю…")
 
         def work():
             try:
                 cdek_token()
-                self.q.put(("status", self.cdek_status, "✔ СДЭК пустил по ключам", C["ok"]))
+                self.status("cdek_status", "✔ СДЭК пустил по ключам", "ok")
             except (RuntimeError, requests.RequestException) as e:
-                self.q.put(("status", self.cdek_status, f"✖ {e}", C["err"]))
-
+                self.status("cdek_status", f"✖ {e}", "err")
         threading.Thread(target=work, daemon=True).start()
 
     def send_morning(self):
@@ -5332,7 +4631,7 @@ class App(tk.Tk):
             return
         data = morning_load()
         if not data:
-            messagebox.showinfo(APP_NAME, "Нечего отправлять: сначала скачай отчёты.")
+            self.alert("Нечего отправлять: сначала скачай отчёты.", "info")
             return
         problems = morning_problems(data)
         text = "Отправить на склад?\n\n" + morning_text(data).replace(" | ", "\n")
@@ -5340,508 +4639,114 @@ class App(tk.Tk):
             text += ("\n\nВНИМАНИЕ:\n" + "\n".join(problems)
                      + "\n\nНе загрузившиеся кабинеты на складе не трогаются — там останутся их заказы со вчера."
                      + "\nЛучше нажать «Утро» ещё раз. Всё равно отправить?")
-        if not messagebox.askyesno(APP_NAME, text, icon="warning" if problems else "question"):
+        if not self.ask(text, warn=bool(problems)):
             return
         self.headline("ОТПРАВКА ЗАКАЗОВ ДНЯ НА СКЛАД")
-
-        def work():
-            morning_send(lambda t: self.q.put(("log", t)))
-            self.q.put(("done",))
-
-        self.run(work)
+        self._sklad_cache = (0.0, None)
+        self.run(lambda: morning_send(self.log))
 
     def flush_sklad(self):
         if self.busy:
             return
         self.save_settings()
         self.headline("ОТПРАВКА НА СКЛАД")
+        self._sklad_cache = (0.0, None)
 
         def work():
-            left = len(_pending_load())
-            if not left:
-                self.q.put(("log", "✔ Всё уже на складе, отправлять нечего"))
-            sklad_flush(lambda t: self.q.put(("log", t)))
-            self.q.put(("done",))
-
+            if not _pending_load():
+                self.log("✔ Всё уже на складе, отправлять нечего")
+            sklad_flush(self.log)
         self.run(work)
 
-    def test_wb(self):
-        if self.busy:
-            return
-        token = self.wb_token.get().strip()
-        if not token:
-            self.wb_status.configure(text="не заполнен", foreground=C["muted"])
-            return
+    def on_close(self):
+        if self._save_timer:
+            self._save_timer.cancel()
         self.save_settings()
-        self.wb_status.configure(text="проверяю…", foreground=C["muted"])
 
-        def work():
-            try:
-                wb_check(token)
-                self.q.put(("status", self.wb_status, "✔ работает", C["ok"]))
-            except Exception as e:  # noqa: BLE001
-                self.q.put(("status", self.wb_status, "✖ ошибка", C["err"]))
-                self.q.put(("log", f"✖ WB: {e}"))
-            self.q.put(("done",))
 
-        self.run(work)
+class Api:
+    """Что страница может вызвать у программы: window.pywebview.api.<имя>(…).
+    Только методы — pywebview отдаёт странице всё, что видит в объекте."""
 
-    # ------------------------------------------------------------ отчёт Ozon
-    def set_excel(self, path):
-        try:
-            names = sheet_names(path)
-        except Exception as e:  # noqa: BLE001
-            messagebox.showerror("Не удалось открыть файл", str(e))
-            return
-        self.excel.set(path)
-        self.excel_name.configure(text=Path(path).name)
-        self.sheet_cb["values"] = names
-        self.sheet.set(names[0])
-        if len(names) > 1:
-            self.sheet_box.pack(side="right", padx=(0, 14))
-        else:
-            self.sheet_box.pack_forget()
-        self.count_report()
+    ACTIONS = ("start_morning", "start_cdek", "pick_left", "start_wave", "pick_excel", "set_sheet", "start_ozon",
+               "start_passes", "pick_wb", "start_wb", "pick_cdek_file", "start_cdek_check", "start_cdek_docs",
+               "save_now", "set_theme", "test_keys", "test_wb", "pick_template", "pick_root", "test_sklad",
+               "flush_sklad", "test_cdek", "send_morning", "open_link")
 
-    def pick_excel(self):
-        path = filedialog.askopenfilename(filetypes=[("Excel", "*.xlsx *.xlsm")])
-        if path:
-            self.set_excel(path)
+    def __init__(self, app):
+        self._app = app
 
-    def background(self, func, done):
-        """Чтение файлов — в фоне, чтобы окно не подвисало; результат — в done(...) в окне."""
-        def work():
-            try:
-                res, err = func(), None
-            except Exception as e:  # noqa: BLE001
-                res, err = None, e
-            self.q.put(("call", lambda: done(res, err)))
-        threading.Thread(target=work, daemon=True).start()
-
-    def count_report(self):
-        path, sheet = self.excel.get(), self.sheet.get()
-        self.report_info.configure(text="читаю отчёт…", foreground=C["muted"])
-
-        def done(text, err):
-            if path != self.excel.get():
-                return  # пока читали, выбрали другой файл
-            if err:
-                self.report_info.configure(text=f"Не получилось прочитать: {err}", foreground=C["err"])
-            else:
-                self.report_info.configure(text=text, foreground=C["text"])
-
-        self.background(lambda: ozon_report_summary(path, sheet), done)
-
-    # ------------------------------------------------------------ отчёты WB
-    def clear_wb(self):
-        self.set_wb_files([])
-
-    def set_wb_files(self, files):
-        self.wb_files = list(files)
-        self.wb_files_label.configure(text="   ·   ".join(Path(p).stem for p in files) or "не выбраны")
-        if not files:
-            self.wb_info.configure(text="Отчёты подставляются сами после «Сборки».")
-            return
-        self.wb_info.configure(text="читаю отчёты…")
-        snapshot = list(files)
-
-        def done(text, err):
-            if snapshot == self.wb_files:
-                self.wb_info.configure(text=text if not err else f"Не получилось прочитать: {err}")
-
-        self.background(lambda: wb_files_summary(snapshot), done)
-
-    def pick_wb(self):
-        paths = filedialog.askopenfilenames(filetypes=[("Excel", "*.xlsx *.xlsm")])
-        if paths:
-            self.set_wb_files(self.wb_files + [p for p in paths if p not in self.wb_files])
-
-    # ------------------------------------------------------------ запуск работ
-    def run(self, work):
-        self.set_busy(True)
-        threading.Thread(target=work, daemon=True).start()
-
-    def headline(self, text):
-        self.bar["value"] = 0
-        self._bar_total = self._bar_target = None
-        self.log("")
-        self.log(f"=== {text} ===")
-
-    def pick_left(self):
-        """Файлы с тем, что не уехало вчера: эти отправления утренний отчёт не возьмёт (1.32)."""
-        if self.busy:
-            return
-        if self.left_files and messagebox.askyesno(
-                APP_NAME, "Уже выбрано:\n" + "\n".join(Path(p).name for p in self.left_files)
-                + "\n\nУбрать выбор? (Нет — выбрать другие файлы)"):
-            self.set_left([])
-            return
-        paths = filedialog.askopenfilenames(
-            title="Что не уехало вчера: PDF с ШК Ozon или отчёт Excel",
-            filetypes=[("ШК или отчёт", "*.pdf *.xlsx *.xlsm *.csv"), ("PDF", "*.pdf"),
-                       ("Excel или CSV", "*.xlsx *.xlsm *.csv")])
-        if paths:
-            self.set_left(list(paths))
-
-    def set_left(self, paths):
-        self.left_files, self.left_day = paths, (today_msk() if paths else None)
-        if not paths:
-            self.left_status.configure(text="")
-            self.log("Не уехало вчера: выбор убран")
-            return
-        postings, _, notes = left_numbers(paths)
-        self.log("Не уехало вчера — выбрано:")
-        for note in notes:
-            self.log(note)
-        color = C["ok"] if postings else C["err"]
-        self.left_status.configure(
-            text=f"Не уехало вчера: {plural(len(postings), 'отправление', 'отправления', 'отправлений')} — "
-                 f"в утренний отчёт не попадут. Убрать — нажми кнопку ещё раз.", foreground=color)
-
-    def start_morning(self):
-        if self.busy:
-            return
-        template = self.check_template()
-        if not template:
-            return
-        cabinets, token = self.cabinets(), self.wb_token.get().strip()
-        if not cabinets and not token:
-            messagebox.showwarning(APP_NAME, "Заполни ключи Ozon и токен WB во вкладке «Настройки».")
-            return
-        self.save_settings()
-        out, days = self.day_dir("Сборка"), int(self.num(self.days, 14))
-        base = Path(self.root_dir.get().strip() or self.default_root())
-        d = today_msk()
-        self.headline(f"УТРЕННЯЯ СБОРКА · {d:%d.%m}")
-        self.mo_status.configure(text="скачиваю…", foreground=C["muted"])
-
-        if self.left_files and self.left_day != d:
-            self.set_left([])  # выбрано в другой день — не применяем
-        left = list(self.left_files)
-
-        def work():
-            try:
-                files = morning(cabinets, token, template, "", out, days,
-                                log=lambda s: self.q.put(("log", s)),
-                                progress=lambda a, b: self.q.put(("progress", a, b)), left=left)
-                files = self.place_reports(base, files, lambda s: self.q.put(("log", s)))
-                self.q.put(("call", lambda: self.after_morning(files)))
-            except Exception as e:  # noqa: BLE001
-                self.q.put(("log", f"✖ Ошибка: {e}"))
-                self.q.put(("status", self.mo_status, "✖ ошибка — см. журнал", C["err"]))
-            self.q.put(("done",))
-
-        self.run(work)
-
-    def after_morning(self, files):
-        if not files.get("ozon") and self.cabinets():
-            self.mo_status.configure(text="✖ Озон не скачался — нажми «Скачать отчёты и сборку» ещё раз.",
-                                     foreground=C["err"])
-            wb = [str(files[k]) for k in ("wb", "sgt") if files.get(k)]
-            if wb:
-                self.set_wb_files(wb)
-            return
-        if files.get("ozon"):
-            self.set_excel(str(files["ozon"]))
-            self.footer.set("Озон утро")
-        wb = [str(files[k]) for k in ("wb", "sgt") if files.get(k)]
-        if wb:
-            self.set_wb_files(wb)
-        self.refresh_links()
-        t = datetime.now(MSK)
-        self.mo_status.configure(text=f"✔ Готово в {t:%H:%M}. Отчёты уже стоят на вкладках Ozon и Wildberries.",
-                                 foreground=C["ok"])
-
-    def start_cdek(self):
-        if self.busy:
-            return
-        template = self.check_template()
-        if not template:
-            return
-        cdek = filedialog.askopenfilename(title="Файл СДЭК", filetypes=[("Excel", "*.xlsx *.xlsm")])
-        if not cdek:
-            return
-        try:
-            orders = read_cdek_orders(cdek)
-        except Exception as e:  # noqa: BLE001
-            messagebox.showerror(APP_NAME, f"Не удалось прочитать файл СДЭК: {e}")
-            return
-        out = self.day_dir("Сборка")
-        self.headline("СДЭК В СБОРКУ")
-
-        def work():
-            log = lambda s: self.q.put(("log", s))  # noqa: E731
-            try:
-                # файл с трэками: склад, листы, ШК и акты — на странице «СДЭК»
-                add_cdek(template, cdek, out, log=log, send_sklad=not orders)
-                if orders:
-                    log("│ Листы сборки, ШК и акты СДЭК — на странице «СДЭК» слева.")
-            except PermissionError:
-                self.q.put(("log", "✖ Файл сборки открыт в Excel — закрой его и нажми ещё раз"))
-            except Exception as e:  # noqa: BLE001
-                self.q.put(("log", f"✖ Ошибка: {e}"))
-            self.q.put(("done",))
-
-        self.run(work)
-
-    def start_wave(self):
-        if self.busy:
-            return
-        cabinets = self.cabinets()
-        if not cabinets:
-            messagebox.showwarning(APP_NAME, "Заполни ключи Ozon во вкладке «Настройки».")
-            return
-        template = self.check_template()
-        if not template:
-            return
-        wave = self.wave_name()
-        kgt = "кгт" in wave.lower()
-        out, days = self.day_dir(wave), int(self.num(self.days, 14))
-        self.save_settings()
-        self.headline(f"{wave.upper()} · {'КГТ' if kgt else 'МГТ'} · только «ожидают сборки»")
-        self.wave_status.configure(text="скачиваю…", foreground=C["muted"])
-
-        def work():
-            try:
-                files = ozon_wave(cabinets, template, out, days, wave, kgt,
-                                  log=lambda s: self.q.put(("log", s)),
-                                  progress=lambda a, b: self.q.put(("progress", a, b)))
-                self.q.put(("call", lambda: self.after_wave(wave, files)))
-            except Exception as e:  # noqa: BLE001
-                self.q.put(("log", f"✖ Ошибка: {e}"))
-                self.q.put(("status", self.wave_status, "✖ ошибка — см. журнал", C["err"]))
-            self.q.put(("done",))
-
-        self.run(work)
-
-    def after_wave(self, wave, files):
-        report = files.get("kgt") or files.get("ozon")
-        if report:
-            self.set_excel(str(report))
-        self.footer.set(wave)
-        self.refresh_links()
-        t = datetime.now(MSK)
-        self.wave_status.configure(text=f"✔ {wave} готов в {t:%H:%M}. Отчёт уже стоит на вкладке Ozon.",
-                                   foreground=C["ok"])
-
-    def start_wb(self, mode):
-        if self.busy:
-            return
-        token = self.wb_token.get().strip()
-        if not token:
-            messagebox.showwarning(APP_NAME, "Вставь токен WB во вкладке «Настройки».")
-            return
-        if mode != "stickers" and not self.wb_files:
-            messagebox.showwarning(APP_NAME, "Добавь отчёты ВБ и СГТ.")
-            return
-        self.save_settings()
-        out = self.day_dir("ВБ")
-        self.headline({"run": "WB · ПОСТАВКИ И СТИКЕРЫ", "check": "WB · ПРОВЕРКА",
-                       "stickers": "WB · СТИКЕРЫ ОТКРЫТЫХ ПОСТАВОК"}[mode])
-        files = list(self.wb_files)
-
-        def work():
-            try:
-                process_wb(files, token, out, log=lambda s: self.q.put(("log", s)),
-                           progress=lambda a, b: self.q.put(("progress", a, b)),
-                           mode=mode, confirm=self.ask)
-            except Exception as e:  # noqa: BLE001
-                self.q.put(("log", f"✖ Ошибка: {e}"))
-            self.q.put(("done",))
-
-        self.run(work)
-
-    def num(self, var, default):
-        try:
-            return float(var.get())
-        except (tk.TclError, ValueError):
-            return default
-
-    def start(self, mode):
-        """Вкладка Ozon. mode: run — скачать и собрать, check — проверка, merge — пересобрать ленты."""
-        if self.busy:
-            return
-        font, margin = self.num(self.font_size, DEFAULT_FONT_SIZE), self.num(self.top_margin, DEFAULT_TOP_MARGIN_PT)
-        out = self.day_dir(self.ozon_sub())
-        if mode == "merge":
-            footer = self.footer.get()
-            src = self.last_ozon_out
-            note = ""
-            if src and Path(src) != out and Path(src).exists():
-                # надпись поменяли после скачивания — переименуем папку под новую надпись
-                if not out.exists():
-                    try:
-                        Path(src).rename(out)
-                        note = f"Папка «{Path(src).name}» переименована в «{out.name}»"
-                    except OSError as e:
-                        out, note = Path(src), f"⚠ Не удалось переименовать папку «{Path(src).name}»: {e}"
-                else:
-                    out = Path(src)
-                    note = f"⚠ Папка «{self.ozon_sub()}» уже есть — пересобираю «{out.name}» с новой надписью"
-            self.last_ozon_out = out
-            self.refresh_links()
-            self.headline(f"ПЕРЕСБОРКА ЛЕНТ · {' '.join(footer.split()) or 'без надписи'}")
-
-            def work():
-                try:
-                    if note:
-                        self.q.put(("log", note))
-                    merge_all(out, font, margin, lambda s: self.q.put(("log", s)), footer)
-                except Exception as e:  # noqa: BLE001
-                    self.q.put(("log", f"✖ Ошибка: {e}"))
-                self.q.put(("done",))
-        else:
-            cabinets = self.cabinets()
-            if not cabinets:
-                messagebox.showwarning(APP_NAME, "Заполни ключи Ozon во вкладке «Настройки».")
-                return
-            if not self.excel.get():
-                messagebox.showwarning(APP_NAME, "Выбери отчёт.")
-                return
-            self.save_settings()
-            self.headline(f"OZON · {'СКАЧИВАНИЕ И СБОРКА' if mode == 'run' else 'ПРОВЕРКА'} · {self.ozon_sub()}")
-            args = (self.excel.get(), self.sheet.get(), cabinets, int(self.num(self.days, 14)), out)
-            autoship, footer = bool(self.autoship.get()), self.footer.get()
-            pass_cfg = self.pass_cfg() if self.pass_on.get() else None
-            if mode == "run":
-                self.last_ozon_out = out
-    
-            def work():
-                try:
-                    form = process(*args, log=lambda s: self.q.put(("log", s)),
-                            progress=lambda a, b: self.q.put(("progress", a, b)),
-                            download=mode == "run", font_size=font, top_margin=margin,
-                            autoship=autoship, confirm=self.ask, footer=footer)
-                    if mode == "run" and pass_cfg and form:
-                        self.q.put(("log", "\n=== ОТГРУЗКА И ПРОПУСКА ==="))
-                        ozon_passes(cabinets, pass_cfg, lambda s: self.q.put(("log", s)),
-                                    form=form, confirm=self.ask)
-                except Exception as e:  # noqa: BLE001
-                    self.q.put(("log", f"✖ Ошибка: {e}"))
-                self.q.put(("done",))
-
-        self.run(work)
-
-    def ask(self, text):
-        """Вопрос «да/нет» из рабочего потока (сам диалог показывается в окне)."""
-        done, answer = threading.Event(), {}
-        self.q.put(("ask", text, done, answer))
-        done.wait()
-        return answer.get("ok", False)
-
-    def set_busy(self, busy):
-        self.busy = busy
-        self.state_pill.configure(text="●  работаю…" if busy else "●  готова к работе",
-                                  fg=C["accent"] if busy else C["ok"])
-        if busy:
-            # Бегущая туда-сюда полоса дёргалась, пока программа считает (1.44): теперь полоса
-            # появляется с первым настоящим шагом и только заполняется. До него — «● работаю…»
-            self._bar_total = self._bar_target = None
-            self.bar.stop()
-            self.bar.configure(mode="determinate", value=0)
-            self.bar.pack_forget()
-        else:
-            self.bar.stop()
-            self.bar.pack_forget()
-        for b in self.buttons:
-            b.configure(state="disabled" if busy else "normal")
-        for b in getattr(self, "wave_chips", {}).values():
-            b.configure(state="disabled" if busy else "normal")
-
-    # ------------------------------------------------------------ журнал
-    def clear_log(self):
-        self.log_box.configure(state="normal")
-        self.log_box.delete("1.0", "end")
-        self.log_box.configure(state="disabled")
-
-    LOG_LIMIT = 6000          # строк в журнале: старые уходят, чтобы окно не тяжелело к вечеру
-    POLL_BUDGET = 0.025       # сколько секунд за раз окно разбирает очередь (дальше — отрисовка)
-
-    @staticmethod
-    def log_tag(text):
-        s = text.lstrip()
-        tag = ("big" if s.startswith(("✔ ВСЕГО ШК", "✔ СКАЧАНО ШК", "✔ ГОТОВО")) else
-               "ok" if s.startswith("✔") else "err" if s.startswith("✖") else
-               "head" if s.startswith("===") else "warn" if s.startswith("⚠") else
-               "warnbody" if s.startswith("│") else "yellow" if s.startswith("●") else
-               "muted" if s.startswith("…") else "")
-        return (s.strip("= ").strip() if tag == "head" else text), tag
-
-    def log(self, text):
-        self.log_lines([text])
-
-    def log_lines(self, texts):
-        """Строки в журнал одной вставкой: сотни строк подряд не замораживают окно (1.42)."""
-        if not texts:
-            return
-        parts = []
-        for text in texts:
-            line, tag = self.log_tag(text)
-            parts += [line + "\n", tag]
-        box = self.log_box
-        at_end = box.yview()[1] >= 0.999
-        box.configure(state="normal")
-        box.insert("end", *parts)
-        extra = int(box.index("end-1c").split(".")[0]) - self.LOG_LIMIT
-        if extra > 0:
-            box.delete("1.0", f"{extra + 1}.0")
-        if at_end:
-            box.see("end")   # листаем вниз, только если пользователь не отмотал журнал вверх
-        box.configure(state="disabled")
-
-    def set_progress(self, done, total):
-        """Цель полосы; сама полоса доезжает до неё плавно (ease_bar). Видна с первого шага."""
-        if self.busy and not self.bar.winfo_ismapped():
-            self.bar.pack(fill="x", padx=18, pady=(10, 0), before=self._log_frame)
-        total = max(total, 1)
-        if total != getattr(self, "_bar_total", None) or done < getattr(self, "_bar_target", 0):
-            # новый этап (другое «из скольких») — полоса начинает с его доли, без рывка назад и вперёд
-            self.bar.configure(maximum=total, value=min(done, total))
-        self._bar_total, self._bar_target = total, min(done, total)
-
-    def ease_bar(self):
-        if str(self.bar.cget("mode")) == "determinate" and getattr(self, "_bar_total", None):
-            value = float(self.bar.cget("value"))
-            target = self._bar_target
-            if abs(target - value) > 0.01:
-                step = max((target - value) * 0.25, self._bar_total / 400)
-                self.bar.configure(value=min(target, value + step))
-        # Пока ничего не идёт — заглядываем редко, чтобы не будить программу 33 раза в секунду
-        self.after(30 if self.busy else 250, self.ease_bar)
+    def init(self):
+        return self._app.state()
 
     def poll(self):
-        start, lines, more = time.monotonic(), [], False
+        return self._app.poll()
+
+    def set(self, key, value):
+        return self._app.set(key, value)
+
+    def set_cabinet(self, index, field, value):
+        self._app.set_cabinet(index, field, value)
+
+    def add_cabinet(self):
+        return self._app.add_cabinet()
+
+    def clear_wb(self):
+        self._app.set_wb_files([])
+
+    def answer(self, ask_id, ok):
+        self._app.answer(ask_id, ok)
+
+    def action(self, name, arg=None):
+        if name not in self.ACTIONS:
+            return False
+        method = getattr(self._app, name)
         try:
-            while True:
-                if time.monotonic() - start > self.POLL_BUDGET:
-                    more = True    # остальное — в следующий раз, окно успеет перерисоваться
-                    break
-                m = self.q.get_nowait()
-                if m[0] == "log":
-                    lines.append(m[1])
-                    continue
-                self.log_lines(lines)   # перед любым другим событием журнал должен быть дописан
-                lines = []
-                if m[0] == "progress":
-                    self.set_progress(m[1], m[2])
-                elif m[0] == "status":
-                    m[1].configure(text=m[2], foreground=m[3])
-                elif m[0] == "ask":
-                    m[3]["ok"] = messagebox.askyesno(APP_NAME, m[1])
-                    m[2].set()
-                elif m[0] == "call":
-                    m[1]()
-                elif m[0] == "done":
-                    self.set_busy(False)
-        except queue.Empty:
+            if arg is None:
+                method()
+            else:
+                method(arg)
+        except Exception as e:  # noqa: BLE001
+            self._app.log(f"✖ Ошибка: {e}")
+        return True
+
+
+def _webview():
+    """pywebview: при запуске .py без него — ставится сам (один раз)."""
+    try:
+        import webview
+        return webview
+    except ImportError:
+        if getattr(sys, "frozen", False):
+            raise
+    print("Ставлю pywebview (окно программы), один раз…")
+    subprocess.call([sys.executable, "-m", "pip", "install", "pywebview"])
+    import webview
+    return webview
+
+
+def main():
+    moved = move_old_data()
+    webview = _webview()
+    app = BlagoApp()
+    if moved:
+        app.log(f"Настройки перенесены из папки программы в {DATA_DIR}: " + ", ".join(moved))
+    html = resource_path(UI_FILE).read_text(encoding="utf-8")
+    dark = ui_theme() == "dark"
+    window = webview.create_window(APP_NAME, html=html, js_api=Api(app), width=1180, height=900,
+                                   min_size=(960, 680), background_color="#0E1220" if dark else "#F4F6FB")
+    app.window = window
+    window.events.closing += app.on_close
+
+    def started():
+        try:   # заставка exe (пока он распаковывается) — убрать, окно готово
+            import pyi_splash
+            pyi_splash.close()
+        except ImportError:
             pass
-        self.log_lines(lines)
-        self.after(15 if more else 60, self.poll)
+
+    webview.start(started)
 
 
 if __name__ == "__main__":
-    _moved = move_old_data()
-    app = App()
-    if _moved:
-        app.log(f"Настройки перенесены из папки программы в {DATA_DIR}: " + ", ".join(_moved))
-    app.mainloop()
+    main()
