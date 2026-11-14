@@ -28,7 +28,7 @@ BLAGO OTGRUZKI — этикетки Ozon FBS и поставки Wildberries FBS
 
 Сборка в .exe (значок — синий «B», как у сайта склада): запустить «Собрать exe.bat» или
     pip install pyinstaller pillow
-    pyinstaller --onefile --windowed --icon blago.ico --add-data "blago.ico;." --name "BLAGO OTGRUZKI" blago_otgruzki.py
+    pyinstaller --onefile --windowed --icon blago.ico --splash splash.png --add-data "blago.ico;." --name "BLAGO OTGRUZKI" blago_otgruzki.py
 
 Вкладка Wildberries (кнопка «Создать поставки и скачать»):
   1. читает отчёт(ы) WB — «№ задания», «Артикул продавца»; склад и дату
@@ -72,7 +72,7 @@ from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.pdfgen import canvas
 
 APP_NAME = "BLAGO OTGRUZKI"
-APP_VERSION = "1.46"  # при каждом обновлении +0.1, запись в CHANGELOG.md
+APP_VERSION = "1.47"  # при каждом обновлении +0.1, запись в CHANGELOG.md
 API = "https://api-seller.ozon.ru"
 BATCH = 20                   # максимум отправлений в одном запросе этикеток
 READY = "awaiting_deliver"   # статус, в котором Ozon отдаёт этикетку
@@ -3988,6 +3988,7 @@ class App(tk.Tk):
     def __init__(self):
         enable_dpi_awareness()   # до создания окна, иначе Windows уже решила растягивать
         super().__init__()
+        self.withdraw()   # окно прячется, пока строится: показывается сразу готовым, без дорисовки по кускам
         self.title(APP_NAME)
         self.set_icon()
         # Масштаб экрана: 1.0 — 100 %, 1.5 — 150 %. Шрифты Tk растут сами, размеры окна в точках — по нему
@@ -4126,6 +4127,13 @@ class App(tk.Tk):
             var.trace_add("write", lambda *_: self.schedule_save())
         self.footer.trace_add("write", lambda *_: self.refresh_links())
         self.show_page("Сборка")
+        self.update_idletasks()
+        self.deiconify()
+        try:   # заставка exe (пока он распаковывается) — убрать, окно готово
+            import pyi_splash
+            pyi_splash.close()
+        except ImportError:
+            pass
         self.protocol("WM_DELETE_WINDOW", self.on_close)
         self.after(50, self.dark_titlebar)
         self.after(100, self.poll)

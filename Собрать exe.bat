@@ -11,7 +11,7 @@ echo Устанавливаю нужные библиотеки...
 %PY% -m pip install --upgrade requests openpyxl pypdf reportlab pillow pyinstaller
 if errorlevel 1 goto fail
 echo Собираю BLAGO OTGRUZKI.exe ...
-%PY% -m PyInstaller --noconfirm --onefile --windowed --icon blago.ico --add-data "blago.ico;." --name "BLAGO OTGRUZKI" blago_otgruzki.py
+%PY% -m PyInstaller --noconfirm --onefile --windowed --icon blago.ico --splash splash.png --add-data "blago.ico;." --name "BLAGO OTGRUZKI" blago_otgruzki.py
 if errorlevel 1 goto fail
 copy /y "dist\BLAGO OTGRUZKI.exe" "BLAGO OTGRUZKI.exe" >nul
 echo.
