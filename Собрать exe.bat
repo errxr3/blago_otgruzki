@@ -1,6 +1,7 @@
 @echo off
 chcp 65001 >nul
 cd /d "%~dp0"
+if not exist "blago_otgruzki.py" goto nofile
 rem Ищем настоящий Python: сначала py (лаунчер), потом python. Заглушка из Microsoft Store не годится.
 set "PY="
 py -3 -c "import sys" >nul 2>&1 && set "PY=py -3"
@@ -26,6 +27,12 @@ exit /b 0
 echo.
 echo Новый exe собран, но старый не заменился - программа была открыта.
 echo Закрой BLAGO OTGRUZKI и запусти этот файл ещё раз.
+pause
+exit /b 1
+:nofile
+echo Рядом с этим файлом нет blago_otgruzki.py.
+echo Похоже, сборщик запущен прямо из архива. Сначала распакуй архив целиком:
+echo правой кнопкой по zip - "Извлечь все", потом запусти "Собрать exe.bat" из распакованной папки.
 pause
 exit /b 1
 :nopy
