@@ -149,3 +149,15 @@ def test_batch_not_sent_is_saved_and_resent(sklad, ozon, tmp_path, log, progress
                                             ("", ("Ozon", "Озон1"))])
 def test_wave_to_sklad_channel(wave, expected):
     assert b.ozon_channel(wave) == expected
+
+
+def test_morning_report_has_label_code_column(cabinets, tmp_path, log):
+    """Утренний отчёт: колонка «Код этикетки» — код с наклейки, если Ozon его уже отдал."""
+    out = tmp_path / "Сборка 10.11"
+    out.mkdir()
+    _, files = b.ozon_reports(CABINETS, 14, out, log, b.OZON_STATUSES, {"ozon": "Озон 10.11", "kgt": "КГТ 10.11"})
+    ws = openpyxl.load_workbook(files["ozon"]).worksheets[0]
+    assert [c.value for c in ws[1]][:5] == ["Номер отправления", "Принят в обработку", "Артикул", "Количество",
+                                            "Код этикетки"]
+    codes = {r[0]: r[4] for r in ws.iter_rows(min_row=2, max_col=5, values_only=True) if r[0]}
+    assert codes["4-1"] == "%4-1%"

@@ -69,7 +69,7 @@ from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.pdfgen import canvas
 
 APP_NAME = "BLAGO OTGRUZKI"
-APP_VERSION = "2.1"  # при каждом обновлении +0.1, запись в CHANGELOG.md
+APP_VERSION = "2.2"  # при каждом обновлении +0.1, запись в CHANGELOG.md
 API = "https://api-seller.ozon.ru"
 BATCH = 20                   # максимум отправлений в одном запросе этикеток
 READY = "awaiting_deliver"   # статус, в котором Ozon отдаёт этикетку
@@ -212,6 +212,50 @@ class Report:
 
 
 COL_NUM = ("Номер отправления", "№ задания")
+COL_LABEL = "Код этикетки"  # номер с этикетки Ozon: по нему склад узнаёт наклейку (2.2)
+
+
+def label_code(codes):
+    """«ii5019607 3009, %12345%» — коды с этикетки: сначала «ii…», потом штрихкоды из ответа Ozon.
+    Ozon выдаёт их, только когда заказ собран: у несобранного пусто."""
+    seen = []
+    codes = [str(x).strip() for x in codes or [] if str(x).strip()]
+    for c in sorted(codes, key=lambda x: not x.lower().startswith("ii")):
+        if c not in seen:
+            seen.append(c)
+    return ", ".join(seen)
+
+
+def fill_label_codes(path, codes, log):
+    """После скачивания этикеток — дописать в отчёт колонку «Код этикетки» (codes: {номер: [коды]}).
+    Отчёт открыт в Excel — не страшно: этикетки уже скачаны, просто код в файл не попадёт."""
+    if not codes:
+        return
+    try:
+        wb = openpyxl.load_workbook(path)
+        ws = wb.worksheets[0]
+        header = [str(c.value).strip() if c.value is not None else "" for c in ws[1]]
+        i_num = _find_col(header, COL_NUM)
+        if COL_LABEL in header:
+            col = header.index(COL_LABEL) + 1
+        else:  # отчёт прошлой версии: колонка — сразу после списка заказов
+            col = next((i for i, h in enumerate(header, 1) if not h), len(header) + 1)
+            from openpyxl.styles import Font
+            ws.cell(1, col, COL_LABEL).font = Font(bold=True)
+        filled = 0
+        for row in range(2, ws.max_row + 1):
+            num = ws.cell(row, i_num + 1).value
+            code = label_code(codes.get(str(num).strip(), [])) if num is not None else ""
+            if code:
+                ws.cell(row, col, code)
+                filled += 1
+        ws.column_dimensions[openpyxl.utils.get_column_letter(col)].width = 26
+        wb.save(path)
+        log(f"✔ Коды этикеток — в отчёт {Path(path).name}: {filled}")
+    except PermissionError:
+        log(f"⚠ Коды этикеток не записались в {Path(path).name}: закрой его в Excel и нажми ещё раз")
+    except Exception as e:  # noqa: BLE001 — этикетки уже есть, отчёт — второстепенно
+        log(f"⚠ Коды этикеток не записались в {Path(path).name}: {e}")
 COL_ART = ("Артикул", "Артикул продавца")
 COL_QTY = ("Количество", "к", "Кол-во", "кол-во")
 COL_TIME = ("Принят в обработку",)
@@ -1294,6 +1338,12 @@ def process(excel, sheet, cabinets, days, out, log, progress, download=True,
          "codes": barcodes.get(n, []) + sticker.get(n, []), "ordered_at": iso(times.get(n))}
         for n, a, _ in entries if n not in not_got], log)
 
+    got_codes = defaultdict(list)  # номер в отчёте → коды его этикеток (заказ мог разделиться)
+    for n, _, _ in entries:
+        if n not in not_got:
+            got_codes[str(origin.get(n, n))] += barcodes.get(n, []) + sticker.get(n, [])
+    fill_label_codes(excel, got_codes, log)
+
     mixed_note = {n: "; вместе с ним не поехал: " + ", ".join(o) for n, _, _, o in mixed}
     skipped = ([(a, n, "красный") for a, n in red]
                + list(yellow))
@@ -2268,7 +2318,7 @@ def ozon_reports(cabinets, days, out, log, statuses, names, shk=None, lines=None
             nowh += not info.get("warehouse")
             for pr in info["products"]:
                 blocks["kgt" if kgt else "ozon"][(info["status"], name)].append(
-                    [num, t, pr["offer_id"], pr["quantity"]])
+                    [num, t, pr["offer_id"], pr["quantity"], label_code(info.get("barcodes"))])
                 if lines is not None:  # заказы дня для склада
                     lines.append({"market": "ozon", "channel": "КГТ" if kgt else "Ozon", "cabinet": name,
                                   "truck": "" if kgt else truck, "posting": num, "article": pr["offer_id"],
@@ -2297,7 +2347,7 @@ def ozon_reports(cabinets, days, out, log, statuses, names, shk=None, lines=None
                 f"их и так нет в отчёте")
     if nowh:
         log(f"⚠ У {nowh} заказов Ozon не указан склад — они попали в отчёт Озон, проверь КГТ вручную")
-    hdr = ["Номер отправления", "Принят в обработку", "Артикул", "Количество"]
+    hdr = ["Номер отправления", "Принят в обработку", "Артикул", "Количество", COL_LABEL]
     for key, title in names.items():
         parts = []
         for st in statuses:
