@@ -15,7 +15,7 @@ if errorlevel 1 goto fail
 rem Открытую программу закрываем: иначе Windows не даст заменить exe
 taskkill /im "BLAGO OTGRUZKI.exe" /f >nul 2>&1
 echo Собираю BLAGO OTGRUZKI.exe ...
-%PY% -m PyInstaller --noconfirm --onefile --windowed --icon blago.ico --splash splash.png --add-data "blago_ui.html;." --name "BLAGO OTGRUZKI" blago_otgruzki.py
+%PY% -m PyInstaller --noconfirm --onefile --windowed --icon blago.ico --add-data "blago_ui.html;." --name "BLAGO OTGRUZKI" blago_otgruzki.py
 if errorlevel 1 goto fail
 copy /y "dist\BLAGO OTGRUZKI.exe" "BLAGO OTGRUZKI.exe" >nul
 if errorlevel 1 goto busy

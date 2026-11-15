@@ -29,7 +29,7 @@ BLAGO OTGRUZKI — этикетки Ozon FBS и поставки Wildberries FBS
 
 Сборка в .exe (значок — синий «B», как у сайта склада): запустить «Собрать exe.bat» или
     pip install pyinstaller pywebview
-    pyinstaller --onefile --windowed --icon blago.ico --splash splash.png --add-data "blago_ui.html;." --name "BLAGO OTGRUZKI" blago_otgruzki.py
+    pyinstaller --onefile --windowed --icon blago.ico --add-data "blago_ui.html;." --name "BLAGO OTGRUZKI" blago_otgruzki.py
 
 Вкладка Wildberries (кнопка «Создать поставки и скачать»):
   1. читает отчёт(ы) WB — «№ задания», «Артикул продавца»; склад и дату
@@ -69,7 +69,7 @@ from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.pdfgen import canvas
 
 APP_NAME = "BLAGO OTGRUZKI"
-APP_VERSION = "2.0"  # при каждом обновлении +0.1, запись в CHANGELOG.md
+APP_VERSION = "2.1"  # при каждом обновлении +0.1, запись в CHANGELOG.md
 API = "https://api-seller.ozon.ru"
 BATCH = 20                   # максимум отправлений в одном запросе этикеток
 READY = "awaiting_deliver"   # статус, в котором Ozon отдаёт этикетку
@@ -4737,15 +4737,7 @@ def main():
                                    min_size=(960, 680), background_color="#0E1220" if dark else "#F4F6FB")
     app.window = window
     window.events.closing += app.on_close
-
-    def started():
-        try:   # заставка exe (пока он распаковывается) — убрать, окно готово
-            import pyi_splash
-            pyi_splash.close()
-        except ImportError:
-            pass
-
-    webview.start(started)
+    webview.start()
 
 
 if __name__ == "__main__":
