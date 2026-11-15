@@ -2270,7 +2270,7 @@ def ozon_reports(cabinets, days, out, log, statuses, names, shk=None, lines=None
                 blocks["kgt" if kgt else "ozon"][(info["status"], name)].append(
                     [num, t, pr["offer_id"], pr["quantity"]])
                 if lines is not None:  # заказы дня для склада
-                    lines.append({"market": "ozon", "channel": "КГТ" if kgt else "Ozon",
+                    lines.append({"market": "ozon", "channel": "КГТ" if kgt else "Ozon", "cabinet": name,
                                   "truck": "" if kgt else truck, "posting": num, "article": pr["offer_id"],
                                   "qty": pr["quantity"], "production": production_of(pr["offer_id"]),
                                   "ordered_at": iso(t)})
