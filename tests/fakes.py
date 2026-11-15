@@ -31,12 +31,19 @@ CABINETS = {
 CAB_BY_ID = {cfg["client_id"]: name for name, cfg in CABINETS.items()}
 
 
+def sticker_of(num):
+    """Код «ii…» на фейковой наклейке: как у Ozon — «ii» и цифры с пробелом."""
+    digits = "".join(ch for ch in str(num) if ch.isdigit()).ljust(11, "0")[:11]
+    return f"ii{digits[:7]} {digits[7:]}"
+
+
 def label_pdf(numbers, size=(164, 113)):
     """Фейковые этикетки Ozon: по странице на отправление, на странице — его номер."""
     buf = io.BytesIO()
     c = canvas.Canvas(buf, pagesize=size)
     for num in numbers:
         c.drawString(10, 60, str(num))
+        c.drawString(10, 40, sticker_of(num))
         c.showPage()
     c.save()
     return buf.getvalue()

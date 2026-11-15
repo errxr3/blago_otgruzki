@@ -69,7 +69,7 @@ from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.pdfgen import canvas
 
 APP_NAME = "BLAGO OTGRUZKI"
-APP_VERSION = "2.2"  # при каждом обновлении +0.1, запись в CHANGELOG.md
+APP_VERSION = "2.3"  # при каждом обновлении +0.1, запись в CHANGELOG.md
 API = "https://api-seller.ozon.ru"
 BATCH = 20                   # максимум отправлений в одном запросе этикеток
 READY = "awaiting_deliver"   # статус, в котором Ozon отдаёт этикетку
@@ -216,14 +216,49 @@ COL_LABEL = "Код этикетки"  # номер с этикетки Ozon: п
 
 
 def label_code(codes):
-    """«ii5019607 3009, %12345%» — коды с этикетки: сначала «ii…», потом штрихкоды из ответа Ozon.
-    Ozon выдаёт их, только когда заказ собран: у несобранного пусто."""
+    """«ii50196073009» — код с наклейки Ozon (из PDF этикетки). Штрихкоды из ответа Ozon — не он, их не пишем.
+    Этикетка есть только у собранного заказа: у несобранного пусто."""
     seen = []
-    codes = [str(x).strip() for x in codes or [] if str(x).strip()]
-    for c in sorted(codes, key=lambda x: not x.lower().startswith("ii")):
-        if c not in seen:
+    for c in (str(x).strip() for x in codes or []):
+        if c.lower().startswith("ii") and c not in seen:
             seen.append(c)
     return ", ".join(seen)
+
+
+def ready_label_codes(cabinets, ready, log):
+    """Коды «ii…» собранных заказов: скачать их этикетки (только чтение, заказы не меняются) и прочитать
+    код со страницы — как при «Скачать и собрать». ready — {кабинет: {номер: [штрихкоды из ответа]}}."""
+    found = {}
+    total = sum(len(v) for v in ready.values())
+    if not total:
+        return found
+    log(f"… коды этикеток собранных заказов: {total}")
+    for name, nums in ready.items():
+        if not nums:
+            continue
+        try:
+            good, bad = grab_labels(headers_for(cabinets[name]), list(nums))
+        except Exception as e:  # noqa: BLE001 — отчёт важнее кода: без кода он всё равно нужен
+            log(f"⚠ {name}: коды этикеток не получены — {e}")
+            continue
+        for part, pdf in good:
+            try:
+                pages = [p.extract_text() or "" for p in PdfReader(io.BytesIO(pdf)).pages]
+            except Exception as e:  # noqa: BLE001
+                log(f"⚠ {name}: этикетки не прочитались — {e}")
+                continue
+            for i, text in enumerate(pages):
+                flat = "".join(text.split())
+                # чья страница: номер отправления или его штрихкод на ней, иначе — по порядку запроса
+                hit = [n for n in part if n in flat or any("".join(str(b).split()) in flat for b in nums[n] if b)]
+                num = hit[0] if len(hit) == 1 else (part[i] if len(pages) == len(part) else None)
+                if num:
+                    for code in sticker_codes(text):
+                        if code not in found.setdefault(num, []):
+                            found[num].append(code)
+        if bad:
+            log(f"⚠ {name}: без кода этикетки {len(bad)} — Ozon не отдал этикетку")
+    return found
 
 
 def fill_label_codes(path, codes, log):
@@ -1341,7 +1376,7 @@ def process(excel, sheet, cabinets, days, out, log, progress, download=True,
     got_codes = defaultdict(list)  # номер в отчёте → коды его этикеток (заказ мог разделиться)
     for n, _, _ in entries:
         if n not in not_got:
-            got_codes[str(origin.get(n, n))] += barcodes.get(n, []) + sticker.get(n, [])
+            got_codes[str(origin.get(n, n))] += sticker.get(n, [])
     fill_label_codes(excel, got_codes, log)
 
     mixed_note = {n: "; вместе с ним не поехал: " + ", ".join(o) for n, _, _, o in mixed}
@@ -2293,6 +2328,8 @@ def ozon_reports(cabinets, days, out, log, statuses, names, shk=None, lines=None
     nowh, broken = 0, []
     skip_postings, skip_orders = skip or (set(), set())
     skipped = defaultdict(set)  # кабинет → отправления, не взятые в отчёт
+    code_rows = defaultdict(list)  # номер → строки отчёта: в них — код с этикетки (2.3)
+    ready = defaultdict(dict)      # кабинет → собранные отправления
     for name in cabinets:
         try:
             snap = lists[name].result()
@@ -2317,8 +2354,11 @@ def ozon_reports(cabinets, days, out, log, statuses, names, shk=None, lines=None
             taken += 1
             nowh += not info.get("warehouse")
             for pr in info["products"]:
-                blocks["kgt" if kgt else "ozon"][(info["status"], name)].append(
-                    [num, t, pr["offer_id"], pr["quantity"], label_code(info.get("barcodes"))])
+                row = [num, t, pr["offer_id"], pr["quantity"], ""]
+                blocks["kgt" if kgt else "ozon"][(info["status"], name)].append(row)
+                code_rows[num].append(row)
+                if info["status"] == READY:  # собран — этикетка есть, код с неё можно прочитать
+                    ready[name][num] = info.get("barcodes") or []
                 if lines is not None:  # заказы дня для склада
                     lines.append({"market": "ozon", "channel": "КГТ" if kgt else "Ozon", "cabinet": name,
                                   "truck": "" if kgt else truck, "posting": num, "article": pr["offer_id"],
@@ -2347,6 +2387,9 @@ def ozon_reports(cabinets, days, out, log, statuses, names, shk=None, lines=None
                 f"их и так нет в отчёте")
     if nowh:
         log(f"⚠ У {nowh} заказов Ozon не указан склад — они попали в отчёт Озон, проверь КГТ вручную")
+    for num, codes in ready_label_codes(cabinets, ready, log).items():
+        for row in code_rows.get(num, []):
+            row[4] = label_code(codes)
     hdr = ["Номер отправления", "Принят в обработку", "Артикул", "Количество", COL_LABEL]
     for key, title in names.items():
         parts = []

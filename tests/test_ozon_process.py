@@ -349,16 +349,17 @@ def test_label_codes_written_to_report_after_download(day, log, progress):
     header = [c.value for c in ws[1]]
     col = header.index(b.COL_LABEL)
     codes = {r[0]: r[col] for r in ws.iter_rows(min_row=2, values_only=True) if r[0]}
-    assert codes["10000002-0001-1"] == "%10000002-0001-1%"
-    assert codes["10000001-0001-1"] == "%10000001-0001-1%"   # уже собранный — тоже
+    assert codes["10000002-0001-1"] == "ii10000002000"        # код «ii…» с его этикетки
+    assert codes["10000001-0001-1"] == "ii10000001000"        # уже собранный — тоже
     assert not codes["10000005-0001-1"]                      # красный — не скачан
     assert codes["10000003-0001-1"]                          # разделён на 3 места — коды частей
     assert "Коды этикеток — в отчёт" in log.text()
     assert "10000002-0001-1" in b.read_report(report).postings
 
 
-def test_label_code_puts_ii_first():
-    assert b.label_code(["%1%", "ii5019607 3009", "", "%1%"]) == "ii5019607 3009, %1%"
+def test_label_code_only_ii_from_label():
+    """В отчёт — только код «ii…» с наклейки; штрихкоды из ответа Ozon — не он."""
+    assert b.label_code(["%1%", "ii50196073009", "", "ii50196073009"]) == "ii50196073009"
     assert b.label_code(None) == ""
 
 

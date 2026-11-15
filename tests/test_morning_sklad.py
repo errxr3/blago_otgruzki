@@ -42,7 +42,9 @@ def test_morning_reports_split_ozon_and_kgt(cabinets, tmp_path, log):
     assert rows(files["ozon"]) == [("1-1", "Zerkalo_50x130", 2), ("6-1", "Zerkalo_50x130", 1),
                                    ("4-1", "Ambient 80 krug", 1)]
     assert sorted(rows(files["kgt"])) == [("2-1", "Alum rama 200x100", 1), ("5-1", "Ambient 200x100", 1)]
-    assert set(cabinets.paths()) == {"/v4/posting/fbs/list"}       # отчёты ничего не меняют
+    # отчёты ничего не меняют: список заказов и этикетки собранных (прочитать «ii…»), без сборки
+    assert set(cabinets.paths()) <= {"/v4/posting/fbs/list", "/v3/posting/fbs/package-label/create",
+                                     "/v2/posting/fbs/package-label/get"}
     # отчёт читается обратно программой: сводная стоит в G/H
     assert b.read_report(files["ozon"]).postings == {"1-1": {"Zerkalo_50x130": 2}, "6-1": {"Zerkalo_50x130": 1},
                                                      "4-1": {"Ambient 80 krug": 1}}
@@ -127,7 +129,7 @@ def test_batch_goes_to_sklad_with_codes_and_channel(sklad, ozon, tmp_path, log, 
     assert path == "/api/v1/batches"
     assert (body["market"], body["channel"], body["truck"]) == ("ozon", "Ozon", "Озон3")
     assert body["items"] == [{"posting": "1-1", "origin": "1-1", "article": "Zerkalo_50x130",
-                              "production": b.KOMINTERNA, "codes": ["%1-1%"],
+                              "production": b.KOMINTERNA, "codes": ["%1-1%", "ii11000000000"],
                               "ordered_at": "2026-11-09T08:00:00"}]
 
 
@@ -152,7 +154,7 @@ def test_wave_to_sklad_channel(wave, expected):
 
 
 def test_morning_report_has_label_code_column(cabinets, tmp_path, log):
-    """Утренний отчёт: колонка «Код этикетки» — код с наклейки, если Ozon его уже отдал."""
+    """Утренний отчёт: колонка «Код этикетки» — «ii…» с этикетки собранных заказов (по API скачивается PDF)."""
     out = tmp_path / "Сборка 10.11"
     out.mkdir()
     _, files = b.ozon_reports(CABINETS, 14, out, log, b.OZON_STATUSES, {"ozon": "Озон 10.11", "kgt": "КГТ 10.11"})
@@ -160,4 +162,5 @@ def test_morning_report_has_label_code_column(cabinets, tmp_path, log):
     assert [c.value for c in ws[1]][:5] == ["Номер отправления", "Принят в обработку", "Артикул", "Количество",
                                             "Код этикетки"]
     codes = {r[0]: r[4] for r in ws.iter_rows(min_row=2, max_col=5, values_only=True) if r[0]}
-    assert codes["4-1"] == "%4-1%"
+    assert codes["4-1"] == "ii41000000000"   # собран: код прочитан с его этикетки
+    assert not codes["1-1"]                  # не собран: этикетки ещё нет
