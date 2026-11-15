@@ -69,7 +69,7 @@ from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.pdfgen import canvas
 
 APP_NAME = "BLAGO OTGRUZKI"
-APP_VERSION = "2.3"  # при каждом обновлении +0.1, запись в CHANGELOG.md
+APP_VERSION = "2.4"  # при каждом обновлении +0.1, запись в CHANGELOG.md
 API = "https://api-seller.ozon.ru"
 BATCH = 20                   # максимум отправлений в одном запросе этикеток
 READY = "awaiting_deliver"   # статус, в котором Ozon отдаёт этикетку
@@ -223,6 +223,55 @@ def label_code(codes):
         if c.lower().startswith("ii") and c not in seen:
             seen.append(c)
     return ", ".join(seen)
+
+
+REPORT_TRIES = 40   # «Отчёт об отправлениях»: сколько раз спросить, готов ли (через REPORT_PAUSE секунд)
+REPORT_PAUSE = 3
+
+
+def report_label_codes(cabinets, days, log):
+    """Коды этикеток «ii…» из «Отчёта об отправлениях» Ozon (тот же CSV, что «Скачать» в кабинете):
+    в нём код есть и у ещё не собранных заказов. Возвращает ({номер: код}, [кабинеты без отчёта])."""
+    import csv
+    now = datetime.now(timezone.utc)
+    body = {"filter": {"processed_at_from": (now - timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%S.000Z"),
+                       "processed_at_to": now.strftime("%Y-%m-%dT%H:%M:%S.000Z"), "delivery_schema": ["fbs"]},
+            "language": "DEFAULT"}
+
+    def one(cfg):
+        headers = headers_for(cfg)
+        r = ozon_post(f"{API}/v1/report/postings/create", headers=headers, json=body, timeout=30)
+        if r.status_code != 200:
+            raise RuntimeError(api_error(r))
+        code = (r.json().get("result") or {}).get("code")
+        if not code:
+            raise RuntimeError("Ozon не дал номер отчёта")
+        for _ in range(REPORT_TRIES):
+            time.sleep(REPORT_PAUSE)
+            info = ozon_post(f"{API}/v1/report/info", headers=headers, json={"code": code}, timeout=30)
+            if info.status_code != 200:
+                raise RuntimeError(api_error(info))
+            res = info.json().get("result") or {}
+            if res.get("status") == "failed":
+                raise RuntimeError(res.get("error") or "Ozon не сделал отчёт")
+            if res.get("status") == "success" and res.get("file"):
+                f = requests.get(res["file"], timeout=60)
+                f.raise_for_status()
+                rows = csv.DictReader(io.StringIO(f.content.decode("utf-8-sig")), delimiter=";")
+                return {str(x.get("Номер отправления") or "").strip(): str(x.get(COL_LABEL) or "").strip()
+                        for x in rows if x.get("Номер отправления")}
+        raise RuntimeError("Ozon долго готовит отчёт")
+
+    codes, failed = {}, []
+    with ThreadPoolExecutor(max_workers=max(1, len(cabinets))) as pool:
+        jobs = {n: pool.submit(one, c) for n, c in cabinets.items()}
+    for name, job in jobs.items():
+        try:
+            codes.update({k: v for k, v in job.result().items() if v})
+        except Exception as e:  # noqa: BLE001 — без кодов отчёт всё равно нужен
+            log(f"⚠ {name}: коды этикеток из отчёта Ozon не получены — {e}")
+            failed.append(name)
+    return codes, failed
 
 
 def ready_label_codes(cabinets, ready, log):
@@ -2387,9 +2436,18 @@ def ozon_reports(cabinets, days, out, log, statuses, names, shk=None, lines=None
                 f"их и так нет в отчёте")
     if nowh:
         log(f"⚠ У {nowh} заказов Ozon не указан склад — они попали в отчёт Озон, проверь КГТ вручную")
-    for num, codes in ready_label_codes(cabinets, ready, log).items():
+    # «Код этикетки»: из «Отчёта об отправлениях» Ozon; не пришёл — у собранных заказов с их этикеток
+    log("… коды этикеток: отчёт об отправлениях Ozon")
+    from_report, _ = report_label_codes(cabinets, days, log)
+    for num, code in from_report.items():
+        for row in code_rows.get(num, []):
+            row[4] = code
+    left = {n: {k: v for k, v in nums.items() if k not in from_report} for n, nums in ready.items()}
+    for num, codes in ready_label_codes(cabinets, left, log).items():
         for row in code_rows.get(num, []):
             row[4] = label_code(codes)
+    if from_report:
+        log(f"✔ Коды этикеток: {sum(1 for n in code_rows if n in from_report)} из {len(code_rows)}")
     hdr = ["Номер отправления", "Принят в обработку", "Артикул", "Количество", COL_LABEL]
     for key, title in names.items():
         parts = []
