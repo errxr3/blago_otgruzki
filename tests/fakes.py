@@ -122,8 +122,6 @@ class FakeOzon:
         self.carriages = {}      # кабинет -> методы доставки для /v2/carriage/delivery/list
         self.created = []        # созданные отгрузки
         self.unprinted = set()   # номера, на которые Ozon не печатает этикетку
-        self.reports = {}        # код отчёта -> кабинет («Отчёт об отправлениях»)
-        self.no_code = set()     # номера без «Код этикетки» в отчёте
         mock.add_callback(responses.POST, re.compile(r"https://api-seller\.ozon\.ru/.*"), callback=self._post)
         mock.add_callback(responses.GET, re.compile(r"https://files\.test/.*"), callback=self._file)
 
@@ -152,10 +150,6 @@ class FakeOzon:
             "/v4/posting/fbs/ship": self._ship,
             "/v3/posting/fbs/package-label/create": self._label_create,
             "/v2/posting/fbs/package-label/get": self._label_get,
-            "/v1/report/postings/create": self._report_create,
-            "/v1/report/info": lambda cab, body: (200, {"result": {
-                "code": body["code"], "status": "success",
-                "file": f"https://files.test/report-{body['code']}.csv"}}),
             "/v2/carriage/delivery/list": self._carriage_list,
             "/v1/carriage/create": self._carriage_create,
             "/v1/carriage/approve": lambda cab, body: (200, {}),
@@ -204,20 +198,7 @@ class FakeOzon:
                                 "status": {"code": "completed", "postings_count": len(numbers),
                                            "unprinted_postings": skipped}}}
 
-    def _report_create(self, cab, body):
-        code = f"r{len(self.reports) + 1}"
-        self.reports[code] = cab
-        return 200, {"result": {"code": code}}
-
     def _file(self, request):
-        report = re.search(r"/report-(\w+)\.csv", request.url)
-        if report:  # CSV как «Скачать» в кабинете: «;», кавычки, BOM
-            lines = ['"Номер заказа";"Номер отправления";"Код этикетки";"Статус";"Артикул";"Количество"']
-            for num, p in self.cabinets[self.reports[report.group(1)]].items():
-                code = "" if num in self.no_code else sticker_of(num).replace(" ", "")
-                lines += [f'"{num.rsplit("-", 1)[0]}";"{num}";"{code}";"{p["status"]}";"{x["offer_id"]}";'
-                          f'"{x["quantity"]}"' for x in p["products"]]
-            return 200, {}, ("\ufeff" + "\n".join(lines)).encode("utf-8")
         task = int(re.search(r"/(\d+)\.pdf", request.url).group(1))
         if self.label_bytes is not None:
             return 200, {}, self.label_bytes

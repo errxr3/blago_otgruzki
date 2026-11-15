@@ -43,8 +43,8 @@ def test_morning_reports_split_ozon_and_kgt(cabinets, tmp_path, log):
                                    ("4-1", "Ambient 80 krug", 1)]
     assert sorted(rows(files["kgt"])) == [("2-1", "Alum rama 200x100", 1), ("5-1", "Ambient 200x100", 1)]
     # отчёты ничего не меняют: список заказов и этикетки собранных (прочитать «ii…»), без сборки
-    assert set(cabinets.paths()) <= {"/v4/posting/fbs/list", "/v1/report/postings/create", "/v1/report/info",
-                                     "/v3/posting/fbs/package-label/create", "/v2/posting/fbs/package-label/get"}
+    assert set(cabinets.paths()) <= {"/v4/posting/fbs/list", "/v3/posting/fbs/package-label/create",
+                                     "/v2/posting/fbs/package-label/get"}
     # отчёт читается обратно программой: сводная стоит в G/H
     assert b.read_report(files["ozon"]).postings == {"1-1": {"Zerkalo_50x130": 2}, "6-1": {"Zerkalo_50x130": 1},
                                                      "4-1": {"Ambient 80 krug": 1}}
@@ -67,10 +67,10 @@ def test_left_yesterday_is_not_taken(cabinets, tmp_path, log):
 def test_wave_takes_only_awaiting_packaging(cabinets, tmp_path, log):
     data, files = b.ozon_reports(CABINETS, 14, tmp_path, log, (b.PACKING,), {"ozon": "Озон 2 10.11"})
     assert data == {"ozon": {"Zerkalo_50x130": 3}}
-    # «Код этикетки» и в волнах (Озон 2, Озон 3, КГТ 2…): из отчёта Ozon, у несобранных тоже
+    # волна — только несобранные: этикеток ещё нет, коды появятся после «Скачать и собрать»
     ws = openpyxl.load_workbook(files["ozon"]).worksheets[0]
-    assert {r[0]: r[4] for r in ws.iter_rows(min_row=2, max_col=5, values_only=True) if r[0]} == {
-        "1-1": "ii11000000000", "6-1": "ii61000000000"}
+    assert b.COL_LABEL in [c.value for c in ws[1]]
+    assert cabinets.count("/v3/posting/fbs/package-label/create") == 0
 
 
 # ---------------------------------------------------------------- склад BLAGO
@@ -158,7 +158,7 @@ def test_wave_to_sklad_channel(wave, expected):
 
 
 def test_morning_report_has_label_code_column(cabinets, tmp_path, log):
-    """Утренний отчёт: «Код этикетки» — из «Отчёта об отправлениях» Ozon, и у несобранных тоже."""
+    """Утренний отчёт: «Код этикетки» — «ii…» с PDF этикеток собранных заказов (скачиваются по API)."""
     out = tmp_path / "Сборка 10.11"
     out.mkdir()
     _, files = b.ozon_reports(CABINETS, 14, out, log, b.OZON_STATUSES, {"ozon": "Озон 10.11", "kgt": "КГТ 10.11"})
@@ -166,19 +166,5 @@ def test_morning_report_has_label_code_column(cabinets, tmp_path, log):
     assert [c.value for c in ws[1]][:5] == ["Номер отправления", "Принят в обработку", "Артикул", "Количество",
                                             "Код этикетки"]
     codes = {r[0]: r[4] for r in ws.iter_rows(min_row=2, max_col=5, values_only=True) if r[0]}
-    assert codes == {"1-1": "ii11000000000", "6-1": "ii61000000000", "4-1": "ii41000000000"}
-    assert cabinets.count("/v3/posting/fbs/package-label/create") == 0  # всё из отчёта — этикетки не качаем
-    assert "✔ Коды этикеток: 5 из 5" in log.text()
-
-
-def test_label_codes_from_labels_if_report_fails(cabinets, tmp_path, log):
-    """Отчёт Ozon не сделал — у собранных код читается с их этикеток, у несобранных пусто, отчёт есть."""
-    cabinets.fail["/v1/report/postings/create"] = (500, {"message": "сломалось"})
-    out = tmp_path / "Сборка 10.11"
-    out.mkdir()
-    _, files = b.ozon_reports(CABINETS, 14, out, log, b.OZON_STATUSES, {"ozon": "Озон 10.11", "kgt": "КГТ 10.11"})
-    ws = openpyxl.load_workbook(files["ozon"]).worksheets[0]
-    codes = {r[0]: r[4] for r in ws.iter_rows(min_row=2, max_col=5, values_only=True) if r[0]}
-    assert codes["4-1"] == "ii41000000000"   # собран — с этикетки
-    assert not codes["1-1"]                  # не собран — кода нет
-    assert "коды этикеток из отчёта Ozon не получены" in log.text()
+    assert codes["4-1"] == "ii41000000000"   # собран: код прочитан с его этикетки
+    assert not codes["1-1"]                  # не собран: этикетки ещё нет
