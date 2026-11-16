@@ -69,7 +69,7 @@ from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.pdfgen import canvas
 
 APP_NAME = "BLAGO OTGRUZKI"
-APP_VERSION = "2.6"  # при каждом обновлении +0.1, запись в CHANGELOG.md
+APP_VERSION = "2.7"  # при каждом обновлении +0.1, запись в CHANGELOG.md
 API = "https://api-seller.ozon.ru"
 BATCH = 20                   # максимум отправлений в одном запросе этикеток
 READY = "awaiting_deliver"   # статус, в котором Ozon отдаёт этикетку
@@ -3497,21 +3497,23 @@ def sklad_flush(log):
         log(f"⚠ Ещё не ушло на склад: {len(left)}")
 
 
-def sklad_demand(day, lines, log, replace=None, drop=None):
+def sklad_demand(day, lines, log, replace=None, drop=None, dry=False):
     """Заказы → склад. Ответ: {отправление: (решение, почему)} или None, если склада нет/не ответил.
-    drop — [{market, posting}] покрашенные «не едет»: в плане склада остаются, но убраны из отгрузки."""
+    drop — [{market, posting}] покрашенные «не едет»: в плане склада остаются, но убраны из отгрузки.
+    dry — только спросить, что едет: в план склада ничего не пишется (2.7)."""
     if not sklad_on() or not (lines or drop):
         return None
     try:
         # Склад пересчитывает остатки по всем заказам — на большом дне это дольше 30 с (1.31)
         data = sklad_post("/api/v1/demand", {"day": day.isoformat(), "lines": lines, "replace": replace or [],
-                                             "drop": drop or []}, timeout=120)
+                                             "drop": drop or [], "dry": dry}, timeout=120)
     except RuntimeError as e:
         log(f"⚠ Склад не ответил, что едет ({e}) — решаю как раньше, по цветам отчёта")
-        sklad_note("err", "заказы НЕ ушли на склад")
+        if not dry:
+            sklad_note("err", "заказы НЕ ушли на склад")
         return None
     count = len({ln["posting"] for ln in lines})
-    if count:
+    if count and not dry:
         sklad_note("ok", f"заказы ушли на склад: {plural(count, 'отправление', 'отправления', 'отправлений')}")
     for q in data.get("questions") or []:
         if q.get("status") == "open":
@@ -3548,9 +3550,16 @@ def sklad_decide(market, channel, truck, postings, times, colored, log, confirm,
     lines = [{"market": market, "channel": channel, "truck": truck, "posting": num, "article": art, "qty": q,
               "production": production_of(art), "ordered_at": iso(times.get(num))}
              for num, arts in postings.items() for art, q in arts.items()]
-    log("Спрашиваю склад, что едет…")
-    # Покрашенное «не едет» — складу отдельным списком: даже если «Отправить на склад» было до покраски
-    answer = sklad_demand(today_msk(), lines, log, drop=[{"market": market, "posting": n} for n in drop or []])
+    log("Спрашиваю склад, что едет (в план склада не записываю)…")
+    # Только вопрос: в план склада заказы кладёт одна кнопка — «Отправить на склад» (2.7).
+    # Покрашенное «не едет» склад вычтет и в вопросе, а в план покраска уйдёт с «Отправить на склад»
+    cut = [{"market": market, "posting": n} for n in drop or []]
+    answer = sklad_demand(today_msk(), lines, log, drop=cut, dry=True)
+    if cut:  # если заказы уже на складе (отправил до покраски) — покраску склад запомнит сразу
+        try:
+            sklad_post("/api/v1/demand", {"day": today_msk().isoformat(), "lines": [], "drop": cut}, timeout=120)
+        except RuntimeError:
+            pass  # не страшно: покраска уйдёт с «Отправить на склад»
     if answer is None:
         return postings
     # Считаем штуки, а не отправления: один заказ на 15 зеркал — это 15 шт., а не 1

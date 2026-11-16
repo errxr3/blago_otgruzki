@@ -106,7 +106,21 @@ def test_sklad_decides_but_owner_colors_win(sklad, log):
     assert set(kept) == {"go-1", "yellow-1"}          # жёлтый покрашен владельцем — склад не переспрашивает
     path, body = sklad["calls"][0]
     assert path == "/api/v1/demand" and body["drop"] == [{"market": "ozon", "posting": "red-1"}]
+    assert body["dry"] is True                       # только вопрос — в план склада не пишется (2.7)
+    path, body = sklad["calls"][1]                   # покраска — тем заказам, что уже на складе
+    assert body["lines"] == [] and body["drop"] == [{"market": "ozon", "posting": "red-1"}] and "dry" not in body
     assert "едет 2 шт." in log.text() and "не едет 2 шт." in log.text()
+
+
+def test_check_does_not_put_orders_into_plan(sklad, log):
+    """Проверка и скачивание ШК — только вопрос складу; в план — лишь «Отправить на склад» (2.7)."""
+    b.sklad_decide("wb", "WB", "", {"1": {"A": 1}}, {}, set(), log, lambda text: True, False)
+    [(path, body)] = sklad["calls"]
+    assert body["dry"] is True and "ушли на склад" not in log.text()
+    b.morning_hold(b.today_msk(), [{"market": "wb", "channel": "WB", "posting": "1", "article": "A", "qty": 1}],
+                   ["wb"], [("WB", 1, "")], log)
+    assert b.morning_send(log)
+    assert sklad["calls"][-1][1]["dry"] is False     # «Отправить на склад» — по-настоящему
 
 
 def test_sklad_down_falls_back_to_report_colors(sklad, isolated, log, monkeypatch):
