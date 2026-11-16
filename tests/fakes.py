@@ -234,8 +234,9 @@ class FakeWB:
         self.new[str(oid)] = {"id": int(oid), "article": article, "cargoType": cargo,
                               "warehouseId": warehouse_id, "createdAt": created, **extra}
 
-    def supply(self, sid, name, orders=(), done=False):
-        self.supplies.append({"id": sid, "name": name, "done": done, "orders": [str(i) for i in orders]})
+    def supply(self, sid, name, orders=(), done=False, created=None):
+        self.supplies.append({"id": sid, "name": name, "done": done, "orders": [str(i) for i in orders],
+                              **({"createdAt": created} if created else {})})
 
     def methods(self):
         return [(m, p) for m, p, _ in self.calls]
@@ -261,7 +262,7 @@ class FakeWB:
                 {"id": i, "supplierStatus": self.status[str(i)][0], "wbStatus": self.status[str(i)][1]}
                 for i in body["orders"] if str(i) in self.status]})
         if request.method == "GET" and path == "/api/v3/supplies":
-            return 200, {}, json.dumps({"supplies": [{k: s[k] for k in ("id", "name", "done")}
+            return 200, {}, json.dumps({"supplies": [{k: s[k] for k in ("id", "name", "done", "createdAt") if k in s}
                                                      for s in self.supplies], "next": 0})
         if request.method == "POST" and path == "/api/v3/supplies":
             sid = f"WB-GI-{100 + len(self.supplies)}"

@@ -69,7 +69,7 @@ from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.pdfgen import canvas
 
 APP_NAME = "BLAGO OTGRUZKI"
-APP_VERSION = "2.5"  # при каждом обновлении +0.1, запись в CHANGELOG.md
+APP_VERSION = "2.6"  # при каждом обновлении +0.1, запись в CHANGELOG.md
 API = "https://api-seller.ozon.ru"
 BATCH = 20                   # максимум отправлений в одном запросе этикеток
 READY = "awaiting_deliver"   # статус, в котором Ozon отдаёт этикетку
@@ -1788,7 +1788,7 @@ def wb_save_supply(token, supply, ids, articles, out, day, log, collect=None):
         pick_list_xlsx(folder / f"Лист подбора {safe}.xlsx", supply["id"], [(a, s) for a, s, _ in rows], day)
     log(f"✔ {supply['name']} — {len(rows)} ШК")
     if collect is not None:  # для партии на склад: какие стикеры скачаны
-        cargo = parsed[1] if parsed else "МГТ"
+        cargo = wb_supply_kind(supply)[1] or "МГТ"
         for art, _, i in rows:
             st = good[i]
             collect.append((cargo, {"posting": str(i), "article": art, "production": prod,
@@ -1801,13 +1801,13 @@ def wb_save_supply(token, supply, ids, articles, out, day, log, collect=None):
 
 
 def wb_leftovers(token, day):
-    """Не уехавшее вчера: задания из неотгруженных поставок программы за прошлые дни.
+    """Не уехавшее вчера: задания из любых неотгруженных поставок прошлых дней (название — любое, 2.6).
 
     Возвращает {id задания: (задание WB, поставка)}. Задание — из списка заданий за 30 дней
     (там артикул, склад, габарит); если WB его не отдал — только номер и артикул «?» (1.37).
     """
     old = [s for s in wb_open_supplies(token)
-           if (p := wb_parse_name(s.get("name"))) and p[0] < day]
+           if (d := wb_supply_kind(s)[0]) is not None and d < day]
     if not old:
         return {}
     ids = {s["id"]: wb_supply_orders(token, s["id"]) for s in old}
@@ -1830,6 +1830,34 @@ def wb_articles(token, ids, known):
         found = wb_orders(token, lo, hi)
         arts.update((i, found[i].get("article", "?")) for i in missing if i in found)
     return arts
+
+
+def wb_supply_kind(supply):
+    """Любая поставка, как бы её ни назвали: (дата, габарит, юрлицо).
+
+    Дата — из названия «Поставка от ДД.ММ.ГГГГ …», иначе — день создания поставки в WB (по Москве);
+    габарит — МГТ/СГТ/КГТ из названия (None — не написан); юрлицо — «юр.лицо» в названии (2.6)."""
+    name = supply.get("name") or ""
+    parsed = wb_parse_name(name)
+    if parsed:
+        return parsed[0], parsed[1], parsed[3]
+    m = re.search(r"(\d\d\.\d\d\.\d{4})", name)
+    day = None
+    if m:
+        try:
+            day = datetime.strptime(m.group(1), "%d.%m.%Y").date()
+        except ValueError:
+            day = None
+    if day is None and supply.get("createdAt"):
+        try:
+            created = datetime.fromisoformat(str(supply["createdAt"]).replace("Z", "+00:00"))
+            if created.tzinfo is None:
+                created = created.replace(tzinfo=timezone.utc)
+            day = created.astimezone(timezone(timedelta(hours=3))).date()
+        except ValueError:
+            day = None
+    cargo = next((c for c in ("СГТ", "КГТ", "МГТ") if re.search(c, name, re.I)), None)
+    return day, cargo, bool(re.search(r"юр\.?\s*лиц", name, re.I))
 
 
 def process_wb(files, token, out, log, progress, mode="check", confirm=lambda text: True,
@@ -1951,9 +1979,12 @@ def process_wb(files, token, out, log, progress, mode="check", confirm=lambda te
     moves = defaultdict(list)   # (габарит, производство, юрлицо) -> [(id, вчерашняя поставка)]
     for sid, ids in carry.items():
         old = carry_sup[sid]
-        parsed = wb_parse_name(old["name"])
+        _, cargo, b2b = wb_supply_kind(old)
         for i in ids:
-            moves[(parsed[1], production_of(next(iter(postings[i]))), parsed[3])].append((i, old))
+            o = left[i][0]   # габарит не написан в названии — по самому заданию
+            kind = (cargo or WB_CARGO.get(o.get("cargoType"), "МГТ"), production_of(next(iter(postings[i]))),
+                    b2b or is_b2b(o))
+            moves[kind].append((i, old))
     for kind in moves:   # вид, которого сегодня нет среди новых заданий, — всё равно своя поставка
         if not any(k[0] == kind[0] and k[1] == kind[1] and k[3] == kind[2] for k in groups):
             groups[(kind[0], kind[1], None, kind[2])] = []
@@ -1986,7 +2017,8 @@ def process_wb(files, token, out, log, progress, mode="check", confirm=lambda te
             for i, o in m:
                 if o["id"] == old["id"]:
                     target = wb_supply_name(day, *kind)
-                    moved = "" if o["name"].endswith(target[len("Поставка от 00.00.0000"):]) else "  ← другое производство"
+                    was = wb_parse_name(o["name"])
+                    moved = "  ← другое производство" if was and was[2] != kind[1] else ""
                     log(f"│     {i}  {next(iter(postings[i]))}  →  {target}{moved}")
     total = sum(len(ids) + len(move) for *_, ids, move in plan)
     if failed:
@@ -2005,17 +2037,12 @@ def process_wb(files, token, out, log, progress, mode="check", confirm=lambda te
     if not plan:
         return
 
-    # 5. Создание поставок, добавление сегодняшних заданий и перенос вчерашних
+    # 5. Создание поставок, добавление сегодняшних заданий и перенос вчерашних.
+    #    Вчерашнее переносится всегда, без вопроса: это то, что вчера не уехало (2.6)
     move_all = sum(len(move) for *_, move in plan)
     do_move = True
     if move_all:
-        lines = "\n".join(f"   {i}  {next(iter(postings[i]))} → {name[len('Поставка от '):]}"
-                          for _, name, _, _, move in plan for i, _ in move)
-        do_move = confirm(f"Не уехало вчера: {plural(move_all, 'задание', 'задания', 'заданий')}.\n\n{lines}\n\n"
-                          f"Да — перенести в сегодняшние поставки (вчерашняя, если опустеет, удалится)\n"
-                          f"Нет — оставить во вчерашних (их ШК тоже скачаются, сдать в WB нужно все поставки)")
-        log("→ вчерашние задания переносятся в сегодняшние поставки" if do_move
-            else "→ вчерашние задания остаются во вчерашних поставках")
+        log("→ вчерашние задания переносятся в сегодняшние поставки")
     news = [name for _, name, target, ids, move in plan if target is None and (ids or (move and do_move))]
     added = sum(len(ids) for *_, ids, _ in plan)
     if added and not confirm(f"Добавить {plural(added, 'задание', 'задания', 'заданий')} в поставки WB"
@@ -2526,8 +2553,8 @@ def morning(cabinets, token, template, cdek, out, days, log, progress, today=Non
                 row = [int(o["id"]), o.get("article", ""), wh or str(o.get("warehouseId") or "")]
                 # как в ручном отчёте: СГТ — это склад продавца «… СГТ» (фильтр «Склад продавца»);
                 # если WB не отдал название склада — по габариту задания (у вчерашнего — по имени поставки)
-                parsed = wb_parse_name(sup["name"]) if sup else None
-                is_sgt = is_kgt(wh) if wh else (parsed[1] == "СГТ" if parsed else o.get("cargoType") == 2)
+                cargo = wb_supply_kind(sup)[1] if sup else None
+                is_sgt = is_kgt(wh) if wh else (cargo == "СГТ" if cargo else o.get("cargoType") == 2)
                 if sup is not None:
                     carried[sup["name"]] += 1
                     if is_sgt:   # вчерашнее едет сегодня: дата — сегодня, чтобы прошло фильтр сводной

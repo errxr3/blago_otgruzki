@@ -278,7 +278,8 @@ def test_leftover_moved_to_todays_supply_and_old_deleted(wb, tmp_path, log, prog
     asked = []
     b.process_wb([str(rep)], TOKEN, str(out), log, progress, mode="run", today=TODAY,
                  confirm=lambda text: asked.append(text) or True)
-    assert any("Не уехало вчера: 1 задание" in q and "401" in q for q in asked)
+    assert not any("Не уехало вчера" in q for q in asked)   # переносится без вопроса (2.6)
+    assert "вчерашние задания переносятся в сегодняшние поставки" in log.text()
     by_name = {s["name"]: sorted(s["orders"]) for s in wb.supplies}
     assert by_name == {"Поставка от 10.11.2026 МГТ коминтерна": ["501"],
                        "Поставка от 10.11.2026 МГТ учительская": ["401", "502"]}   # вчерашняя удалена
@@ -300,18 +301,42 @@ def test_leftover_goes_by_article_not_by_old_supply(wb, tmp_path, log, progress)
     assert [(s["name"], s["orders"]) for s in wb.supplies] == [("Поставка от 10.11.2026 МГТ коминтерна", ["402"])]
 
 
-def test_leftover_answer_no_keeps_old_supply_and_downloads_it(wb, tmp_path, log, progress):
+def test_leftover_moved_without_question(wb, tmp_path, log, progress):
+    """Вчерашнее переносится всегда: вопроса «перенести?» нет, даже если на всё отвечать «нет» (2.6)."""
     leftover(wb)
     wb.order(501, "Zerkalo_50x130")
     rep = wb_report(tmp_path / "ВБ.xlsx", [(401, "Ambient warm 80 krug multi", MGT_WH, "-", 1),
                                            (501, "Zerkalo_50x130", MGT_WH, "-", 1)])
-    out = tmp_path / "o"
-    b.process_wb([str(rep)], TOKEN, str(out), log, progress, mode="run", today=TODAY,
-                 confirm=lambda text: "Не уехало вчера" not in text)
+    asked = []
+    b.process_wb([str(rep)], TOKEN, str(tmp_path / "o"), log, progress, mode="run", today=TODAY,
+                 confirm=lambda text: asked.append(text) or text.startswith("Добавить"))
+    assert not any("Не уехало вчера" in q for q in asked)
     names = sorted(s["name"] for s in wb.supplies)
-    assert names == ["Поставка от 09.11.2026 МГТ учительская", "Поставка от 10.11.2026 МГТ коминтерна"]
-    assert (out / b.UCHITELSKAYA / "ШК Поставка от 09.11.2026 МГТ учительская.pdf").exists()
-    assert "СКАЧАНО ШК: 2" in log.text()
+    assert names == ["Поставка от 10.11.2026 МГТ коминтерна", "Поставка от 10.11.2026 МГТ учительская"]
+
+
+def test_leftover_from_supply_with_any_name(wb, tmp_path, log, progress):
+    """Вчерашняя поставка названа как угодно: дата — из WB (создана вчера), МГТ — из названия (2.6)."""
+    wb.history["401"] = {"id": 401, "article": "Ambient warm 80 krug multi", "cargoType": 1, "warehouseId": 1,
+                         "createdAt": "2026-11-09T08:00:00Z"}
+    wb.status["401"] = ("confirm", "waiting")
+    wb.supply("WB-GI-ANY", "мгт вечер руками", orders=[401], created="2026-11-09T18:00:00Z")
+    wb.supply("WB-GI-TODAY", "МГТ сегодня руками", orders=[], created="2026-11-10T06:00:00Z")
+    rep = wb_report(tmp_path / "ВБ.xlsx", [(401, "Ambient warm 80 krug multi", MGT_WH, "-", 1)])
+    b.process_wb([str(rep)], TOKEN, str(tmp_path / "o"), log, progress, mode="run", today=TODAY)
+    got = {s["name"]: s["orders"] for s in wb.supplies}
+    assert got == {"МГТ сегодня руками": [], "Поставка от 10.11.2026 МГТ учительская": ["401"]}
+    assert "Пустая «мгт вечер руками» удалена" in log.text()
+
+
+def test_morning_takes_leftover_from_supply_with_any_name(wb, tmp_path, log, progress, monkeypatch):
+    wb.history["401"] = {"id": 401, "article": "Ambient warm 80 krug multi", "cargoType": 2, "warehouseId": 9,
+                         "createdAt": "2026-11-09T08:00:00Z"}
+    wb.supply("WB-GI-ANY", "Моя СГТ", orders=[401], created="2026-11-09T18:00:00Z")
+    monkeypatch.setattr(b, "wb_warehouses", lambda token: {})
+    files = b.morning({}, TOKEN, None, None, tmp_path / "С", 14, log, progress, today=TODAY)
+    ws = openpyxl.load_workbook(files["sgt"]).active
+    assert [r[0] for r in ws.iter_rows(min_row=2, max_col=1, values_only=True) if r[0]] == [401]
 
 
 def test_move_refused_by_wb_keeps_old_and_downloads(wb, tmp_path, log, progress):
