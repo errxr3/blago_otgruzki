@@ -69,7 +69,7 @@ from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.pdfgen import canvas
 
 APP_NAME = "BLAGO OTGRUZKI"
-APP_VERSION = "2.7"  # при каждом обновлении +0.1, запись в CHANGELOG.md
+APP_VERSION = "2.8"  # при каждом обновлении +0.1, запись в CHANGELOG.md
 API = "https://api-seller.ozon.ru"
 BATCH = 20                   # максимум отправлений в одном запросе этикеток
 READY = "awaiting_deliver"   # статус, в котором Ozon отдаёт этикетку
@@ -2784,9 +2784,15 @@ def cdek_check(orders, log):
         last = max(sts, key=lambda x: x.get("date_time") or "") if sts else {}
         return o, last.get("code") or "", cdek_amounts(ent)
 
+    # Заказ СДЭК из нескольких мест в таблице — по строке на место с одним треком (2.8):
+    # спрашиваем СДЭК один раз на трек и сравниваем сумму строк трека
+    by_track = {}
+    for o in orders:
+        t = by_track.setdefault(o["track"], dict(o, qty=0))
+        t["qty"] += o.get("qty", 1)
     bad = 0
     with ThreadPoolExecutor(max_workers=WORKERS) as pool:
-        for o, code, extra in pool.map(one, orders):
+        for o, code, extra in pool.map(one, list(by_track.values())):
             if not isinstance(extra, tuple):   # строка — ошибка запроса
                 bad += 1
                 log(f"✖ {o['track']} ({o['article']}): {extra}")
@@ -2820,7 +2826,7 @@ def cdek_amounts(entity):
 def cdek_pages(pdfs):
     """Страницы ШК по номеру заказа СДЭК (номер — первый текст на этикетке) и код [ITM] с этикетки."""
     import re
-    pages, itm = {}, {}
+    pages, itm = {}, {}   # itm: номер → коды [ITM] всех его мест (у каждого места свой, 2.8)
     for data in pdfs:
         for page in PdfReader(io.BytesIO(data)).pages:
             text = page.extract_text() or ""
@@ -2829,8 +2835,8 @@ def cdek_pages(pdfs):
                 continue
             pages.setdefault(m.group(1), []).append(page)
             i = re.search(r"\[ITM\]\s*(\d+)", text)
-            if i:
-                itm[m.group(1)] = i.group(1)
+            if i and i.group(1) not in itm.setdefault(m.group(1), []):
+                itm[m.group(1)].append(i.group(1))
     return pages, itm
 
 
@@ -3217,7 +3223,7 @@ def make_cdek(orders, out, log, today=None):
     if cdek_on():
         log(f"… качаю ШК СДЭК: {len(orders)} заказов")
         try:
-            pdfs = cdek_barcodes_api([o["track"] for o in orders], log)
+            pdfs = cdek_barcodes_api(list(dict.fromkeys(o["track"] for o in orders)), log)  # трек — один раз
         except (RuntimeError, requests.RequestException, ValueError) as e:
             log(f"✖ ШК из СДЭК не скачались — {e}")
     pages, itm = cdek_pages(pdfs) if pdfs else ({}, {})
@@ -3237,15 +3243,26 @@ def make_cdek(orders, out, log, today=None):
                 if pieces(group) != len(group) else f"✔ {prod}: {len(group)} заказов — лист сборки и акт")
         if pages:
             writer, got = PdfWriter(), 0
+            # Заказ из нескольких мест в таблице — по строке на место с одним треком: ШК мест трека
+            # раздаём по его строкам, а не каждой строке все места (иначе 3 места × 3 строки = 9 ШК, 2.8)
+            rows_left = defaultdict(int)
+            for o in group:
+                rows_left[o["track"]] += 1
+            used = defaultdict(int)
             for o in group:
                 found = pages.get(o["track"]) or []
                 if not found:
                     missing.append(o)
                     continue
-                # ШК на каждое зеркало: СДЭК дал по месту — берём их; мест меньше, чем зеркал, — повторяем
-                need = max(o.get("qty", 1), len(found))
-                for k in range(need):
-                    writer.add_page(found[k % len(found)])
+                rows_left[o["track"]] -= 1
+                # ШК на каждое зеркало: СДЭК дал по месту — берём их; мест меньше, чем зеркал, — повторяем;
+                # последняя строка трека забирает оставшиеся места
+                need = o.get("qty", 1)
+                if not rows_left[o["track"]]:
+                    need = max(need, len(found) - used[o["track"]])
+                for _ in range(need):
+                    writer.add_page(found[used[o["track"]] % len(found)])
+                    used[o["track"]] += 1
                 got += need
             if got:
                 with open(folder / f"СДЭК ШК {day:%d.%m}.pdf", "wb") as f:
@@ -3265,7 +3282,7 @@ def make_cdek(orders, out, log, today=None):
         sklad_send_batch(day, "cdek", "СДЭК", "", "СДЭК", [
             {"posting": o["track"], "origin": o["task"] or o["track"], "article": o["article"],
              "production": production_of(o["article"]),
-             "codes": [f"[CDK]{o['track']}", o["track"]] + ([f"[ITM]{itm[o['track']]}"] if o["track"] in itm else [])}
+             "codes": [f"[CDK]{o['track']}", o["track"]] + [f"[ITM]{c}" for c in itm.get(o["track"], [])]}
             for o in orders for _ in range(o.get("qty", 1))], log)   # одна строка на зеркало
     return out
 

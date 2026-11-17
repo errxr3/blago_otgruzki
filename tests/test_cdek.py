@@ -138,3 +138,54 @@ def test_places_used_when_no_goods(cdek_api, log):
 def test_no_amounts_in_cdek_no_warning(cdek_api, log):
     cdek_api["10000000001"] = {"entity": {"statuses": [{"code": "CREATED"}]}}
     assert b.cdek_check([{"task": "1", "article": "Z", "track": "10000000001", "qty": 3}], log) == 0
+
+
+# ---------------------------------------------------------------- трек на несколько строк (2.8)
+# Таблица СДЭК 17.11: заказ из 3 мест — 3 строки с одним треком (по строке на место)
+MULTI = [("6278328923", "Ambient 180x60 knopka 4000", "10349131421", 1),
+         ("6278328925", "Ambient 180x60 knopka 4000", "10349131421", 1),
+         ("6278328926", "Ambient 180x60 knopka 4000", "10349131421", 1),
+         ("6283051921", "Ambient 160x50 knopka 4000", "10349495734", 1)]
+
+
+def place_pdf(places):
+    """ШК СДЭК: по странице на место, у каждого места свой [ITM]."""
+    import io
+
+    from reportlab.pdfgen import canvas
+    buf = io.BytesIO()
+    c = canvas.Canvas(buf, pagesize=(300, 200))
+    for track, itm in places:
+        c.drawString(10, 150, f"{track} {track[-4:]}")
+        c.drawString(10, 60, f"[ITM]{itm}")
+        c.showPage()
+    c.save()
+    return buf.getvalue()
+
+
+def test_track_on_several_rows_prints_each_place_once(tmp_path, log, monkeypatch):
+    orders = b.read_cdek_orders(cdek_file(tmp_path / "сдэк.xlsx", MULTI))
+    asked = []
+    pdf = place_pdf([("10349131421", "1"), ("10349131421", "2"), ("10349131421", "3"), ("10349495734", "9")])
+    monkeypatch.setattr(b, "cdek_on", lambda: True)
+    monkeypatch.setattr(b, "cdek_barcodes_api", lambda tracks, log: asked.append(tracks) or [pdf])
+    sent = {}
+    monkeypatch.setattr(b, "sklad_on", lambda: True)
+    monkeypatch.setattr(b, "morning_hold", lambda day, lines, *a, **k: sent.setdefault("lines", lines))
+    monkeypatch.setattr(b, "sklad_send_batch",
+                        lambda day, market, channel, truck, source, items, log: sent.setdefault("items", items))
+    out = tmp_path / "out"
+    b.make_cdek(orders, out, log)
+    assert asked == [["10349131421", "10349495734"]]          # трек у СДЭК — один раз
+    pages = [p.extract_text() for p in PdfReader(str(next((out / b.UCHITELSKAYA).glob("СДЭК ШК *.pdf")))).pages]
+    assert len(pages) == 4 and "ШК 4 шт." in log.text()       # 3 места + 1, а не 3 × 3 + 1
+    assert sorted(p.split("[ITM]")[1].strip() for p in pages) == ["1", "2", "3", "9"]   # каждое место — раз
+    items = [x for x in sent["items"] if x["posting"] == "10349131421"]
+    assert len(items) == 3 and {"[ITM]1", "[ITM]2", "[ITM]3"} <= set(items[0]["codes"])
+
+
+def test_check_sums_rows_of_one_track(cdek_api, log):
+    cdek_api["10349131421"] = cdek_entity(3, [1, 1, 1])
+    orders = [{"task": str(i), "article": "Ambient 180x60 knopka 4000", "track": "10349131421", "qty": 1}
+              for i in range(3)]
+    assert b.cdek_check(orders, log) == 0 and "проверь количество" not in log.text()
